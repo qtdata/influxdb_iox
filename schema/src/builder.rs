@@ -68,7 +68,7 @@ impl SchemaBuilder {
         }
     }
 
-    pub fn timestamp_new(&self, column_name: &str) {
+    pub fn timestamp_new(&mut self, column_name: &str) -> &mut Self {
         let influxdb_column_type = InfluxColumnType::Timestamp;
         let arrow_type = (&influxdb_column_type).into();
         self.add_column(column_name, false, influxdb_column_type, arrow_type)
