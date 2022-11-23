@@ -28,7 +28,7 @@ pub fn TIME_DATA_TIMEZONE() -> Option<String> {
     // DataFusion doesn't currently do a great job with such
     // timezones so punting for now
     //Some(String::from("UTC"));
-    Some(String::from("asia/shanghai"))
+    None
 }
 
 /// the [`ArrowDataType`] to use for InfluxDB timestamps
