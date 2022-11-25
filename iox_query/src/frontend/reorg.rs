@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::Field;
 use datafusion::{
     logical_expr::LogicalPlan,
     prelude::{col, lit_timestamp_nano},
@@ -163,6 +164,15 @@ impl ReorgPlanner {
         if split_times.is_empty() {
             panic!("Split plan does not accept empty split_times");
         }
+        let sort_columns: Vec<String> = output_sort_key
+            .to_columns()
+            .map(|c| c.to_string())
+            .collect();
+        let time_columns: Vec<String> = schema.time_iter().map(|c| c.name().clone()).collect();
+        let time_column_name = &sort_columns
+            .into_iter()
+            .find(|c| time_columns.contains(c))
+            .expect("a time column is needed")[..];
 
         let scan_plan = ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("split_plan"))
             .with_chunks(chunks)
@@ -172,7 +182,7 @@ impl ReorgPlanner {
 
         let mut split_exprs = Vec::with_capacity(split_times.len());
         // time <= split_times[0]
-        split_exprs.push(col(TIME_COLUMN_NAME).lt_eq(lit_timestamp_nano(split_times[0])));
+        split_exprs.push(col(time_column_name).lt_eq(lit_timestamp_nano(split_times[0])));
         // split_times[i-1] , time <= split_time[i]
         for i in 1..split_times.len() {
             if split_times[i - 1] >= split_times[i] {
@@ -185,9 +195,9 @@ impl ReorgPlanner {
                 );
             }
             split_exprs.push(
-                col(TIME_COLUMN_NAME)
+                col(time_column_name)
                     .gt(lit_timestamp_nano(split_times[i - 1]))
-                    .and(col(TIME_COLUMN_NAME).lt_eq(lit_timestamp_nano(split_times[i]))),
+                    .and(col(time_column_name).lt_eq(lit_timestamp_nano(split_times[i]))),
             );
         }
 
