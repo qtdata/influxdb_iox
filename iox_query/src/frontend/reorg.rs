@@ -177,6 +177,7 @@ impl ReorgPlanner {
         let scan_plan = ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("split_plan"))
             .with_chunks(chunks)
             .with_output_sort_key(output_sort_key)
+            .enable_deduplication(false)
             .build()
             .context(BuildingScanSnafu)?;
 
