@@ -1,7 +1,7 @@
 //! This module contains the schema definition for IOx
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     convert::{TryFrom, TryInto},
     fmt,
     mem::{size_of, size_of_val},
@@ -46,7 +46,7 @@ pub mod sort;
 pub use builder::SchemaBuilder;
 pub use projection::Projection;
 
-/// Database schema creation / validation errors.
+/// Namespace schema creation / validation errors.
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
@@ -283,7 +283,7 @@ impl Schema {
         self.inner.fields().is_empty()
     }
 
-    /// Returns an iterator of (Option<InfluxColumnType>, &Field) for
+    /// Returns an iterator of `(Option<InfluxColumnType>, &Field)` for
     /// all the columns of this schema, in order
     pub fn iter(&self) -> SchemaIter<'_> {
         SchemaIter::new(self)
@@ -367,7 +367,7 @@ impl Schema {
 
     /// Return names of the columns of given indexes with all PK columns (tags and time)
     /// If the columns are not provided, return all columns
-    pub fn select_given_and_pk_columns(&self, cols: &Option<Vec<usize>>) -> Vec<String> {
+    pub fn select_given_and_pk_columns(&self, cols: Option<&Vec<usize>>) -> Vec<String> {
         match cols {
             Some(cols) => {
                 let mut columns = cols
@@ -484,12 +484,9 @@ impl Schema {
                     field.name().capacity()
                         + field
                             .metadata()
-                            .map(|md| {
-                                md.iter()
-                                    .map(|(k, v)| k.capacity() + v.capacity())
-                                    .sum::<usize>()
-                            })
-                            .unwrap_or_default()
+                            .iter()
+                            .map(|(k, v)| k.capacity() + v.capacity())
+                            .sum::<usize>()
                 })
                 .sum::<usize>();
 
@@ -508,8 +505,6 @@ impl Schema {
 pub(crate) fn get_influx_type(field: &ArrowField) -> Result<InfluxColumnType, Option<String>> {
     let md = field
         .metadata()
-        .as_ref()
-        .ok_or(None)?
         .get(COLUMN_METADATA_KEY)
         .ok_or(None)?
         .as_str();
@@ -519,10 +514,10 @@ pub(crate) fn get_influx_type(field: &ArrowField) -> Result<InfluxColumnType, Op
 
 /// Sets the metadata for a field - replacing any existing metadata
 pub(crate) fn set_field_metadata(field: &mut ArrowField, column_type: InfluxColumnType) {
-    field.set_metadata(Some(BTreeMap::from([(
+    field.set_metadata(HashMap::from([(
         COLUMN_METADATA_KEY.to_string(),
         column_type.to_string(),
-    )])));
+    )]));
 }
 
 /// Field value types for InfluxDB 2.0 data model, as defined in
@@ -750,11 +745,11 @@ pub(crate) mod test_util {
         column_type: &str,
     ) -> ArrowField {
         let mut field = ArrowField::new(name, data_type, nullable);
-        field.set_metadata(Some(
+        field.set_metadata(
             vec![(COLUMN_METADATA_KEY.to_string(), column_type.to_string())]
                 .into_iter()
                 .collect(),
-        ));
+        );
         field
     }
 }
@@ -1357,6 +1352,6 @@ mod test {
             .unwrap();
 
         // this is mostly a smoke test
-        assert_eq!(schema.estimate_size(), 795);
+        assert_eq!(schema.estimate_size(), 843);
     }
 }

@@ -123,6 +123,8 @@ impl ParquetExecInput {
             table_partition_cols: vec![],
             // TODO avoid this `copied_config` when config_options are directly available on context
             config_options: session_ctx.copied_config().config_options(),
+            // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
+            output_ordering: None,
         };
         let exec = ParquetExec::new(base_config, None, None);
         let exec_schema = exec.schema();
@@ -242,9 +244,18 @@ impl ParquetStorage {
         // This is abort-able by the user by dropping the upload() future.
         //
         // Cloning `data` is a ref count inc, rather than a data copy.
+        let mut retried = false;
         while let Err(e) = self.object_store.put(&path, data.clone()).await {
-            error!(error=%e, ?meta, "failed to upload parquet file to object storage");
+            warn!(error=%e, ?meta, "failed to upload parquet file to object storage, retrying");
             tokio::time::sleep(Duration::from_secs(1)).await;
+            retried = true;
+        }
+
+        if retried {
+            info!(
+                ?meta,
+                "Succeeded uploading files to object storage on retry"
+            );
         }
 
         Ok((parquet_meta, file_size))

@@ -1,26 +1,31 @@
-//! Implements the native gRPC IOx query API using Arrow Flight
+//! Implements the InfluxDB IOx Flight API using Arrow Flight and gRPC
+
+mod request;
 
 use arrow::error::ArrowError;
-use arrow_flight::{
-    flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
-    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
-    HandshakeRequest, HandshakeResponse, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+use arrow_util::optimize::{
+    prepare_batch_for_flight, prepare_schema_for_flight, split_batch_for_grpc_response,
 };
-use arrow_util::optimize::{optimize_record_batch, optimize_schema};
-use bytes::{Bytes, BytesMut};
-use data_types::{DatabaseName, DatabaseNameError};
+use bytes::BytesMut;
+use data_types::NamespaceNameError;
 use datafusion::{error::DataFusionError, physical_plan::ExecutionPlan};
 use futures::{SinkExt, Stream, StreamExt};
 use generated_types::influxdata::iox::querier::v1 as proto;
+use iox_arrow_flight::{
+    flight_descriptor::DescriptorType,
+    flight_service_server::{FlightService as Flight, FlightServiceServer as FlightServer},
+    sql::{CommandStatementQuery, ProstMessageExt},
+    Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightEndpoint, FlightInfo,
+    HandshakeRequest, HandshakeResponse, PutResult, SchemaAsIpc, SchemaResult, Ticket,
+};
 use iox_query::{
     exec::{ExecutionContextProvider, IOxSessionContext},
-    QueryCompletedToken, QueryDatabase,
+    QueryCompletedToken, QueryNamespace,
 };
 use observability_deps::tracing::{debug, info, warn};
 use pin_project::{pin_project, pinned_drop};
-use prost::Message;
-use serde::Deserialize;
-use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryDatabaseProvider};
+use request::{IoxGetRequest, RunQuery};
+use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryNamespaceProvider};
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, pin::Pin, sync::Arc, task::Poll, time::Instant};
 use tokio::task::JoinHandle;
@@ -29,14 +34,21 @@ use trace::{ctx::SpanContext, span::SpanExt};
 use trace_http::ctx::{RequestLogContext, RequestLogContextExt};
 use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 
+/// The name of the grpc header that contains the target iox namespace
+/// name for FlightSQL requests.
+///
+/// See <https://lists.apache.org/thread/fd6r1n7vt91sg2c7fr35wcrsqz6x4645>
+/// for discussion on adding support to FlightSQL itself.
+const IOX_FLIGHT_SQL_NAMESPACE_HEADER: &str = "iox-namespace-name";
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid ticket. Error: {:?}", source))]
-    InvalidTicket { source: prost::DecodeError },
+    #[snafu(display("Invalid ticket. Error: {}", source))]
+    InvalidTicket { source: request::Error },
 
-    #[snafu(display("Invalid legacy ticket. Error: {:?}", source))]
-    InvalidTicketLegacy { source: std::string::FromUtf8Error },
+    #[snafu(display("Internal creating encoding ticket: {}", source))]
+    InternalCreatingTicket { source: request::Error },
 
     #[snafu(display("Invalid query, could not parse '{}': {}", query, source))]
     InvalidQuery {
@@ -44,21 +56,29 @@ pub enum Error {
         source: serde_json::Error,
     },
 
-    #[snafu(display("Database {} not found", database_name))]
-    DatabaseNotFound { database_name: String },
+    #[snafu(display("Namespace {} not found", namespace_name))]
+    NamespaceNotFound { namespace_name: String },
 
     #[snafu(display(
-        "Internal error reading points from database {}:  {}",
-        database_name,
+        "Internal error reading points from namespace {}: {}",
+        namespace_name,
         source
     ))]
     Query {
-        database_name: String,
+        namespace_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Invalid database name: {}", source))]
-    InvalidDatabaseName { source: DatabaseNameError },
+    #[snafu(display("no 'iox-namespace-name' header in request"))]
+    NoNamespaceHeader,
+
+    #[snafu(display("Invalid 'iox-namespace-name' header in request: {}", source))]
+    InvalidNamespaceHeader {
+        source: tonic::metadata::errors::ToStrError,
+    },
+
+    #[snafu(display("Invalid namespace name: {}", source))]
+    InvalidNamespaceName { source: NamespaceNameError },
 
     #[snafu(display("Failed to optimize record batch: {}", source))]
     Optimize { source: ArrowError },
@@ -70,6 +90,18 @@ pub enum Error {
 
     #[snafu(display("Error during protobuf serialization: {}", source))]
     Serialization { source: prost::EncodeError },
+
+    #[snafu(display("Invalid protobuf: {}", source))]
+    Deserialization { source: prost::DecodeError },
+
+    #[snafu(display("Invalid protobuf for type_url'{}': {}", type_url, source))]
+    DeserializationTypeKnown {
+        type_url: String,
+        source: prost::DecodeError,
+    },
+
+    #[snafu(display("Unsupported message type: {}", description))]
+    UnsupportedMessageType { description: String },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -81,15 +113,24 @@ impl From<Error> for tonic::Status {
         // logging is handled for any new error variants.
         let msg = "Error handling Flight gRPC request";
         match err {
-            Error::DatabaseNotFound { .. }
+            Error::NamespaceNotFound { .. }
             | Error::InvalidTicket { .. }
-            | Error::InvalidTicketLegacy { .. }
             | Error::InvalidQuery { .. }
-            // TODO(edd): this should be `debug`. Keeping at info whilst IOx still in early development
-            | Error::InvalidDatabaseName { .. } => info!(e=%err, msg),
+            // TODO(edd): this should be `debug`. Keeping at info while IOx in early development
+            | Error::InvalidNamespaceName { .. } => info!(e=%err, msg),
             Error::Query { .. } => info!(e=%err, msg),
             Error::Optimize { .. }
-            | Error::Planning { .. } | Error::Serialization { .. } => warn!(e=%err, msg),
+            |Error::NoNamespaceHeader
+            |Error::InvalidNamespaceHeader { .. }
+            | Error::Planning { .. }
+            | Error::Serialization { .. }
+            | Error::Deserialization { .. }
+            | Error::DeserializationTypeKnown { .. }
+            | Error::InternalCreatingTicket { .. }
+                | Error::UnsupportedMessageType { .. }
+            => {
+                warn!(e=%err, msg)
+            }
         }
         err.into_status()
     }
@@ -102,102 +143,89 @@ impl Error {
         let msg = self.to_string();
 
         let code = match self {
-            Self::DatabaseNotFound { .. } => tonic::Code::NotFound,
+            Self::NamespaceNotFound { .. } => tonic::Code::NotFound,
             Self::InvalidTicket { .. }
-            | Self::InvalidTicketLegacy { .. }
             | Self::InvalidQuery { .. }
-            | Self::InvalidDatabaseName { .. } => tonic::Code::InvalidArgument,
+            | Self::Serialization { .. }
+            | Self::Deserialization { .. }
+            | Self::DeserializationTypeKnown { .. }
+            | Self::NoNamespaceHeader
+            | Self::InvalidNamespaceHeader { .. }
+            | Self::InvalidNamespaceName { .. } => tonic::Code::InvalidArgument,
             Self::Planning { source, .. } | Self::Query { source, .. } => {
                 datafusion_error_to_tonic_code(&source)
             }
-            Self::Optimize { .. } | Self::Serialization { .. } => tonic::Code::Internal,
+            Self::UnsupportedMessageType { .. } => tonic::Code::Unimplemented,
+            Self::InternalCreatingTicket { .. } | Self::Optimize { .. } => tonic::Code::Internal,
         };
 
         tonic::Status::new(code, msg)
+    }
+
+    fn unsupported_message_type(description: impl Into<String>) -> Self {
+        Self::UnsupportedMessageType {
+            description: description.into(),
+        }
     }
 }
 
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, tonic::Status>> + Send + Sync + 'static>>;
 
-#[derive(Deserialize, Debug)]
-/// Body of the `Ticket` serialized and sent to the do_get endpoint.
-struct ReadInfo {
-    database_name: String,
-    sql_query: String,
-}
-
-impl ReadInfo {
-    fn decode_json(ticket: &[u8]) -> Result<Self> {
-        let json_str = String::from_utf8(ticket.to_vec()).context(InvalidTicketLegacySnafu {})?;
-
-        let read_info: ReadInfo =
-            serde_json::from_str(&json_str).context(InvalidQuerySnafu { query: &json_str })?;
-
-        Ok(read_info)
-    }
-
-    fn decode_protobuf(ticket: &[u8]) -> Result<Self> {
-        let read_info =
-            proto::ReadInfo::decode(Bytes::from(ticket.to_vec())).context(InvalidTicketSnafu {})?;
-
-        Ok(Self {
-            database_name: read_info.namespace_name,
-            sql_query: read_info.sql_query,
-        })
-    }
-}
-
 /// Concrete implementation of the gRPC Arrow Flight Service API
 #[derive(Debug)]
 struct FlightService<S>
 where
-    S: QueryDatabaseProvider,
+    S: QueryNamespaceProvider,
 {
     server: Arc<S>,
 }
 
 pub fn make_server<S>(server: Arc<S>) -> FlightServer<impl Flight>
 where
-    S: QueryDatabaseProvider,
+    S: QueryNamespaceProvider,
 {
     FlightServer::new(FlightService { server })
 }
 
 impl<S> FlightService<S>
 where
-    S: QueryDatabaseProvider,
+    S: QueryNamespaceProvider,
 {
     async fn run_query(
         &self,
         span_ctx: Option<SpanContext>,
         permit: InstrumentedAsyncOwnedSemaphorePermit,
-        sql_query: String,
-        database_name: String,
+        query: &RunQuery,
+        namespace: String,
     ) -> Result<Response<TonicStream<FlightData>>, tonic::Status> {
-        let database = DatabaseName::new(&database_name).context(InvalidDatabaseNameSnafu)?;
-
         let db = self
             .server
-            .db(&database, span_ctx.child_span("get namespace"))
+            .db(&namespace, span_ctx.child_span("get namespace"))
             .await
-            .ok_or_else(|| tonic::Status::not_found(format!("Unknown namespace: {database}")))?;
+            .ok_or_else(|| tonic::Status::not_found(format!("Unknown namespace: {namespace}")))?;
 
         let ctx = db.new_query_context(span_ctx);
-        let query_completed_token = db.record_query(&ctx, "sql", Box::new(sql_query.clone()));
+        let (query_completed_token, physical_plan) = match query {
+            RunQuery::Sql(sql_query) => {
+                let token = db.record_query(&ctx, "sql", Box::new(sql_query.clone()));
+                let plan = Planner::new(&ctx)
+                    .sql(sql_query)
+                    .await
+                    .context(PlanningSnafu)?;
+                (token, plan)
+            }
+            RunQuery::InfluxQL(sql_query) => {
+                let token = db.record_query(&ctx, "influxql", Box::new(sql_query.clone()));
+                let plan = Planner::new(&ctx)
+                    .influxql(db, sql_query)
+                    .await
+                    .context(PlanningSnafu)?;
+                (token, plan)
+            }
+        };
 
-        let physical_plan = Planner::new(&ctx)
-            .sql(sql_query)
-            .await
-            .context(PlanningSnafu)?;
-
-        let output = GetStream::new(
-            ctx,
-            physical_plan,
-            database_name,
-            query_completed_token,
-            permit,
-        )
-        .await?;
+        let output =
+            GetStream::new(ctx, physical_plan, namespace, query_completed_token, permit).await?;
 
         Ok(Response::new(Box::pin(output) as TonicStream<FlightData>))
     }
@@ -206,13 +234,13 @@ where
 #[tonic::async_trait]
 impl<S> Flight for FlightService<S>
 where
-    S: QueryDatabaseProvider,
+    S: QueryNamespaceProvider,
 {
     type HandshakeStream = TonicStream<HandshakeResponse>;
     type ListFlightsStream = TonicStream<FlightInfo>;
     type DoGetStream = TonicStream<FlightData>;
     type DoPutStream = TonicStream<PutResult>;
-    type DoActionStream = TonicStream<arrow_flight::Result>;
+    type DoActionStream = TonicStream<iox_arrow_flight::Result>;
     type ListActionsStream = TonicStream<ActionType>;
     type DoExchangeStream = TonicStream<FlightData>;
 
@@ -232,19 +260,16 @@ where
         let span_ctx: Option<SpanContext> = request.extensions().get().cloned();
         let ticket = request.into_inner();
 
-        // decode ticket
-        let read_info = ReadInfo::decode_protobuf(&ticket.ticket).or_else(|_e| {
-            // try legacy json
-            ReadInfo::decode_json(&ticket.ticket)
-        });
+        // attempt to decode ticket
+        let request = IoxGetRequest::try_decode(ticket).context(InvalidTicketSnafu);
 
-        if let Err(e) = &read_info {
-            info!(%e, "Error decoding database and SQL query name from flight ticket");
+        if let Err(e) = &request {
+            info!(%e, "Error decoding Flight API ticket");
         };
-        let ReadInfo {
-            database_name,
-            sql_query,
-        } = read_info?;
+
+        let request = request?;
+        let namespace_name = request.namespace_name();
+        let query = request.query();
 
         let permit = self
             .server
@@ -253,17 +278,17 @@ where
 
         // Log after we acquire the permit and are about to start execution
         let start = Instant::now();
-        info!(db_name=%database_name, %sql_query, %trace, "Running SQL via flight do_get");
+        info!(%namespace_name, %query, %trace, "Running SQL via flight do_get");
 
         let response = self
-            .run_query(span_ctx, permit, sql_query.clone(), database_name.clone())
+            .run_query(span_ctx, permit, query, namespace_name.to_string())
             .await;
 
         if let Err(e) = &response {
-            info!(db_name=%database_name, %sql_query, %trace, %e, "Error running SQL query");
+            info!(%namespace_name, %query, %trace, %e, "Error running SQL query");
         } else {
             let elapsed = Instant::now() - start;
-            debug!(db_name=%database_name,%sql_query,%trace, ?elapsed, "Completed SQL query successfully");
+            debug!(%namespace_name, %query,%trace, ?elapsed, "Completed SQL query successfully");
         }
         response
     }
@@ -288,11 +313,43 @@ where
         Err(tonic::Status::unimplemented("Not yet implemented"))
     }
 
+    /// Handles requests encoded in the FlightDescriptor
+    ///
+    /// IOx currently only processes "cmd" type Descriptors (not
+    /// paths) and attempts to decodes the [`FlightDescriptor::cmd`]
+    /// bytes as an encoded protobuf message
+    ///
+    ///
     async fn get_flight_info(
         &self,
-        _request: Request<FlightDescriptor>,
+        request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, tonic::Status> {
-        Err(tonic::Status::unimplemented("Not yet implemented"))
+        // look for namespace information in headers
+        let namespace_name = request
+            .metadata()
+            .get(IOX_FLIGHT_SQL_NAMESPACE_HEADER)
+            .map(|v| {
+                v.to_str()
+                    .context(InvalidNamespaceHeaderSnafu)
+                    .map(|s| s.to_string())
+            })
+            .ok_or(Error::NoNamespaceHeader)??;
+
+        let request = request.into_inner();
+
+        let cmd = match request.r#type() {
+            DescriptorType::Cmd => Ok(&request.cmd),
+            DescriptorType::Path => Err(Error::unsupported_message_type("FlightInfo with Path")),
+            DescriptorType::Unknown => Err(Error::unsupported_message_type(
+                "FlightInfo of unknown type",
+            )),
+        }?;
+
+        let message: prost_types::Any =
+            prost::Message::decode(cmd.as_slice()).context(DeserializationSnafu)?;
+
+        let flight_info = self.dispatch(&namespace_name, request, message).await?;
+        Ok(tonic::Response::new(flight_info))
     }
 
     async fn do_put(
@@ -324,6 +381,88 @@ where
     }
 }
 
+impl<S> FlightService<S>
+where
+    S: QueryNamespaceProvider,
+{
+    /// Given a successfully decoded protobuf *Any* message, handles
+    /// recognized messages (e.g those defined by FlightSQL) and
+    /// creates the appropriate FlightData response
+    ///
+    /// Arguments
+    ///
+    /// namespace_name: is the target namespace of the request
+    ///
+    /// flight_descriptor: is the descriptor sent in the request (included in response)
+    ///
+    /// msg is the `cmd` field of the flight descriptor decoded as a protobuf  message
+    async fn dispatch(
+        &self,
+        namespace_name: &str,
+        flight_descriptor: FlightDescriptor,
+        msg: prost_types::Any,
+    ) -> Result<FlightInfo> {
+        fn try_unpack<T: ProstMessageExt>(msg: &prost_types::Any) -> Result<Option<T>> {
+            // Does the type URL match?
+            if T::type_url() != msg.type_url {
+                return Ok(None);
+            }
+            // type matched, so try and decode
+            let m = prost::Message::decode(&*msg.value).context(DeserializationTypeKnownSnafu {
+                type_url: &msg.type_url,
+            })?;
+            Ok(Some(m))
+        }
+
+        // FlightSQL CommandStatementQuery
+        let (schema, ticket) = if let Some(cmd) = try_unpack::<CommandStatementQuery>(&msg)? {
+            let CommandStatementQuery { query } = cmd;
+            debug!(%namespace_name, %query, "Handling FlightSQL CommandStatementQuery");
+
+            // TODO is supposed to return a schema -- if clients
+            // actually expect the schema we'll have to plan the query
+            // here.
+            let schema = vec![];
+
+            // Create a ticket that can be passed to do_get to run the query
+            let ticket = IoxGetRequest::new(namespace_name, RunQuery::Sql(query))
+                .try_encode()
+                .context(InternalCreatingTicketSnafu)?;
+
+            (schema, ticket)
+        } else {
+            return Err(Error::unsupported_message_type(format!(
+                "Unsupported cmd message: {}",
+                msg.type_url
+            )));
+        };
+
+        // form the response
+
+        // Arrow says "set to -1 if not known
+        let total_records = -1;
+        let total_bytes = -1;
+
+        let endpoint = vec![FlightEndpoint {
+            ticket: Some(ticket),
+            // "If the list is empty, the expectation is that the
+            // ticket can only be redeemed on the current service
+            // where the ticket was generated."
+            //
+            // https://github.com/apache/arrow-rs/blob/a0a5880665b1836890f6843b6b8772d81c463351/format/Flight.proto#L292-L294
+            location: vec![],
+        }];
+
+        Ok(FlightInfo {
+            schema,
+            flight_descriptor: Some(flight_descriptor),
+            endpoint,
+            total_records,
+            total_bytes,
+        })
+    }
+}
+
 #[pin_project(PinnedDrop)]
 struct GetStream {
     #[pin]
@@ -338,7 +477,7 @@ impl GetStream {
     async fn new(
         ctx: IOxSessionContext,
         physical_plan: Arc<dyn ExecutionPlan>,
-        database_name: String,
+        namespace_name: String,
         mut query_completed_token: QueryCompletedToken,
         permit: InstrumentedAsyncOwnedSemaphorePermit,
     ) -> Result<Self, tonic::Status> {
@@ -346,7 +485,7 @@ impl GetStream {
         let (mut tx, rx) = futures::channel::mpsc::channel::<Result<FlightData, tonic::Status>>(1);
 
         // get schema
-        let schema = Arc::new(optimize_schema(&physical_plan.schema()));
+        let schema = Arc::new(prepare_schema_for_flight(&physical_plan.schema()));
 
         // setup stream
         let options = arrow::ipc::writer::IpcWriteOptions::default();
@@ -362,7 +501,7 @@ impl GetStream {
             .execute_stream(Arc::clone(&physical_plan))
             .await
             .context(QuerySnafu {
-                database_name: &database_name,
+                namespace_name: &namespace_name,
             })?;
 
         let join_handle = tokio::spawn(async move {
@@ -374,23 +513,25 @@ impl GetStream {
             while let Some(batch_or_err) = stream_record_batches.next().await {
                 match batch_or_err {
                     Ok(batch) => {
-                        match optimize_record_batch(&batch, Arc::clone(&schema)) {
+                        match prepare_batch_for_flight(&batch, Arc::clone(&schema)) {
                             Ok(batch) => {
-                                let (flight_dictionaries, flight_batch) =
-                                    arrow_flight::utils::flight_data_from_arrow_batch(
-                                        &batch, &options,
-                                    );
+                                for batch in split_batch_for_grpc_response(batch) {
+                                    let (flight_dictionaries, flight_batch) =
+                                        iox_arrow_flight::utils::flight_data_from_arrow_batch(
+                                            &batch, &options,
+                                        );
 
-                                for dict in flight_dictionaries {
-                                    if tx.send(Ok(dict)).await.is_err() {
+                                    for dict in flight_dictionaries {
+                                        if tx.send(Ok(dict)).await.is_err() {
+                                            // receiver is gone
+                                            return;
+                                        }
+                                    }
+
+                                    if tx.send(Ok(flight_batch)).await.is_err() {
                                         // receiver is gone
                                         return;
                                     }
-                                }
-
-                                if tx.send(Ok(flight_batch)).await.is_err() {
-                                    // receiver is gone
-                                    return;
                                 }
                             }
                             Err(e) => {
@@ -407,7 +548,7 @@ impl GetStream {
                     Err(e) => {
                         // failure sending here is OK because we're cutting the stream anyways
                         tx.send(Err(Error::Query {
-                            database_name: database_name.clone(),
+                            namespace_name: namespace_name.clone(),
                             source: DataFusionError::ArrowError(e),
                         }
                         .into()))
@@ -503,7 +644,7 @@ mod tests {
             server: Arc::clone(&test_storage),
         };
         let ticket = Ticket {
-            ticket: br#"{"database_name": "my_db", "sql_query": "SELECT 1;"}"#.to_vec(),
+            ticket: br#"{"namespace_name": "my_db", "sql_query": "SELECT 1;"}"#.to_vec(),
         };
         let streaming_resp1 = service
             .do_get(tonic::Request::new(ticket.clone()))

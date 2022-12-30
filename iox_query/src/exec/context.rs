@@ -2,7 +2,9 @@
 //! DataFusion
 
 use super::{
-    non_null_checker::NonNullCheckerNode, seriesset::series::Either, split::StreamSplitNode,
+    non_null_checker::NonNullCheckerNode,
+    seriesset::{series::Either, SeriesSet},
+    split::StreamSplitNode,
 };
 use crate::{
     exec::{
@@ -17,6 +19,7 @@ use crate::{
         split::StreamSplitExec,
         stringset::{IntoStringSet, StringSetRef},
     },
+    logical_optimizer::iox_optimizer,
     plan::{
         fieldlist::FieldListPlan,
         seriesset::{SeriesSetPlan, SeriesSetPlans},
@@ -29,6 +32,7 @@ use datafusion::{
     catalog::catalog::CatalogProvider,
     execution::{
         context::{QueryPlanner, SessionState, TaskContext},
+        memory_pool::MemoryPool,
         runtime_env::RuntimeEnv,
     },
     logical_expr::{LogicalPlan, UserDefinedLogicalNode},
@@ -42,9 +46,9 @@ use datafusion::{
 };
 use datafusion_util::config::{iox_session_config, DEFAULT_CATALOG};
 use executor::DedicatedExecutor;
-use futures::TryStreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use observability_deps::tracing::debug;
-use query_functions::selectors::register_selector_aggregates;
+use query_functions::{register_scalar_functions, selectors::register_selector_aggregates};
 use std::{convert::TryInto, fmt, sync::Arc};
 use trace::{
     ctx::SpanContext,
@@ -209,6 +213,8 @@ impl IOxSessionConfig {
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
 
         let state = register_selector_aggregates(state);
+        let mut state = register_scalar_functions(state);
+        state.optimizer = iox_optimizer();
 
         let inner = SessionContext::with_state(state);
 
@@ -218,7 +224,7 @@ impl IOxSessionConfig {
 
         let maybe_span = self.span_ctx.child_span("Query Execution");
 
-        IOxSessionContext::new(inner, Some(self.exec), SpanRecorder::new(maybe_span))
+        IOxSessionContext::new(inner, self.exec, SpanRecorder::new(maybe_span))
     }
 }
 
@@ -237,13 +243,13 @@ impl IOxSessionConfig {
 pub struct IOxSessionContext {
     inner: SessionContext,
 
-    /// Optional dedicated executor for query execution.
+    /// Dedicated executor for query execution.
     ///
     /// DataFusion plans are "CPU" bound and thus can consume tokio
     /// executors threads for extended periods of time. We use a
     /// dedicated tokio runtime to run them so that other requests
     /// can be handled.
-    exec: Option<DedicatedExecutor>,
+    exec: DedicatedExecutor,
 
     /// Span context from which to create spans for this query
     recorder: SpanRecorder,
@@ -253,6 +259,8 @@ impl fmt::Debug for IOxSessionContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("IOxSessionContext")
             .field("inner", &"<DataFusion ExecutionContext>")
+            .field("exec", &self.exec)
+            .field("recorder", &self.recorder)
             .finish()
     }
 }
@@ -265,7 +273,7 @@ impl IOxSessionContext {
     pub fn with_testing() -> Self {
         Self {
             inner: SessionContext::default(),
-            exec: None,
+            exec: DedicatedExecutor::new_testing(),
             recorder: SpanRecorder::default(),
         }
     }
@@ -273,7 +281,7 @@ impl IOxSessionContext {
     /// Private constructor
     pub(crate) fn new(
         inner: SessionContext,
-        exec: Option<DedicatedExecutor>,
+        exec: DedicatedExecutor,
         recorder: SpanRecorder,
     ) -> Self {
         // attach span to DataFusion session
@@ -404,30 +412,30 @@ impl IOxSessionContext {
 
     /// Executes the SeriesSetPlans on the query executor, in
     /// parallel, producing series or groups
-    ///
-    /// TODO make this streaming rather than buffering the results
     pub async fn to_series_and_groups(
         &self,
         series_set_plans: SeriesSetPlans,
-    ) -> Result<Vec<Either>> {
+        memory_pool: Arc<dyn MemoryPool>,
+    ) -> Result<impl Stream<Item = Result<Either>>> {
         let SeriesSetPlans {
             mut plans,
             group_columns,
         } = series_set_plans;
 
         if plans.is_empty() {
-            return Ok(vec![]);
+            return Ok(futures::stream::empty().boxed());
         }
 
         // sort plans by table (measurement) name
         plans.sort_by(|a, b| a.table_name.cmp(&b.table_name));
 
         // Run the plans in parallel
-        let handles = plans
-            .into_iter()
-            .map(|plan| {
-                let ctx = self.child_ctx("to_series_set");
-                self.run(async move {
+        let ctx = self.child_ctx("to_series_set");
+        let exec = self.exec.clone();
+        let data = futures::stream::iter(plans)
+            .then(move |plan| {
+                let ctx = ctx.child_ctx("for plan");
+                Self::run_inner(exec.clone(), async move {
                     let SeriesSetPlan {
                         table_name,
                         plan,
@@ -444,25 +452,10 @@ impl IOxSessionContext {
                     SeriesSetConverter::default()
                         .convert(table_name, tag_columns, field_columns, it)
                         .await
-                        .map_err(|e| {
-                            Error::Execution(format!(
-                                "Error executing series set conversion: {}",
-                                e
-                            ))
-                        })
                 })
             })
-            .collect::<Vec<_>>();
-
-        // join_all ensures that the results are consumed in the same order they
-        // were spawned maintaining the guarantee to return results ordered
-        // by table name and plan sort order.
-        let all_series_sets = futures::future::try_join_all(handles).await?;
-
-        // convert to series sets
-        let mut data: Vec<Series> = vec![];
-        for series_sets in all_series_sets {
-            for series_set in series_sets {
+            .try_flatten()
+            .try_filter_map(|series_set: SeriesSet| async move {
                 // If all timestamps of returned columns are nulls,
                 // there must be no data. We need to check this because
                 // aggregate (e.g. count, min, max) returns one row that are
@@ -470,26 +463,23 @@ impl IOxSessionContext {
                 // For influx read_group's series and group, we do not want to return 0
                 // for count either.
                 if series_set.is_timestamp_all_null() {
-                    continue;
+                    return Ok(None);
                 }
 
                 let series: Vec<Series> = series_set
                     .try_into()
                     .map_err(|e| Error::Execution(format!("Error converting to series: {}", e)))?;
-                data.extend(series);
-            }
-        }
+                Ok(Some(futures::stream::iter(series).map(Ok)))
+            })
+            .try_flatten();
 
         // If we have group columns, sort the results, and create the
         // appropriate groups
         if let Some(group_columns) = group_columns {
-            let grouper = GroupGenerator::new(group_columns);
-            grouper
-                .group(data)
-                .map_err(|e| Error::Execution(format!("Error forming groups: {}", e)))
+            let grouper = GroupGenerator::new(group_columns, memory_pool);
+            Ok(grouper.group(data).await?.boxed())
         } else {
-            let data = data.into_iter().map(|series| series.into()).collect();
-            Ok(data)
+            Ok(data.map_ok(|series| series.into()).boxed())
         }
     }
 
@@ -514,7 +504,10 @@ impl IOxSessionContext {
                             .await?
                             .into_fieldlist()
                             .map_err(|e| {
-                                Error::Execution(format!("Error converting to field list: {}", e))
+                                Error::Context(
+                                    "Error converting to field list".to_string(),
+                                    Box::new(Error::External(Box::new(e))),
+                                )
                             })?;
 
                     Ok(field_list)
@@ -537,9 +530,12 @@ impl IOxSessionContext {
         }
 
         // TODO: Stream this
-        results
-            .into_fieldlist()
-            .map_err(|e| Error::Execution(format!("Error converting to field list: {}", e)))
+        results.into_fieldlist().map_err(|e| {
+            Error::Context(
+                "Error converting to field list".to_string(),
+                Box::new(Error::External(Box::new(e))),
+            )
+        })
     }
 
     /// Executes this plan on the query pool, and returns the
@@ -552,7 +548,12 @@ impl IOxSessionContext {
                 .run_logical_plans(plans)
                 .await?
                 .into_stringset()
-                .map_err(|e| Error::Execution(format!("Error converting to stringset: {}", e))),
+                .map_err(|e| {
+                    Error::Context(
+                        "Error converting to stringset".to_string(),
+                        Box::new(Error::External(Box::new(e))),
+                    )
+                }),
         }
     }
 
@@ -592,13 +593,20 @@ impl IOxSessionContext {
         Fut: std::future::Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
     {
-        match &self.exec {
-            Some(exec) => exec
-                .spawn(fut)
-                .await
-                .unwrap_or_else(|e| Err(Error::Execution(format!("Join Error: {}", e)))),
-            None => unimplemented!("spawn onto current threadpool"),
-        }
+        Self::run_inner(self.exec.clone(), fut).await
+    }
+
+    pub async fn run_inner<Fut, T>(exec: DedicatedExecutor, fut: Fut) -> Result<T>
+    where
+        Fut: std::future::Future<Output = Result<T>> + Send + 'static,
+        T: Send + 'static,
+    {
+        exec.spawn(fut).await.unwrap_or_else(|e| {
+            Err(Error::Context(
+                "Join Error".to_string(),
+                Box::new(Error::External(Box::new(e))),
+            ))
+        })
     }
 
     /// Returns a IOxSessionContext with a SpanRecorder that is a child of the current
@@ -627,7 +635,7 @@ impl IOxSessionContext {
 
     /// Number of currently active tasks.
     pub fn tasks(&self) -> usize {
-        self.exec.as_ref().map(|e| e.tasks()).unwrap_or_default()
+        self.exec.tasks()
     }
 }
 

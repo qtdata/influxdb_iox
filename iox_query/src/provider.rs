@@ -37,14 +37,15 @@ use snafu::{ResultExt, Snafu};
 
 mod adapter;
 mod deduplicate;
-mod metrics;
 pub mod overlap;
 mod physical;
+mod record_batch_exec;
 use self::overlap::group_potential_duplicates;
 pub use deduplicate::{DeduplicateExec, RecordBatchDeduplicator};
-pub(crate) use physical::IOxReadFilterNode;
+pub(crate) use physical::chunks_to_physical_nodes;
 
-pub use metrics::parquet_metrics;
+#[cfg(test)]
+pub(crate) use record_batch_exec::RecordBatchesExec;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -76,16 +77,6 @@ pub enum Error {
 
     #[snafu(display("Internal error: Can not group chunks '{}'", source,))]
     InternalChunkGrouping { source: self::overlap::Error },
-
-    #[snafu(display(
-    "Query would scan at least {} bytes, more than configured maximum {} bytes. Try adjusting your compactor settings or increasing the per query memory limit.",
-    actual_bytes,
-    limit_bytes,
-    ))]
-    TooMuchData {
-        actual_bytes: usize,
-        limit_bytes: usize,
-    },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -230,7 +221,7 @@ impl TableProvider for ChunkTableProvider {
     async fn scan(
         &self,
         _ctx: &SessionState,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         _limit: Option<usize>,
     ) -> std::result::Result<Arc<dyn ExecutionPlan>, DataFusionError> {
@@ -246,16 +237,11 @@ impl TableProvider for ChunkTableProvider {
         // This debug shows the self.arrow_schema() includes all columns in all chunks
         // which means the schema of all chunks are merged before invoking this scan
         debug!(schema=?self.arrow_schema(), "All chunks schema");
-        // However, the schema of each chunk is still in its original form which does not
-        // include the merged columns of other chunks. The code below (put in comments on purpose) proves it
-        // for chunk in chunks.clone() {
-        //     trace!("Schema of chunk {}: {:#?}", chunk.id(), chunk.schema());
-        // }
 
         // Note that `filters` don't actually need to be evaluated in
         // the scan for the plans to be correct, they are an extra
         // optimization for providers which can offer them
-        let predicate = Predicate::default().with_pushdown_exprs(filters);
+        let predicate = Predicate::default().with_exprs(filters.to_vec());
         let deduplicate = Deduplicater::new(self.ctx.child_ctx("deduplicator"))
             .enable_deduplication(self.deduplication());
 
@@ -328,6 +314,10 @@ impl Chunks {
                 .or_insert_with(Vec::new);
             chunks.push(chunk);
         }
+
+        // ensure deterministic order
+        let mut partition_groups: Vec<_> = partition_groups.into_iter().collect();
+        partition_groups.sort_by_key(|(partition_id, _chunks)| *partition_id);
 
         // -------------------------------
         // Find all overlapped groups for each partition-group based on their time range
@@ -441,10 +431,10 @@ impl Deduplicater {
     /// `None` the output will not (necessarily) be sorted.
     ///
     /// In the case of sorted plan, plan will include 2 extra operators: the final SortPreservingMergeExec on top and the SortExec
-    ///   on top of Chunk 4's IOxReadFilterNode. Detail:
+    ///   on top of Chunk 4's RecordBatchesExec. Detail:
     /// In this example, there are 4 chunks and should be read bottom up as follows:
     ///  . Chunks 1 and 2 overlap and need to get deduplicated. This includes these main steps:
-    ///     i. Read/scan/steam the chunk: IOxReadFilterNode.
+    ///     i. Read/scan/steam the chunk: RecordBatchesExec.
     ///     ii. Sort each chunk if they are not sorted yet: SortExec.
     ///     iii. Merge the sorted chunks into one stream: SortPreservingMergeExc.
     ///     iv. Deduplicate the sorted stream: DeduplicateExec
@@ -482,7 +472,7 @@ impl Deduplicater {
     ///                        │                                  │                     ▲
     ///            ┌───────────────────────┐                      │                     │
     ///            │SortPreservingMergeExec│                      │             ┌─────────────────┐
-    ///            └───────────────────────┘                      │             │IOxReadFilterNode│
+    ///            └───────────────────────┘                      │             │RecordBatchesExec│
     ///                        ▲                                  │             │    (Chunk 4)    │
     ///                        │                                  │             └─────────────────┘
     ///            ┌───────────────────────┐                      │
@@ -500,7 +490,7 @@ impl Deduplicater {
     ///           │                       │                      │
     ///           │                       │                      │
     ///  ┌─────────────────┐     ┌─────────────────┐    ┌─────────────────┐
-    ///  │IOxReadFilterNode│     │IOxReadFilterNode│    │IOxReadFilterNode│
+    ///  │RecordBatchesExec│     │RecordBatchesExec│    │RecordBatchesExec│
     ///  │    (Chunk 1)    │     │    (Chunk 2)    │    │    (Chunk 3)    │
     ///  └─────────────────┘     └─────────────────┘    └─────────────────┘
     ///
@@ -514,7 +504,7 @@ impl Deduplicater {
         table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunks: Vec<Arc<dyn QueryChunk>>,
-        predicate: Predicate,
+        mut predicate: Predicate,
         output_sort_key: Option<SortKey>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // find overlapped chunks and put them into the right group
@@ -527,6 +517,14 @@ impl Deduplicater {
             // the chunks have neither overlaps nor duplicates
             if !self.deduplication {
                 debug!(%table_name, "Deduplication is disable. Build only one scan node for all of them.");
+
+                // If we do NOT run de-dup, then we also cannot apply all predicates because we have to assume that the
+                // output of this plan is later fed through de-dup. Currently (2022-11-16) this does not matter because
+                // selection is not used within the ingester, but it will become an issue once this is hooked up.
+                predicate = predicate.push_through_dedup(&Self::compute_chunks_schema(
+                    &chunks,
+                    &mut self.schema_interner,
+                ));
             }
             if chunks.no_duplicates() {
                 debug!(%table_name,  "All chunks neither overlap nor duplicate. Build only one scan node for all of them.");
@@ -534,7 +532,6 @@ impl Deduplicater {
 
             let mut non_duplicate_plans = Self::build_plans_for_non_duplicates_chunks(
                 self.ctx.child_ctx("build_plans_for_non_duplicates_chunks"),
-                Arc::clone(&table_name),
                 Arc::clone(&output_schema),
                 chunks,
                 predicate,
@@ -596,7 +593,6 @@ impl Deduplicater {
                 plans.push(Self::build_deduplicate_plan_for_overlapped_chunks(
                     self.ctx
                         .child_ctx("build_deduplicate_plan_for_overlapped_chunks"),
-                    Arc::clone(&table_name),
                     Arc::clone(&output_schema),
                     overlapped_chunks,
                     predicate.clone(),
@@ -626,7 +622,6 @@ impl Deduplicater {
                 plans.push(Self::build_deduplicate_plan_for_chunk_with_duplicates(
                     self.ctx
                         .child_ctx("build_deduplicate_plan_for_chunk_with_duplicates"),
-                    Arc::clone(&table_name),
                     Arc::clone(&output_schema),
                     chunk_with_duplicates,
                     predicate.clone(),
@@ -645,7 +640,6 @@ impl Deduplicater {
                 );
                 let mut non_duplicate_plans = Self::build_plans_for_non_duplicates_chunks(
                     self.ctx.child_ctx("build_plans_for_non_duplicates_chunks"),
-                    Arc::clone(&table_name),
                     Arc::clone(&output_schema),
                     chunks,
                     predicate,
@@ -659,7 +653,7 @@ impl Deduplicater {
 
         if plans.is_empty() {
             // No plan generated. Something must go wrong
-            // Even if the chunks are empty, IOxReadFilterNode is still created
+            // Even if the chunks are empty, RecordBatchesExec is still created
             panic!("Internal error generating deduplicate plan");
         }
 
@@ -730,7 +724,7 @@ impl Deduplicater {
         // At least one of the overlapped chunks are not sorted
         // Either Ingesting data or data sent from Ingester to Querier will
         // fall into this case
-        if chunks.iter().any(|c| c.sort_key() == None) {
+        if chunks.iter().any(|c| c.sort_key().is_none()) {
             debug!("At least one of the overlapped chunks are not sorted");
             return None;
         }
@@ -808,13 +802,12 @@ impl Deduplicater {
     ///           │          ...             │
     ///           │                          │
     ///  ┌─────────────────┐        ┌─────────────────┐
-    ///  │IOxReadFilterNode│        │IOxReadFilterNode│
+    ///  │RecordBatchesExec│        │RecordBatchesExec│
     ///  │    (Chunk 1)    │ ...    │    (Chunk n)    │
     ///  └─────────────────┘        └─────────────────┘
     ///```
     fn build_deduplicate_plan_for_overlapped_chunks(
         ctx: IOxSessionContext,
-        table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunks: Vec<Arc<dyn QueryChunk>>, // These chunks are identified overlapped
         predicate: Predicate,
@@ -823,6 +816,9 @@ impl Deduplicater {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Note that we may need to sort/deduplicate based on tag
         // columns which do not appear in the output
+
+        let predicate =
+            predicate.push_through_dedup(&Self::compute_chunks_schema(&chunks, schema_interner));
 
         // We need to sort chunks before creating the execution plan. For that, the chunk order is used. Since the order
         // only sorts overlapping chunks, we also use the chunk ID for deterministic outputs.
@@ -848,7 +844,6 @@ impl Deduplicater {
             .map(|chunk| {
                 Self::build_sort_plan_for_read_filter(
                     ctx.child_ctx("build_sort_plan_for_read_filter"),
-                    Arc::clone(&table_name),
                     Arc::clone(&input_schema),
                     Arc::clone(chunk),
                     predicate.clone(),
@@ -899,19 +894,23 @@ impl Deduplicater {
     ///                        ▲
     ///                        │
     ///                ┌─────────────────┐
-    ///                │IOxReadFilterNode│
+    ///                │RecordBatchesExec│
     ///                │    (Chunk)      │
     ///                └─────────────────┘
     ///```
     fn build_deduplicate_plan_for_chunk_with_duplicates(
         ctx: IOxSessionContext,
-        table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunk: Arc<dyn QueryChunk>, // This chunk is identified having duplicates
         predicate: Predicate,
         output_sort_key: &SortKey,
         schema_interner: &mut SchemaInterner,
     ) -> Result<Arc<dyn ExecutionPlan>> {
+        // This will practically never matter because this can only happen for in-memory chunks which are currently
+        // backed by RecordBatches and these don't do anything with the predicate at all. However to prevent weird
+        // future issues, we still transform the predicate here. (@crepererum, 2022-11-16)
+        let predicate = predicate.push_through_dedup(&chunk.schema());
+
         let pk_schema = Self::compute_pk_schema(&[Arc::clone(&chunk)], schema_interner);
         let input_schema = Self::compute_input_schema(&output_schema, &pk_schema, schema_interner);
 
@@ -925,10 +924,9 @@ impl Deduplicater {
         // Compute the output sort key for this chunk
         let chunks = vec![chunk];
 
-        // Create the 2 bottom nodes IOxReadFilterNode and SortExec
+        // Create the 2 bottom nodes RecordBatchesExec and SortExec
         let plan = Self::build_sort_plan_for_read_filter(
             ctx.child_ctx("build_sort_plan_for_read_filter"),
-            table_name,
             Arc::clone(&input_schema),
             Arc::clone(&chunks[0]),
             predicate,
@@ -1003,7 +1001,7 @@ impl Deduplicater {
     /// This plan is applied for every chunk to read data from chunk
     /// The plan will look like this. Reading bottom up:
     ///
-    ///   1. First we scan the data in IOxReadFilterNode which represents a custom implemented scan
+    ///   1. First we scan the data in RecordBatchesExec which represents a custom implemented scan
     ///      of the chunk. Both Select Predicate of the query and Delete Predicates of the chunk is
     ///      pushed down here to eliminate as much data as early as possible but it is not
     ///      guaranteed all filters are applied because only certain expressions work at this low
@@ -1038,30 +1036,29 @@ impl Deduplicater {
     ///                          │
     ///                          │
     ///                ┌─────────────────┐
-    ///                │IOxReadFilterNode│
+    ///                │RecordBatchesExec│
     ///                │    (Chunk)      │
     ///                └─────────────────┘
     ///```
     fn build_sort_plan_for_read_filter(
         ctx: IOxSessionContext,
-        table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunk: Arc<dyn QueryChunk>,
         predicate: Predicate, // This is the select predicate of the query
         output_sort_key: Option<&SortKey>,
         schema_interner: &mut SchemaInterner,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        // Add columns of sort key and delete predicates in the schema of to-be-scanned IOxReadFilterNode
+        // Add columns of sort key and delete predicates in the schema of to-be-scanned RecordBatchesExec
         // This is needed because columns in select query may not include them yet
 
-        // Construct a schema to pass to IOxReadFilterNode that contains:
+        // Construct a schema to pass to RecordBatchesExec that contains:
         //
         // 1. all columns present in the output schema
         // 2. all columns present in the sort key that are present in the chunk
         // 3. all columns present in any delete predicates on the chunk
         //
         // Any columns present in the schema but not in the chunk, will be padded with NULLs
-        // by IOxReadFilterNode
+        // by RecordBatchesExec
         //
         // 1. ensures that the schema post-projection matches output_schema
         // 2. ensures that all columns necessary to perform the sort are present
@@ -1098,14 +1095,14 @@ impl Deduplicater {
 
         let input_schema = schema_merger.build();
 
-        // Create the bottom node IOxReadFilterNode for this chunk
-        let mut input: Arc<dyn ExecutionPlan> = Arc::new(IOxReadFilterNode::new(
-            ctx,
-            Arc::clone(&table_name),
+        // Create the bottom node RecordBatchesExec for this chunk
+        let mut input = chunks_to_physical_nodes(
             input_schema,
+            output_sort_key,
             vec![Arc::clone(&chunk)],
             predicate,
-        ));
+            ctx.inner().task_ctx(),
+        );
 
         // Add Filter operator, FilterExec, if the chunk has delete predicates
         let del_preds = chunk.delete_predicates();
@@ -1205,11 +1202,10 @@ impl Deduplicater {
         ))
     }
 
-    /// Return the simplest IOx scan plan of a given chunk which is IOxReadFilterNode
+    /// Return the simplest IOx scan plan of a given chunk which is RecordBatchesExec
     // And some optional operators on top such as applying delete predicates or sort the chunk
     fn build_plan_for_non_duplicates_chunk(
         ctx: IOxSessionContext,
-        table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunk: Arc<dyn QueryChunk>, // This chunk is identified having no duplicates
         predicate: Predicate,
@@ -1218,7 +1214,6 @@ impl Deduplicater {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         Self::build_sort_plan_for_read_filter(
             ctx,
-            table_name,
             output_schema,
             chunk,
             predicate,
@@ -1229,10 +1224,10 @@ impl Deduplicater {
 
     /// Return either
     ///  The simplest IOx scan plan for chunks without delete predicates
-    ///  and no need to sort is IOxReadFilterNode:
+    ///  and no need to sort is RecordBatchesExec:
     /// ```text
     ///                ┌─────────────────┐
-    ///                │IOxReadFilterNode│
+    ///                │RecordBatchesExec│
     ///                │ (No Chunks)     │
     ///                └─────────────────┘
     /// ```
@@ -1254,14 +1249,13 @@ impl Deduplicater {
     ///            │                                     │
     ///            │                                     │
     ///   ┌─────────────────┐                   ┌─────────────────┐
-    ///   │IOxReadFilterNode│                   │IOxReadFilterNode│
+    ///   │RecordBatchesExec│                   │RecordBatchesExec│
     ///   │    (Chunk 1)    │                   │    (Chunk n)    │
     ///   └─────────────────┘                   └─────────────────┘
     ///```
     #[allow(clippy::too_many_arguments)]
     fn build_plans_for_non_duplicates_chunks(
         ctx: IOxSessionContext,
-        table_name: Arc<str>,
         output_schema: Arc<Schema>,
         chunks: Chunks, // These chunks is identified having no duplicates
         predicate: Predicate,
@@ -1275,18 +1269,18 @@ impl Deduplicater {
 
         let mut plans: Vec<Arc<dyn ExecutionPlan>> = vec![];
 
-        // Only chunks without delete predicates should be in this one IOxReadFilterNode
+        // Only chunks without delete predicates should be in this one RecordBatchesExec
         // if there is no chunk, we still need to return a plan
         if (output_sort_key.is_none() && chunks.no_delete_predicates()) || chunks.is_empty() {
-            debug!("Build one scan IOxReadFilterNode for all non duplicated chunks even if empty");
+            debug!("Build one scan RecordBatchesExec for all non duplicated chunks even if empty");
 
-            plans.push(Arc::new(IOxReadFilterNode::new(
-                ctx,
-                Arc::clone(&table_name),
+            plans.push(chunks_to_physical_nodes(
                 output_schema,
+                output_sort_key,
                 chunks.into_no_duplicates(deduplication),
                 predicate,
-            )));
+                ctx.inner().task_ctx(),
+            ));
             return Ok(plans);
         }
 
@@ -1297,7 +1291,6 @@ impl Deduplicater {
             .map(|chunk| {
                 Self::build_plan_for_non_duplicates_chunk(
                     ctx.child_ctx("build_plan_for_non_duplicates_chunk"),
-                    Arc::clone(&table_name),
                     Arc::clone(&output_schema),
                     Arc::clone(chunk),
                     predicate.clone(),
@@ -1333,6 +1326,19 @@ impl Deduplicater {
         schema_merger.build()
     }
 
+    // Compute schema for all chunks
+    fn compute_chunks_schema<'a>(
+        chunks: impl IntoIterator<Item = &'a Arc<dyn QueryChunk>>,
+        schema_interner: &mut SchemaInterner,
+    ) -> Arc<Schema> {
+        let mut schema_merger = SchemaMerger::new().with_interner(schema_interner);
+        for chunk in chunks {
+            schema_merger = schema_merger.merge(&chunk.schema()).unwrap();
+        }
+
+        schema_merger.build()
+    }
+
     /// Find columns required to read from each scan: the output columns + the
     /// primary key columns
     fn compute_input_schema(
@@ -1355,7 +1361,9 @@ mod test {
     use super::*;
     use crate::test::{raw_data, TestChunk};
     use arrow::datatypes::DataType;
-    use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
+    use arrow_util::{
+        assert_batches_eq, assert_batches_sorted_eq, test_util::equalize_batch_schemas,
+    };
     use datafusion::physical_plan::displayable;
     use datafusion_util::test_collect;
     use schema::{builder::SchemaBuilder, TIME_COLUMN_NAME};
@@ -1451,13 +1459,13 @@ mod test {
         let sort_key = SortKey::from_columns(vec!["tag1", TIME_COLUMN_NAME]);
 
         // IOx scan operator
-        let input: Arc<dyn ExecutionPlan> = Arc::new(IOxReadFilterNode::new(
-            IOxSessionContext::with_testing(),
-            Arc::from("t"),
+        let input = chunks_to_physical_nodes(
             chunk.schema(),
+            None,
             vec![Arc::clone(&chunk)],
             Predicate::default(),
-        ));
+            IOxSessionContext::with_testing().inner().task_ctx(),
+        );
 
         // plan should not have sort operator
         let plan = format!("{}", displayable(input.as_ref()).indent());
@@ -1535,13 +1543,13 @@ mod test {
         let sort_key = SortKey::from_columns(vec!["tag1", "tag2", "tag3", TIME_COLUMN_NAME]);
 
         // IOx scan operator
-        let input: Arc<dyn ExecutionPlan> = Arc::new(IOxReadFilterNode::new(
-            IOxSessionContext::with_testing(),
-            Arc::from("t"),
+        let input = chunks_to_physical_nodes(
             chunk.schema(),
+            None,
             vec![Arc::clone(&chunk)],
             Predicate::default(),
-        ));
+            IOxSessionContext::with_testing().inner().task_ctx(),
+        );
         let batch = test_collect(Arc::clone(&input)).await;
         // data in its original non-sorted form
         let expected = vec![
@@ -1613,7 +1621,6 @@ mod test {
 
         let sort_plan = Deduplicater::build_sort_plan_for_read_filter(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             Arc::clone(&schema),
             Arc::clone(&chunk),
             Predicate::default(),
@@ -1656,7 +1663,6 @@ mod test {
 
         let sort_plan = Deduplicater::build_sort_plan_for_read_filter(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             Arc::clone(&chunk),
             Predicate::default(),
@@ -1691,7 +1697,6 @@ mod test {
 
         let plan = Deduplicater::build_deduplicate_plan_for_chunk_with_duplicates(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             Arc::clone(&chunk),
             Predicate::default(),
@@ -1722,7 +1727,6 @@ mod test {
 
         let plan = Deduplicater::build_deduplicate_plan_for_chunk_with_duplicates(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             Arc::clone(&chunk),
             Predicate::default(),
@@ -1771,7 +1775,6 @@ mod test {
         // All chunks in one single scan
         let plans = Deduplicater::build_plans_for_non_duplicates_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             Arc::clone(&schema),
             Chunks::split_overlapped_chunks(vec![Arc::clone(&chunk1), Arc::clone(&chunk2)], false)
                 .unwrap(),
@@ -1794,7 +1797,6 @@ mod test {
         // Each chunk in its own plan becasue sorting on each chunk is asked
         let plans = Deduplicater::build_plans_for_non_duplicates_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             Chunks::split_overlapped_chunks(vec![Arc::clone(&chunk1), Arc::clone(&chunk2)], false)
                 .unwrap(),
@@ -1962,7 +1964,6 @@ mod test {
         let output_sort_key = SortKey::from_columns(vec!["tag1", "tag2", "time"]);
         let sort_plan = Deduplicater::build_deduplicate_plan_for_overlapped_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             Arc::clone(&schema),
             chunks,
             Predicate::default(),
@@ -2023,7 +2024,6 @@ mod test {
 
         let sort_plan = Deduplicater::build_deduplicate_plan_for_overlapped_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             vec![chunk1, chunk2],
             Predicate::default(),
@@ -2100,7 +2100,6 @@ mod test {
         let output_sort_key = SortKey::from_columns(vec!["tag1", "tag2", "time"]);
         let sort_plan = Deduplicater::build_deduplicate_plan_for_overlapped_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             Arc::new(schema),
             chunks,
             Predicate::default(),
@@ -2163,27 +2162,30 @@ mod test {
         let chunks = vec![chunk1, chunk2, chunk3];
         // data in its original form
         let expected = vec![
-            "+-----------+------+--------------------------------+--------------------------------+",
-            "| field_int | tag1 | tag2                           | time                           |",
-            "+-----------+------+--------------------------------+--------------------------------+",
-            "| 1000      | MT   | CT                             | 1970-01-01T00:00:00.000001Z    |",
-            "| 10        | MT   | AL                             | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        | CT   | CT                             | 1970-01-01T00:00:00.000000100Z |",
-            "| 100       | AL   | MA                             | 1970-01-01T00:00:00.000000050Z |",
-            "| 5         | MT   | AL                             | 1970-01-01T00:00:00.000005Z    |",
-            "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |                                |",
-            "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |                                |",
-            "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |                                |",
-            "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |                                |",
-            "| 5         | MT   | 1970-01-01T00:00:00.000005Z    |                                |",
-            "| 1000      | MT   | 1970-01-01T00:00:00.000001Z    |                                |",
-            "| 10        | MT   | 1970-01-01T00:00:00.000007Z    |                                |",
-            "| 70        | CT   | 1970-01-01T00:00:00.000000100Z |                                |",
-            "| 100       | AL   | 1970-01-01T00:00:00.000000050Z |                                |",
-            "| 5         | MT   | 1970-01-01T00:00:00.000005Z    |                                |",
-            "+-----------+------+--------------------------------+--------------------------------+",
+            "+-----------+------+------+--------------------------------+-----------------+",
+            "| field_int | tag1 | tag2 | time                           | other_field_int |",
+            "+-----------+------+------+--------------------------------+-----------------+",
+            "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000001Z    |                 |",
+            "| 10        | MT   | AL   | 1970-01-01T00:00:00.000007Z    |                 |",
+            "| 70        | CT   | CT   | 1970-01-01T00:00:00.000000100Z |                 |",
+            "| 100       | AL   | MA   | 1970-01-01T00:00:00.000000050Z |                 |",
+            "| 5         | MT   | AL   | 1970-01-01T00:00:00.000005Z    |                 |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000001Z    | 1000            |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000007Z    | 10              |",
+            "|           | CT   |      | 1970-01-01T00:00:00.000000100Z | 70              |",
+            "|           | AL   |      | 1970-01-01T00:00:00.000000050Z | 100             |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000005Z    | 5               |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000001Z    | 1000            |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000007Z    | 10              |",
+            "|           | CT   |      | 1970-01-01T00:00:00.000000100Z | 70              |",
+            "|           | AL   |      | 1970-01-01T00:00:00.000000050Z | 100             |",
+            "|           | MT   |      | 1970-01-01T00:00:00.000005Z    | 5               |",
+            "+-----------+------+------+--------------------------------+-----------------+",
         ];
-        assert_batches_eq!(&expected, &raw_data(&chunks).await);
+        assert_batches_eq!(
+            &expected,
+            &equalize_batch_schemas(raw_data(&chunks).await).unwrap()
+        );
 
         // request just the fields
         let schema = SchemaBuilder::new()
@@ -2197,7 +2199,6 @@ mod test {
         let output_sort_key = SortKey::from_columns(vec!["tag2", "tag1", "time"]);
         let sort_plan = Deduplicater::build_deduplicate_plan_for_overlapped_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             Arc::new(schema),
             chunks,
             Predicate::default(),
@@ -2277,32 +2278,34 @@ mod test {
         let chunks = vec![chunk1, chunk2, chunk3];
         // data in its original form
         let expected = vec![
-            "+-----------+------+------+--------------------------------+",
-            "| field_int | tag1 | tag2 | time                           |",
-            "+-----------+------+------+--------------------------------+",
-            "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 10        | MT   | AL   | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        | CT   | CT   | 1970-01-01T00:00:00.000000100Z |",
-            "| 100       | AL   | MA   | 1970-01-01T00:00:00.000000050Z |",
-            "| 5         | MT   | AL   | 1970-01-01T00:00:00.000005Z    |",
-            "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 10        | MT   | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        | CT   | AL   | 1970-01-01T00:00:00.000000100Z |",
-            "| 100       | AL   | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 5         | MT   | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "| 1000      | 1000 | CT   | 1970-01-01T00:00:00.000001Z    |",
-            "| 10        | 10   | MT   | 1970-01-01T00:00:00.000007Z    |",
-            "| 70        | 70   | AL   | 1970-01-01T00:00:00.000000100Z |",
-            "| 100       | 100  | AL   | 1970-01-01T00:00:00.000000050Z |",
-            "| 5         | 5    | MT   | 1970-01-01T00:00:00.000005Z    |",
-            "+-----------+------+------+--------------------------------+",
+            "+-----------+------+------+--------------------------------+------+------------+",
+            "| field_int | tag1 | tag2 | time                           | tag3 | field_int2 |",
+            "+-----------+------+------+--------------------------------+------+------------+",
+            "| 1000      | MT   | CT   | 1970-01-01T00:00:00.000001Z    |      |            |",
+            "| 10        | MT   | AL   | 1970-01-01T00:00:00.000007Z    |      |            |",
+            "| 70        | CT   | CT   | 1970-01-01T00:00:00.000000100Z |      |            |",
+            "| 100       | AL   | MA   | 1970-01-01T00:00:00.000000050Z |      |            |",
+            "| 5         | MT   | AL   | 1970-01-01T00:00:00.000005Z    |      |            |",
+            "| 1000      | MT   |      | 1970-01-01T00:00:00.000001Z    | CT   |            |",
+            "| 10        | MT   |      | 1970-01-01T00:00:00.000007Z    | MT   |            |",
+            "| 70        | CT   |      | 1970-01-01T00:00:00.000000100Z | AL   |            |",
+            "| 100       | AL   |      | 1970-01-01T00:00:00.000000050Z | AL   |            |",
+            "| 5         | MT   |      | 1970-01-01T00:00:00.000005Z    | MT   |            |",
+            "| 1000      |      |      | 1970-01-01T00:00:00.000001Z    | CT   | 1000       |",
+            "| 10        |      |      | 1970-01-01T00:00:00.000007Z    | MT   | 10         |",
+            "| 70        |      |      | 1970-01-01T00:00:00.000000100Z | AL   | 70         |",
+            "| 100       |      |      | 1970-01-01T00:00:00.000000050Z | AL   | 100        |",
+            "| 5         |      |      | 1970-01-01T00:00:00.000005Z    | MT   | 5          |",
+            "+-----------+------+------+--------------------------------+------+------------+",
         ];
-        assert_batches_eq!(&expected, &raw_data(&chunks).await);
+        assert_batches_eq!(
+            &expected,
+            &equalize_batch_schemas(raw_data(&chunks).await).unwrap()
+        );
 
         let output_sort_key = SortKey::from_columns(vec!["tag2", "tag1", "time"]);
         let sort_plan = Deduplicater::build_deduplicate_plan_for_overlapped_chunks(
             IOxSessionContext::with_testing(),
-            Arc::from("t"),
             schema,
             chunks,
             Predicate::default(),
@@ -2868,13 +2871,13 @@ mod test {
         //         SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         //             UnionExec
         //                 SortExec: [tag1@1 ASC,time@2 ASC]                   <-- needed for deduplication
-        //                     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                     RecordBatchesExec: batches_groups=1 batches=1
         //                 SortExec: [tag1@1 ASC,time@2 ASC]                   <-- needed for deduplication
-        //                     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                     RecordBatchesExec: batches_groups=1 batches=1
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
         //         SortExec: [tag1@1 ASC,time@2 ASC]                           <-- needed for deduplication
-        //             IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate   <-- no sort above this because it
+        //             RecordBatchesExec: batches_groups=1 batches=1
+        //     RecordBatchesExec: batches_groups=1 batches=1                   <-- no sort above this because it
         //                                                                         does not need to get deduplicated
         //                                                                         and the plan output is not sorted
 
@@ -2882,8 +2885,8 @@ mod test {
         let count = plan_str.matches("SortExec").count();
         assert_eq!(count, 3);
 
-        // Verify 4 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 4 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 4);
 
         // Verify 2 DeduplicateExec
@@ -2935,9 +2938,9 @@ mod test {
             .build_scan_plan(Arc::from("t"), schema, chunks, Predicate::default(), None)
             .unwrap();
 
-        // Plan is very simple with one single IOxReadFilterNode that includes 4 chunks
+        // Plan is very simple with one single RecordBatchesExec that includes 4 chunks
         let plan_str = format!("{}", displayable(plan.as_ref()).indent());
-        let expected_plan = "IOxReadFilterNode: table_name=t, chunks=4 predicate=Predicate\n";
+        let expected_plan = "RecordBatchesExec: batches_groups=4 batches=4\n";
         assert_eq!(plan_str, expected_plan);
 
         let batch = test_collect(plan).await;
@@ -3095,21 +3098,21 @@ mod test {
         //             SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         //                 UnionExec
         //                     SortExec: [tag1@1 ASC,time@2 ASC]  <-- needed for deduplication
-        //                         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                         RecordBatchesExec: batches_groups=1 batches=1
         //                     SortExec: [tag1@1 ASC,time@2 ASC]  <-- needed for deduplication
-        //                         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                         RecordBatchesExec: batches_groups=1 batches=1
         //         DeduplicateExec: [tag1@1 ASC,time@2 ASC]
         //             SortExec: [tag1@1 ASC,time@2 ASC]         <-- needed for deduplication
-        //                 IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                 RecordBatchesExec: batches_groups=1 batches=1
         //         SortExec: [tag1@1 ASC,time@2 ASC]              <-- needed because the plan output is asked to get sorted
-        //            IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //            RecordBatchesExec: batches_groups=1 batches=1
 
         //  Verify 4 SortExec
         let count = plan_str.matches("SortExec").count();
         assert_eq!(count, 4);
 
-        // Verify 4 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 4 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 4);
 
         // Verify 2 DeduplicateExec
@@ -3167,21 +3170,21 @@ mod test {
         // "SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         // \n  UnionExec
         // \n    SortExec: [tag1@1 ASC,time@2 ASC]
-        // \n      IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        // \n      RecordBatchesExec: batches_groups=1 batches=1
         // \n    SortExec: [tag1@1 ASC,time@2 ASC]
-        // \n      IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        // \n      RecordBatchesExec: batches_groups=1 batches=1
         // \n    SortExec: [tag1@1 ASC,time@2 ASC]
-        // \n      IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        // \n      RecordBatchesExec: batches_groups=1 batches=1
         // \n    SortExec: [tag1@1 ASC,time@2 ASC]
-        // \n      IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate\n"
+        // \n      RecordBatchesExec: batches_groups=1 batches=1
         let plan_str = format!("{}", displayable(plan.as_ref()).indent());
 
         //  Verify 4 SortExec
         let count = plan_str.matches("SortExec").count();
         assert_eq!(count, 4);
 
-        // Verify 4 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 4 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 4);
 
         // Verify no DeduplicateExec
@@ -3278,19 +3281,19 @@ mod test {
         //         DeduplicateExec: [tag1@1 ASC,time@2 ASC]
         //             SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         //                 UnionExec
-        //                     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //                     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                     RecordBatchesExec: batches_groups=1 batches=1
+        //                     RecordBatchesExec: batches_groups=1 batches=1
         //         DeduplicateExec: [tag1@1 ASC,time@2 ASC]
-        //             IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //             RecordBatchesExec: batches_groups=1 batches=1
+        //         RecordBatchesExec: batches_groups=1 batches=1
         let plan_str = format!("{}", displayable(plan.as_ref()).indent());
-        //println!("{}", plan_str);
+        println!("{}", plan_str);
 
         //  Verify no SortExec because chunks are already sorted on the specified sort_key
         assert!(!plan_str.contains("SortExec"));
 
-        // Verify 4 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 4 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 4);
 
         // Verify 2 DeduplicateExec
@@ -3315,10 +3318,10 @@ mod test {
         //
         // "SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         // \n  UnionExec
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate\n"
+        // \n    RecordBatchesExec: batches_groups=1 batches=1
+        // \n    RecordBatchesExec: batches_groups=1 batches=1
+        // \n    RecordBatchesExec: batches_groups=1 batches=1
+        // \n    RecordBatchesExec: batches_groups=1 batches=1\n"
         let plan = deduplicator
             .build_scan_plan(
                 Arc::from("t"),
@@ -3333,8 +3336,8 @@ mod test {
         //  Verify no SortExec because chunks are already sorted on the specified sort_key
         assert!(!plan_str.contains("SortExec"));
 
-        // Verify 4 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 4 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 4);
 
         // Verify 2 DeduplicateExec
@@ -3351,7 +3354,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn alread_sorted_scan_plan_with_two_partitions_explain() {
+    async fn already_sorted_scan_plan_with_two_partitions_explain() {
         test_helpers::maybe_start_logging();
 
         // ------------
@@ -3509,30 +3512,30 @@ mod test {
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
         //         SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         //             UnionExec
-        //                 IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //                 IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                 RecordBatchesExec: batches_groups=1 batches=1
+        //                 RecordBatchesExec: batches_groups=1 batches=1
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
         //         SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         //             UnionExec
-        //                 IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //                 IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //                 RecordBatchesExec: batches_groups=1 batches=1
+        //                 RecordBatchesExec: batches_groups=1 batches=1
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
-        //         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //         RecordBatchesExec: batches_groups=1 batches=1
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
-        //         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //         RecordBatchesExec: batches_groups=1 batches=1
         //     DeduplicateExec: [tag1@1 ASC,time@2 ASC]
-        //         IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        //     IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
+        //         RecordBatchesExec: batches_groups=1 batches=1
+        //     RecordBatchesExec: batches_groups=1 batches=1
+        //     RecordBatchesExec: batches_groups=1 batches=1
+        //     RecordBatchesExec: batches_groups=1 batches=1
         let plan_str = format!("{}", displayable(plan.as_ref()).indent());
         println!("{}", plan_str);
 
         //  Verify no SortExec because chunks are already sorted on the specified sort_key
         assert!(!plan_str.contains("SortExec"));
 
-        // Verify 10 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 10 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 10);
 
         // Verify 5 DeduplicateExec
@@ -3566,16 +3569,16 @@ mod test {
         //
         // "SortPreservingMergeExec: [tag1@1 ASC,time@2 ASC]
         // \n  UnionExec
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate
-        // ..... (8 more IOxReadFilterNodes here)
-        // \n    IOxReadFilterNode: table_name=t, chunks=1 predicate=Predicate\n"
+        // \n    RecordBatchesExec: batches_groups=1 batches=1
+        // ..... (8 more RecordBatcheExec here)
+        // \n    RecordBatchesExec: batches_groups=1 batches=1\n"
         let plan_str = format!("{}", displayable(plan.as_ref()).indent());
 
         //  Verify no SortExec because chunks are already sorted on the specified sort_key
         assert!(!plan_str.contains("SortExec"));
 
-        // Verify 10 IOxReadFilterNode
-        let count = plan_str.matches("IOxReadFilterNode").count();
+        // Verify 10 RecordBatchesExec
+        let count = plan_str.matches("RecordBatchesExec").count();
         assert_eq!(count, 10);
 
         // Verify 5 DeduplicateExec

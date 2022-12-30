@@ -9,15 +9,17 @@ use futures::{stream::FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
 use hyper::{Body, Request, StatusCode};
 use iox_catalog::{interface::Catalog, mem::MemCatalog};
+use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, DurationHistogram, Metric, Registry, U64Counter};
 use mutable_batch::MutableBatch;
 use router::{
     dml_handlers::{
         Chain, DmlError, DmlHandlerChainExt, FanOutAdaptor, InstrumentationDecorator, Partitioned,
-        Partitioner, SchemaError, SchemaValidator, ShardedWriteBuffer, WriteSummaryAdapter,
+        Partitioner, RetentionError, RetentionValidator, SchemaError, SchemaValidator,
+        ShardedWriteBuffer, WriteSummaryAdapter,
     },
     namespace_cache::{MemoryNamespaceCache, ShardedCache},
-    namespace_resolver::{NamespaceAutocreation, NamespaceSchemaResolver},
+    namespace_resolver::{MissingNamespaceAction, NamespaceAutocreation, NamespaceSchemaResolver},
     server::http::HttpDelegate,
     shard::Shard,
 };
@@ -35,6 +37,9 @@ const TEST_TOPIC_ID: i64 = 1;
 /// handler stack for namespaces it has not yet observed.
 const TEST_QUERY_POOL_ID: i64 = 1;
 
+/// Common retention period value we'll use in tests
+const TEST_RETENTION_PERIOD_NS: Option<i64> = Some(3_600 * 1_000_000_000);
+
 pub struct TestContext {
     delegate: HttpDelegateStack,
     catalog: Arc<dyn Catalog>,
@@ -49,7 +54,13 @@ pub struct TestContext {
 type HttpDelegateStack = HttpDelegate<
     InstrumentationDecorator<
         Chain<
-            Chain<SchemaValidator<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>, Partitioner>,
+            Chain<
+                Chain<
+                    RetentionValidator<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>,
+                    SchemaValidator<Arc<ShardedCache<Arc<MemoryNamespaceCache>>>>,
+                >,
+                Partitioner,
+            >,
             WriteSummaryAdapter<
                 FanOutAdaptor<
                     ShardedWriteBuffer<JumpHash<Arc<Shard>>>,
@@ -67,9 +78,11 @@ type HttpDelegateStack = HttpDelegate<
 /// A [`router`] stack configured with the various DML handlers using mock
 /// catalog / write buffer backends.
 impl TestContext {
-    pub fn new() -> Self {
+    pub fn new(autocreate_ns: bool, ns_autocreate_retention_period_ns: Option<i64>) -> Self {
         let metrics = Arc::new(metric::Registry::default());
-        let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
+        let time = iox_time::MockProvider::new(
+            iox_time::Time::from_timestamp_millis(668563200000).unwrap(),
+        );
 
         let write_buffer = MockBufferForWriting::new(
             MockBufferSharedState::empty_with_n_shards(1.try_into().unwrap()),
@@ -93,20 +106,22 @@ impl TestContext {
             iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
         ));
 
+        let retention_validator =
+            RetentionValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
         let schema_validator =
-            SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &*metrics);
+            SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &metrics);
         let partitioner = Partitioner::new(PartitionTemplate {
             parts: vec![TemplatePart::TimeFormat("%Y-%m-%d".to_owned())],
         });
 
-        let handler_stack =
-            schema_validator
-                .and_then(partitioner)
-                .and_then(WriteSummaryAdapter::new(FanOutAdaptor::new(
-                    sharded_write_buffer,
-                )));
+        let handler_stack = retention_validator
+            .and_then(schema_validator)
+            .and_then(partitioner)
+            .and_then(WriteSummaryAdapter::new(FanOutAdaptor::new(
+                sharded_write_buffer,
+            )));
 
-        let handler_stack = InstrumentationDecorator::new("request", &*metrics, handler_stack);
+        let handler_stack = InstrumentationDecorator::new("request", &metrics, handler_stack);
 
         let namespace_resolver =
             NamespaceSchemaResolver::new(Arc::clone(&catalog), Arc::clone(&ns_cache));
@@ -116,7 +131,13 @@ impl TestContext {
             Arc::clone(&catalog),
             TopicId::new(TEST_TOPIC_ID),
             QueryPoolId::new(TEST_QUERY_POOL_ID),
-            iox_catalog::INFINITE_RETENTION_POLICY.to_owned(),
+            {
+                if autocreate_ns {
+                    MissingNamespaceAction::AutoCreate(ns_autocreate_retention_period_ns)
+                } else {
+                    MissingNamespaceAction::Reject
+                }
+            },
         );
 
         let delegate = HttpDelegate::new(1024, 100, namespace_resolver, handler_stack, &metrics);
@@ -148,22 +169,49 @@ impl TestContext {
     pub fn metrics(&self) -> &Registry {
         self.metrics.as_ref()
     }
+
+    /// Return the [`TableId`] in the catalog for `name` in `namespace`, or panic.
+    pub async fn table_id(&self, namespace: &str, name: &str) -> TableId {
+        let mut repos = self.catalog.repositories().await;
+        let namespace_id = repos
+            .namespaces()
+            .get_by_name(namespace)
+            .await
+            .expect("query failed")
+            .expect("namespace does not exist")
+            .id;
+
+        repos
+            .tables()
+            .get_by_namespace_and_name(namespace_id, name)
+            .await
+            .expect("query failed")
+            .expect("no table entry for the specified namespace/table name pair")
+            .id
+    }
 }
 
 impl Default for TestContext {
     fn default() -> Self {
-        Self::new()
+        Self::new(true, None)
     }
 }
 
 #[tokio::test]
 async fn test_write_ok() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new(true, None);
+
+    // Write data inside retention period
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos,tag1=A,tag2=B val=42i ".to_string() + &now;
 
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from("platanos,tag1=A,tag2=B val=42i 123456"))
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
 
     let response = ctx
@@ -178,8 +226,8 @@ async fn test_write_ok() {
     let writes = ctx.write_buffer_state().get_messages(ShardIndex::new(0));
     assert_eq!(writes.len(), 1);
     assert_matches!(writes.as_slice(), [Ok(DmlOperation::Write(w))] => {
-        assert_eq!(w.namespace(), "bananas_test");
-        assert!(w.table("platanos").is_some());
+        let table_id = ctx.table_id("bananas_test", "platanos").await;
+        assert!(w.table(&table_id).is_some());
     });
 
     // Ensure the catalog saw the namespace creation
@@ -193,12 +241,9 @@ async fn test_write_ok() {
         .expect("query should succeed")
         .expect("namespace not found");
     assert_eq!(ns.name, "bananas_test");
-    assert_eq!(
-        ns.retention_duration.as_deref(),
-        Some(iox_catalog::INFINITE_RETENTION_POLICY)
-    );
     assert_eq!(ns.topic_id, TopicId::new(TEST_TOPIC_ID));
     assert_eq!(ns.query_pool_id, QueryPoolId::new(TEST_QUERY_POOL_ID));
+    assert_eq!(ns.retention_period_ns, None);
 
     // Ensure the metric instrumentation was hit
     let histogram = ctx
@@ -239,13 +284,53 @@ async fn test_write_ok() {
 }
 
 #[tokio::test]
-async fn test_schema_conflict() {
-    let ctx = TestContext::new();
+async fn test_write_outside_retention_period() {
+    let ctx = TestContext::new(true, TEST_RETENTION_PERIOD_NS);
+
+    // Write data outside retention period into a new table
+    let two_hours_ago =
+        (SystemProvider::default().now().timestamp_nanos() - 2 * 3_600 * 1_000_000_000).to_string();
+    let lp = "apple,tag1=AAA,tag2=BBB val=422i ".to_string() + &two_hours_ago;
 
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from("platanos,tag1=A,tag2=B val=42i 123456"))
+        .body(Body::from(lp))
+        .expect("failed to construct HTTP request");
+
+    let err = ctx
+        .delegate()
+        .route(request)
+        .await
+        .expect_err("LP write request should fail");
+
+    assert_matches!(
+        &err,
+        router::server::http::Error::DmlHandler(
+            DmlError::Retention(
+                RetentionError::OutsideRetention(e))
+        ) => {
+            assert_eq!(e, "apple");
+        }
+    );
+    assert_eq!(err.as_status_code(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn test_schema_conflict() {
+    let ctx = TestContext::new(true, None);
+
+    // data inside the retention period
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos,tag1=A,tag2=B val=42i ".to_string() + &now;
+
+    let request = Request::builder()
+        .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
+        .method("POST")
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
 
     let response = ctx
@@ -256,10 +341,16 @@ async fn test_schema_conflict() {
 
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos,tag1=A,tag2=B val=42.0 ".to_string() + &now;
+
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from("platanos,tag1=A,tag2=B val=42.0 123457"))
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
 
     let err = ctx
@@ -292,14 +383,53 @@ async fn test_schema_conflict() {
 }
 
 #[tokio::test]
+async fn test_rejected_ns() {
+    let ctx = TestContext::new(false, None);
+
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos,tag1=A,tag2=B val=42i ".to_string() + &now;
+
+    let request = Request::builder()
+        .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
+        .method("POST")
+        .body(Body::from(lp))
+        .expect("failed to construct HTTP request");
+
+    let err = ctx
+        .delegate()
+        .route(request)
+        .await
+        .expect_err("should error");
+    assert_matches!(
+        err,
+        router::server::http::Error::NamespaceResolver(
+            // can't check the type of the create error without making ns_autocreation public, but
+            // not worth it just for this test, as the correct error is asserted in unit tests in
+            // that module. here it's just important that the write fails.
+            router::namespace_resolver::Error::Create(_)
+        )
+    );
+    assert_eq!(err.as_status_code(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn test_schema_limit() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new(true, None);
+
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos,tag1=A,tag2=B val=42i ".to_string() + &now;
 
     // Drive the creation of the namespace
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from("platanos,tag1=A,tag2=B val=42i 123456"))
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
     let response = ctx
         .delegate()
@@ -318,10 +448,16 @@ async fn test_schema_limit() {
         .expect("failed to update table limit");
 
     // Attempt to create another table
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = "platanos2,tag1=A,tag2=B val=42i ".to_string() + &now;
+
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from("platanos2,tag1=A,tag2=B val=42i 123456"))
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
     let err = ctx
         .delegate()
@@ -347,7 +483,7 @@ async fn test_schema_limit() {
 
 #[tokio::test]
 async fn test_write_propagate_ids() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new(true, None);
 
     // Create the namespace and a set of tables.
     let ns = ctx
@@ -357,7 +493,7 @@ async fn test_write_propagate_ids() {
         .namespaces()
         .create(
             "bananas_test",
-            iox_catalog::INFINITE_RETENTION_POLICY,
+            None,
             TopicId::new(TEST_TOPIC_ID),
             QueryPoolId::new(TEST_QUERY_POOL_ID),
         )
@@ -384,18 +520,26 @@ async fn test_write_propagate_ids() {
         .collect::<HashMap<_, _>>()
         .await;
 
+    // data inside the retention period
+    let now = SystemProvider::default()
+        .now()
+        .timestamp_nanos()
+        .to_string();
+    let lp = format! {
+        "
+            platanos,tag1=A,tag2=B val=42i {}\n\
+            another,tag1=A,tag2=B val=42i {}\n\
+            test,tag1=A,tag2=B val=42i {}\n\
+            platanos,tag1=A,tag2=B val=42i {}\n\
+            table,tag1=A,tag2=B val=42i {}\n\
+        ", now, now, now, now, now
+
+    };
+
     let request = Request::builder()
         .uri("https://bananas.example/api/v2/write?org=bananas&bucket=test")
         .method("POST")
-        .body(Body::from(
-            "\
-                platanos,tag1=A,tag2=B val=42i 123456\n\
-                another,tag1=A,tag2=B val=42i 123458\n\
-                test,tag1=A,tag2=B val=42i 123458\n\
-                platanos,tag1=A,tag2=B val=42i 123458\n\
-                table,tag1=A,tag2=B val=42i 123458\n\
-            ",
-        ))
+        .body(Body::from(lp))
         .expect("failed to construct HTTP request");
 
     let response = ctx
@@ -410,19 +554,17 @@ async fn test_write_propagate_ids() {
     let writes = ctx.write_buffer_state().get_messages(ShardIndex::new(0));
     assert_eq!(writes.len(), 1);
     assert_matches!(writes.as_slice(), [Ok(DmlOperation::Write(w))] => {
-        assert_eq!(w.namespace(), "bananas_test");
-        assert_eq!(unsafe { w.namespace_id() } , ns.id);
-        assert!(w.table("platanos").is_some());
+        assert_eq!(w.namespace_id(), ns.id);
 
-        for (name, id) in ids {
-            assert_eq!(unsafe { w.table_id(name).unwrap() }, id);
+        for id in ids.values() {
+            assert!(w.table(id).is_some());
         }
     });
 }
 
 #[tokio::test]
 async fn test_delete_propagate_ids() {
-    let ctx = TestContext::new();
+    let ctx = TestContext::new(true, None);
 
     // Create the namespace and a set of tables.
     let ns = ctx
@@ -432,7 +574,7 @@ async fn test_delete_propagate_ids() {
         .namespaces()
         .create(
             "bananas_test",
-            iox_catalog::INFINITE_RETENTION_POLICY,
+            None,
             TopicId::new(TEST_TOPIC_ID),
             QueryPoolId::new(TEST_QUERY_POOL_ID),
         )
@@ -463,7 +605,6 @@ async fn test_delete_propagate_ids() {
     let writes = ctx.write_buffer_state().get_messages(ShardIndex::new(0));
     assert_eq!(writes.len(), 1);
     assert_matches!(writes.as_slice(), [Ok(DmlOperation::Delete(w))] => {
-        assert_eq!(w.namespace(), "bananas_test");
-        assert_eq!(unsafe { w.namespace_id() } , ns.id);
+        assert_eq!(w.namespace_id(), ns.id);
     });
 }

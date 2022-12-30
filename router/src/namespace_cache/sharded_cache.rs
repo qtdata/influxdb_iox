@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use data_types::{DatabaseName, NamespaceSchema};
+use data_types::{NamespaceName, NamespaceSchema};
 use sharder::JumpHash;
 
 use super::NamespaceCache;
@@ -25,13 +25,13 @@ impl<T> NamespaceCache for Arc<ShardedCache<T>>
 where
     T: NamespaceCache,
 {
-    fn get_schema(&self, namespace: &DatabaseName<'_>) -> Option<Arc<NamespaceSchema>> {
+    fn get_schema(&self, namespace: &NamespaceName<'_>) -> Option<Arc<NamespaceSchema>> {
         self.shards.hash(namespace).get_schema(namespace)
     }
 
     fn put_schema(
         &self,
-        namespace: DatabaseName<'static>,
+        namespace: NamespaceName<'static>,
         schema: impl Into<Arc<NamespaceSchema>>,
     ) -> Option<Arc<NamespaceSchema>> {
         self.shards.hash(&namespace).put_schema(namespace, schema)
@@ -48,14 +48,14 @@ mod tests {
     use super::*;
     use crate::namespace_cache::MemoryNamespaceCache;
 
-    fn rand_namespace() -> DatabaseName<'static> {
+    fn rand_namespace() -> NamespaceName<'static> {
         thread_rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
             .collect::<String>()
             .try_into()
-            .expect("generated invalid random database name")
+            .expect("generated invalid random namespace name")
     }
 
     fn schema_with_id(id: i64) -> NamespaceSchema {
@@ -65,6 +65,7 @@ mod tests {
             query_pool_id: QueryPoolId::new(1),
             tables: Default::default(),
             max_columns_per_table: 7,
+            retention_period_ns: None,
         }
     }
 

@@ -371,41 +371,31 @@ pub mod test_utils {
         test_flush(&adapter).await;
     }
 
-    /// Parse the provided line-protocol and return both the table ID indexed
-    /// data map, and the table ID to table name map.
+    /// Parse the provided line-protocol and return the table ID indexed data map.
     ///
     /// Makes up the namespace ID & table IDs.
-    pub fn lp_to_batches(lp: &str) -> (HashMap<String, MutableBatch>, HashMap<String, TableId>) {
+    pub fn lp_to_batches(lp: &str) -> HashMap<TableId, MutableBatch> {
         mutable_batch_lp::lines_to_batches(lp, 0)
             .unwrap()
             .into_iter()
             .enumerate()
-            .map(|(idx, (name, data))| {
-                let idx = idx as i64;
-                let name_mapping = (name.clone(), data);
-                let id_mapping = (name, TableId::new(idx));
-
-                (name_mapping, id_mapping)
-            })
-            .unzip()
+            .map(|(idx, (_table_name, batch))| (TableId::new(idx as _), batch))
+            .collect()
     }
 
     /// Writes line protocol and returns the [`DmlWrite`] that was written.
     pub async fn write(
-        namespace: &str,
         writer: &impl WriteBufferWriting,
         lp: &str,
         shard_index: ShardIndex,
         partition_key: PartitionKey,
         span_context: Option<&SpanContext>,
     ) -> DmlWrite {
-        let (tables, names) = lp_to_batches(lp);
+        let tables = lp_to_batches(lp);
 
         let write = DmlWrite::new(
-            namespace,
             NamespaceId::new(42),
             tables,
-            names,
             partition_key,
             DmlMeta::unsequenced(span_context.cloned()),
         );
@@ -454,7 +444,6 @@ pub mod test_utils {
 
         // adding content allows us to get results
         let w1 = write(
-            "namespace",
             &writer,
             entry_1,
             shard_index,
@@ -470,7 +459,6 @@ pub mod test_utils {
 
         // adding more data unblocks the stream
         let w2 = write(
-            "namespace",
             &writer,
             entry_2,
             shard_index,
@@ -479,7 +467,6 @@ pub mod test_utils {
         )
         .await;
         let w3 = write(
-            "namespace",
             &writer,
             entry_3,
             shard_index,
@@ -517,7 +504,6 @@ pub mod test_utils {
         let shard_index = ShardIndex::new(0);
 
         let w1 = write(
-            "namespace",
             &writer,
             entry_1,
             shard_index,
@@ -526,7 +512,6 @@ pub mod test_utils {
         )
         .await;
         let w2 = write(
-            "namespace",
             &writer,
             entry_2,
             shard_index,
@@ -535,7 +520,6 @@ pub mod test_utils {
         )
         .await;
         let w3 = write(
-            "namespace",
             &writer,
             entry_3,
             shard_index,
@@ -610,7 +594,6 @@ pub mod test_utils {
 
         // entries arrive at the right target stream
         let w1 = write(
-            "namespace",
             &writer,
             entry_1,
             shard_index_1,
@@ -622,7 +605,6 @@ pub mod test_utils {
         assert_stream_pending(&mut stream_2).await;
 
         let w2 = write(
-            "namespace",
             &writer,
             entry_2,
             shard_index_2,
@@ -634,7 +616,6 @@ pub mod test_utils {
         assert_write_op_eq(&stream_2.next().await.unwrap().unwrap(), &w2);
 
         let w3 = write(
-            "namespace",
             &writer,
             entry_3,
             shard_index_1,
@@ -681,7 +662,6 @@ pub mod test_utils {
         let shard_index_2 = set_pop_first(&mut shard_indexes_1).unwrap();
 
         let w_east_1 = write(
-            "namespace",
             &writer_1,
             entry_east_1,
             shard_index_1,
@@ -690,7 +670,6 @@ pub mod test_utils {
         )
         .await;
         let w_west_1 = write(
-            "namespace",
             &writer_1,
             entry_west_1,
             shard_index_2,
@@ -699,7 +678,6 @@ pub mod test_utils {
         )
         .await;
         let w_east_2 = write(
-            "namespace",
             &writer_2,
             entry_east_2,
             shard_index_1,
@@ -745,7 +723,6 @@ pub mod test_utils {
         let shard_index_2 = set_pop_first(&mut shard_indexes).unwrap();
 
         let w_east_1 = write(
-            "namespace",
             &writer,
             entry_east_1,
             shard_index_1,
@@ -754,7 +731,6 @@ pub mod test_utils {
         )
         .await;
         let w_east_2 = write(
-            "namespace",
             &writer,
             entry_east_2,
             shard_index_1,
@@ -763,7 +739,6 @@ pub mod test_utils {
         )
         .await;
         let w_west_1 = write(
-            "namespace",
             &writer,
             entry_west_1,
             shard_index_2,
@@ -812,7 +787,6 @@ pub mod test_utils {
         );
 
         let w_east_3 = write(
-            "namespace",
             &writer,
             entry_east_3,
             ShardIndex::new(0),
@@ -855,7 +829,6 @@ pub mod test_utils {
         let shard_index_1 = set_pop_first(&mut shard_indexes).unwrap();
 
         let w_east_1 = write(
-            "namespace",
             &writer,
             entry_east_1,
             shard_index_1,
@@ -864,7 +837,6 @@ pub mod test_utils {
         )
         .await;
         let w_east_2 = write(
-            "namespace",
             &writer,
             entry_east_2,
             shard_index_1,
@@ -928,7 +900,6 @@ pub mod test_utils {
 
         // high water mark moves
         write(
-            "namespace",
             &writer,
             entry_east_1,
             shard_index_1,
@@ -937,7 +908,6 @@ pub mod test_utils {
         )
         .await;
         let w1 = write(
-            "namespace",
             &writer,
             entry_east_2,
             shard_index_1,
@@ -946,7 +916,6 @@ pub mod test_utils {
         )
         .await;
         let w2 = write(
-            "namespace",
             &writer,
             entry_west_1,
             shard_index_2,
@@ -971,7 +940,7 @@ pub mod test_utils {
         T: TestAdapter,
     {
         // Note: Roundtrips are only guaranteed for millisecond-precision
-        let t0 = Time::from_timestamp_millis(129);
+        let t0 = Time::from_timestamp_millis(129).unwrap();
         let time = Arc::new(iox_time::MockProvider::new(t0));
         let context = adapter
             .new_context_with_time(
@@ -990,7 +959,6 @@ pub mod test_utils {
         let shard_index = set_pop_first(&mut shard_indexes).unwrap();
 
         let write = write(
-            "namespace",
             &writer,
             entry,
             shard_index,
@@ -1020,7 +988,7 @@ pub mod test_utils {
         T: TestAdapter,
     {
         // Note: Roundtrips are only guaranteed for millisecond-precision
-        let t0 = Time::from_timestamp_millis(129);
+        let t0 = Time::from_timestamp_millis(129).unwrap();
         let time_provider = Arc::new(iox_time::MockProvider::new(t0));
         let context = adapter
             .new_context_with_time(
@@ -1040,7 +1008,6 @@ pub mod test_utils {
         // Two ops with the same partition keys, first write at time 100
         time_provider.set(time_provider.inc(Duration::from_millis(100)));
         write(
-            "ns1",
             &writer,
             "table foo=1",
             shard_index,
@@ -1052,7 +1019,6 @@ pub mod test_utils {
         // second write @ time 200
         time_provider.set(time_provider.inc(Duration::from_millis(100)));
         write(
-            "ns1",
             &writer,
             "table foo=1",
             shard_index,
@@ -1064,7 +1030,6 @@ pub mod test_utils {
         // third write @ time 300
         time_provider.set(time_provider.inc(Duration::from_millis(100)));
         write(
-            "ns1",
             &writer,
             "table foo=1",
             shard_index,
@@ -1186,7 +1151,6 @@ pub mod test_utils {
 
         // 1: no context
         write(
-            "namespace",
             &writer,
             entry,
             shard_index,
@@ -1206,7 +1170,6 @@ pub mod test_utils {
         // 2: some context
         let span_context_1 = SpanContext::new(Arc::clone(&collector) as Arc<_>);
         write(
-            "namespace",
             &writer,
             entry,
             shard_index,
@@ -1219,7 +1182,6 @@ pub mod test_utils {
         let span_context_parent = SpanContext::new(Arc::clone(&collector) as Arc<_>);
         let span_context_2 = span_context_parent.child("foo").ctx;
         write(
-            "namespace",
             &writer,
             entry,
             shard_index,
@@ -1249,12 +1211,10 @@ pub mod test_utils {
     {
         let context = adapter.new_context(NonZeroU32::try_from(1).unwrap()).await;
 
-        let (tables, names) = lp_to_batches("upc user=1 100");
+        let tables = lp_to_batches("upc user=1 100");
         let write = DmlWrite::new(
-            "foo",
             NamespaceId::new(42),
             tables,
-            names,
             "bananas".into(),
             Default::default(),
         );
@@ -1294,7 +1254,6 @@ pub mod test_utils {
         let shard_index = set_pop_first(&mut shard_indexes).unwrap();
 
         let w1 = write(
-            "namespace_1",
             &writer,
             entry_2,
             shard_index,
@@ -1303,7 +1262,6 @@ pub mod test_utils {
         )
         .await;
         let w2 = write(
-            "namespace_2",
             &writer,
             entry_1,
             shard_index,
@@ -1337,7 +1295,6 @@ pub mod test_utils {
                     let entry = format!("upc,region=east user={} {}", i, i);
 
                     write(
-                        "ns",
                         writer.as_ref(),
                         &entry,
                         shard_index,
@@ -1494,12 +1451,9 @@ pub mod test_utils {
                     panic!(
                         "TEST_INTEGRATION is set which requires running integration tests, but \
                         KAFKA_CONNECT is not set. Please run Kafka, perhaps by using the command \
-                        `docker-compose -f docker/ci-kafka-docker-compose.yml up kafka`, then \
-                        set KAFKA_CONNECT to the host and port where Kafka is accessible. If \
-                        running the `docker-compose` command and the Rust tests on the host, the \
-                        value for `KAFKA_CONNECT` should be `localhost:9093`. If running the Rust \
-                        tests in another container in the `docker-compose` network as on CI, \
-                        `KAFKA_CONNECT` should be `kafka:9092`."
+                        `docker-compose -f integration-docker-compose.yml up redpanda`, then \
+                        set KAFKA_CONNECT to the host and port where Kafka is accessible. In \
+                        this case the `KAFKA_CONNECT` envvar should be `localhost:9092`."
                     )
                 }
                 (false, Some(_)) => {

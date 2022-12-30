@@ -1,15 +1,18 @@
 use self::{
-    flight_client::{Error as FlightClientError, FlightClient, FlightClientImpl, FlightError},
+    circuit_breaker::CircuitBreakerFlightClient,
+    flight_client::{
+        Error as FlightClientError, FlightClientImpl, FlightError, IngesterFlightClient,
+    },
     test_util::MockIngesterConnection,
 };
-use crate::cache::CatalogCache;
+use crate::cache::{namespace::CachedTable, CatalogCache};
 use arrow::{datatypes::DataType, error::ArrowError, record_batch::RecordBatch};
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig, BackoffError};
 use client_util::connection;
 use data_types::{
-    ChunkId, ChunkOrder, IngesterMapping, PartitionId, SequenceNumber, ShardId, ShardIndex,
-    TableSummary, TimestampMinMax,
+    ChunkId, ChunkOrder, IngesterMapping, NamespaceId, PartitionId, SequenceNumber, ShardId,
+    ShardIndex, TableSummary, TimestampMinMax,
 };
 use datafusion::error::DataFusionError;
 use futures::{stream::FuturesUnordered, TryStreamExt};
@@ -18,9 +21,8 @@ use generated_types::{
     ingester::{encode_proto_predicate_as_base64, IngesterQueryRequest},
     write_info::merge_responses,
 };
-use influxdb_iox_client::flight::{
-    generated_types::IngesterQueryResponseMetadata, low_level::LowLevelMessage,
-};
+use influxdb_iox_client::flight::generated_types::IngesterQueryResponseMetadata;
+use iox_arrow_flight::DecodedPayload;
 use iox_query::{
     exec::{stringset::StringSet, IOxSessionContext},
     util::{compute_timenanosecond_min_max, create_basic_summary},
@@ -39,7 +41,9 @@ use std::{
     time::Duration,
 };
 use trace::span::{Span, SpanRecorder};
+use uuid::Uuid;
 
+mod circuit_breaker;
 pub(crate) mod flight_client;
 pub(crate) mod test_util;
 
@@ -133,25 +137,63 @@ pub enum Error {
         "Shard index {shard_index} was neither mapped to an ingester nor marked ignore"
     ))]
     ShardNotMapped { shard_index: ShardIndex },
+
+    #[snafu(display("Could not parse `{ingester_uuid}` as a UUID: {source}"))]
+    IngesterUuid {
+        ingester_uuid: String,
+        source: uuid::Error,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Create a new set of connections given a map of shard indexes to Ingester configurations
-pub fn create_ingester_connections_by_shard(
-    shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
+/// Create a new set of connections given ingester configurations
+pub fn create_ingester_connections(
+    shard_to_ingesters: Option<HashMap<ShardIndex, IngesterMapping>>,
+    ingester_addresses: Option<Vec<Arc<str>>>,
     catalog_cache: Arc<CatalogCache>,
+    open_circuit_after_n_errors: u64,
 ) -> Arc<dyn IngesterConnection> {
-    Arc::new(IngesterConnectionImpl::by_shard(
-        shard_to_ingesters,
-        catalog_cache,
-        BackoffConfig {
-            init_backoff: Duration::from_millis(100),
-            max_backoff: Duration::from_secs(1),
-            base: 3.0,
-            deadline: Some(Duration::from_secs(10)),
-        },
-    ))
+    // This backoff config is used to retry requests for a specific table-scoped query.
+    let retry_backoff_config = BackoffConfig {
+        init_backoff: Duration::from_millis(100),
+        max_backoff: Duration::from_secs(1),
+        base: 3.0,
+        deadline: Some(Duration::from_secs(10)),
+    };
+
+    // This backoff config is used to half-open the circuit after it was opened. Circuits are
+    // ingester-scoped.
+    let circuit_breaker_backoff_config = BackoffConfig {
+        init_backoff: Duration::from_secs(1),
+        max_backoff: Duration::from_secs(60),
+        base: 3.0,
+        deadline: None,
+    };
+
+    // Exactly one of `shard_to_ingesters` or `ingester_addreses` must be specified.
+    // `shard_to_ingesters` uses the Kafka write buffer path.
+    // `ingester_addresses` uses the RPC write path.
+    match (shard_to_ingesters, ingester_addresses) {
+        (None, None) => panic!("Neither shard_to_ingesters nor ingester_addresses was specified!"),
+        (Some(_), Some(_)) => {
+            panic!("Both shard_to_ingesters and ingester_addresses were specified!")
+        }
+        (Some(shard_to_ingesters), None) => Arc::new(IngesterConnectionImpl::by_shard(
+            shard_to_ingesters,
+            catalog_cache,
+            retry_backoff_config,
+            circuit_breaker_backoff_config,
+            open_circuit_after_n_errors,
+        )),
+        (None, Some(ingester_addresses)) => Arc::new(IngesterConnectionImpl::by_addrs(
+            ingester_addresses,
+            catalog_cache,
+            retry_backoff_config,
+            circuit_breaker_backoff_config,
+            open_circuit_after_n_errors,
+        )),
+    }
 }
 
 /// Create a new ingester suitable for testing
@@ -159,8 +201,7 @@ pub fn create_ingester_connection_for_testing() -> Arc<dyn IngesterConnection> {
     Arc::new(MockIngesterConnection::new())
 }
 
-/// Handles communicating with the ingester(s) to retrieve
-/// data that is not yet persisted
+/// Handles communicating with the ingester(s) to retrieve data that is not yet persisted
 #[async_trait]
 pub trait IngesterConnection: std::fmt::Debug + Send + Sync + 'static {
     /// Returns all partitions ingester(s) know about for the specified table.
@@ -171,12 +212,11 @@ pub trait IngesterConnection: std::fmt::Debug + Send + Sync + 'static {
     #[allow(clippy::too_many_arguments)]
     async fn partitions(
         &self,
-        shard_indexes: &[ShardIndex],
-        namespace_name: Arc<str>,
-        table_name: Arc<str>,
+        shard_indexes: Option<Vec<ShardIndex>>,
+        namespace_id: NamespaceId,
+        cached_table: Arc<CachedTable>,
         columns: Vec<String>,
         predicate: &Predicate,
-        expected_schema: Arc<Schema>,
         span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>>;
 
@@ -229,8 +269,8 @@ struct IngesterResponseOk {
 
 /// Helper to observe a single ingester request.
 ///
-/// Use [`set_ok`](Self::set_ok) or [`set_err`](Self::set_err) if an ingester result was observered. Otherwise the
-/// request will count as "cancelled".
+/// Use [`set_ok`](Self::set_ok) or [`set_err`](Self::set_err) if an ingester result was
+/// observered. Otherwise the request will count as "cancelled".
 struct ObserveIngesterRequest<'a> {
     res: Option<Result<IngesterResponseOk, ()>>,
     t_start: Time,
@@ -294,8 +334,8 @@ impl<'a> Drop for ObserveIngesterRequest<'a> {
 
             debug!(
                 predicate=?self.request.predicate,
-                namespace=%self.request.namespace_name,
-                table_name=%self.request.table_name,
+                namespace_id=self.request.namespace_id.get(),
+                table_id=self.request.cached_table.id.get(),
                 n_partitions=?ok_status.map(|s| s.n_partitions),
                 n_chunks=?ok_status.map(|s| s.n_chunks),
                 n_rows=?ok_status.map(|s| s.n_rows),
@@ -312,7 +352,7 @@ impl<'a> Drop for ObserveIngesterRequest<'a> {
 pub struct IngesterConnectionImpl {
     shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
     unique_ingester_addresses: HashSet<Arc<str>>,
-    flight_client: Arc<dyn FlightClient>,
+    flight_client: Arc<dyn IngesterFlightClient>,
     catalog_cache: Arc<CatalogCache>,
     metrics: Arc<IngesterConnectionMetrics>,
     backoff_config: BackoffConfig,
@@ -337,13 +377,23 @@ impl IngesterConnectionImpl {
     pub fn by_shard(
         shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
         catalog_cache: Arc<CatalogCache>,
-        backoff_config: BackoffConfig,
+        retry_backoff_config: BackoffConfig,
+        circuit_breaker_backoff_config: BackoffConfig,
+        open_circuit_after_n_errors: u64,
     ) -> Self {
+        let flight_client = Arc::new(FlightClientImpl::new());
+        let flight_client = Arc::new(CircuitBreakerFlightClient::new(
+            flight_client,
+            catalog_cache.time_provider(),
+            catalog_cache.metric_registry(),
+            open_circuit_after_n_errors,
+            circuit_breaker_backoff_config,
+        ));
         Self::by_shard_with_flight_client(
             shard_to_ingesters,
-            Arc::new(FlightClientImpl::new()),
+            flight_client,
             catalog_cache,
-            backoff_config,
+            retry_backoff_config,
         )
     }
 
@@ -353,7 +403,7 @@ impl IngesterConnectionImpl {
     /// network communication.
     pub fn by_shard_with_flight_client(
         shard_to_ingesters: HashMap<ShardIndex, IngesterMapping>,
-        flight_client: Arc<dyn FlightClient>,
+        flight_client: Arc<dyn IngesterFlightClient>,
         catalog_cache: Arc<CatalogCache>,
         backoff_config: BackoffConfig,
     ) -> Self {
@@ -378,19 +428,48 @@ impl IngesterConnectionImpl {
             backoff_config,
         }
     }
+
+    /// Create a new set of connections given a list of ingester2 addresses.
+    pub fn by_addrs(
+        ingester_addresses: Vec<Arc<str>>,
+        catalog_cache: Arc<CatalogCache>,
+        backoff_config: BackoffConfig,
+        circuit_breaker_backoff_config: BackoffConfig,
+        open_circuit_after_n_errors: u64,
+    ) -> Self {
+        let flight_client = Arc::new(FlightClientImpl::new());
+        let flight_client = Arc::new(CircuitBreakerFlightClient::new(
+            flight_client,
+            catalog_cache.time_provider(),
+            catalog_cache.metric_registry(),
+            open_circuit_after_n_errors,
+            circuit_breaker_backoff_config,
+        ));
+
+        let metric_registry = catalog_cache.metric_registry();
+        let metrics = Arc::new(IngesterConnectionMetrics::new(&metric_registry));
+
+        Self {
+            shard_to_ingesters: HashMap::new(),
+            unique_ingester_addresses: ingester_addresses.into_iter().collect(),
+            flight_client,
+            catalog_cache,
+            metrics,
+            backoff_config,
+        }
+    }
 }
 
 /// Struct that names all parameters to `execute`
 #[derive(Debug, Clone)]
 struct GetPartitionForIngester<'a> {
-    flight_client: Arc<dyn FlightClient>,
+    flight_client: Arc<dyn IngesterFlightClient>,
     catalog_cache: Arc<CatalogCache>,
     ingester_address: Arc<str>,
-    namespace_name: Arc<str>,
-    table_name: Arc<str>,
+    namespace_id: NamespaceId,
     columns: Vec<String>,
     predicate: &'a Predicate,
-    expected_schema: Arc<Schema>,
+    cached_table: Arc<CachedTable>,
 }
 
 /// Fetches the partitions for a single ingester
@@ -402,16 +481,15 @@ async fn execute(
         flight_client,
         catalog_cache,
         ingester_address,
-        namespace_name,
-        table_name,
+        namespace_id,
         columns,
         predicate,
-        expected_schema,
+        cached_table,
     } = request;
 
     let ingester_query_request = IngesterQueryRequest {
-        namespace: namespace_name.to_string(),
-        table: table_name.to_string(),
+        namespace_id,
+        table_id: cached_table.id,
         columns: columns.clone(),
         predicate: Some(predicate.clone()),
     };
@@ -424,20 +502,30 @@ async fn execute(
         )
         .await;
 
-    if let Err(FlightClientError::Flight {
-        source: FlightError::GrpcError(status),
-    }) = &query_res
-    {
-        if status.code() == tonic::Code::NotFound {
+    match &query_res {
+        Err(FlightClientError::CircuitBroken { .. }) => {
+            warn!(
+                ingester_address = ingester_address.as_ref(),
+                namespace_id = namespace_id.get(),
+                table_id = cached_table.id.get(),
+                "Could not connect to ingester, circuit broken",
+            );
+            return Ok(vec![]);
+        }
+        Err(FlightClientError::Flight {
+            source: FlightError::ArrowFlightError(iox_arrow_flight::FlightError::Tonic(status)),
+        }) if status.code() == tonic::Code::NotFound => {
             debug!(
-                ingester_address=ingester_address.as_ref(),
-                %namespace_name,
-                %table_name,
+                ingester_address = ingester_address.as_ref(),
+                namespace_id = namespace_id.get(),
+                table_id = cached_table.id.get(),
                 "Ingester does not know namespace or table, skipping",
             );
             return Ok(vec![]);
         }
+        _ => {}
     }
+
     let mut perform_query = query_res
         .context(RemoteQuerySnafu {
             ingester_address: ingester_address.as_ref(),
@@ -447,8 +535,8 @@ async fn execute(
             warn!(
                 e=%e,
                 ingester_address=ingester_address.as_ref(),
-                namespace=namespace_name.as_ref(),
-                table=table_name.as_ref(),
+                namespace_id=namespace_id.get(),
+                table_id=cached_table.id.get(),
                 columns=columns.join(",").as_str(),
                 predicate_str=%predicate,
                 predicate_binary=encode_predicate_as_base64(predicate).as_str(),
@@ -460,10 +548,11 @@ async fn execute(
         })?;
 
     // collect data from IO stream
-    // Drain data from ingester so we don't block the ingester while performing catalog IO or CPU computations
+    // Drain data from ingester so we don't block the ingester while performing catalog IO or CPU
+    // computations
     let mut messages = vec![];
     while let Some(data) = perform_query
-        .next()
+        .next_message()
         .await
         .map_err(|source| FlightClientError::Flight { source })
         .context(RemoteQuerySnafu {
@@ -477,7 +566,7 @@ async fn execute(
     let mut decoder = IngesterStreamDecoder::new(
         ingester_address,
         catalog_cache,
-        expected_schema,
+        cached_table,
         span_recorder.child_span("IngesterStreamDecoder"),
     );
     for (msg, md) in messages {
@@ -489,15 +578,15 @@ async fn execute(
 
 /// Helper to disassemble the data from the ingester Apache Flight arrow stream.
 ///
-/// This should be used AFTER the stream was drained because we will perform some catalog IO and this should likely not
-/// block the ingester.
+/// This should be used AFTER the stream was drained because we will perform some catalog IO and
+/// this should likely not block the ingester.
 struct IngesterStreamDecoder {
     finished_partitions: HashMap<PartitionId, IngesterPartition>,
     current_partition: Option<IngesterPartition>,
     current_chunk: Option<(Schema, Vec<RecordBatch>)>,
     ingester_address: Arc<str>,
     catalog_cache: Arc<CatalogCache>,
-    expected_schema: Arc<Schema>,
+    cached_table: Arc<CachedTable>,
     span_recorder: SpanRecorder,
 }
 
@@ -506,7 +595,7 @@ impl IngesterStreamDecoder {
     fn new(
         ingester_address: Arc<str>,
         catalog_cache: Arc<CatalogCache>,
-        expected_schema: Arc<Schema>,
+        cached_table: Arc<CachedTable>,
         span: Option<Span>,
     ) -> Self {
         Self {
@@ -515,12 +604,12 @@ impl IngesterStreamDecoder {
             current_chunk: None,
             ingester_address,
             catalog_cache,
-            expected_schema,
+            cached_table,
             span_recorder: SpanRecorder::new(span),
         }
     }
 
-    /// FLush current chunk, if any.
+    /// Flush current chunk, if any.
     fn flush_chunk(&mut self) -> Result<()> {
         if let Some((schema, batches)) = self.current_chunk.take() {
             let current_partition = self
@@ -534,7 +623,7 @@ impl IngesterStreamDecoder {
         Ok(())
     }
 
-    /// FLush current partition, if any.
+    /// Flush current partition, if any.
     ///
     /// This will also flush the current chunk.
     async fn flush_partition(&mut self) -> Result<()> {
@@ -549,18 +638,27 @@ impl IngesterStreamDecoder {
             let primary_keys: Vec<_> = schemas.iter().map(|s| s.primary_key()).collect();
             let primary_key: Vec<_> = primary_keys
                 .iter()
-                .flat_map(|pk| pk.iter().copied())
+                .flat_map(|pk| pk.iter())
+                // cache may be older then the ingester response status, so some entries might be missing
+                .filter_map(|name| {
+                    self.cached_table
+                        .column_id_map_rev
+                        .get(&Arc::from(name.to_owned()))
+                })
+                .copied()
                 .collect();
             let partition_sort_key = self
                 .catalog_cache
                 .partition()
                 .sort_key(
+                    Arc::clone(&self.cached_table),
                     current_partition.partition_id(),
                     &primary_key,
                     self.span_recorder
                         .child_span("cache GET partition sort key"),
                 )
-                .await;
+                .await
+                .map(|sort_key| Arc::clone(&sort_key.sort_key));
             let current_partition = current_partition.with_partition_sort_key(partition_sort_key);
             self.finished_partitions
                 .insert(current_partition.partition_id, current_partition);
@@ -572,11 +670,11 @@ impl IngesterStreamDecoder {
     /// Register a new message and its metadata from the Flight stream.
     async fn register(
         &mut self,
-        msg: LowLevelMessage,
+        msg: DecodedPayload,
         md: IngesterQueryResponseMetadata,
     ) -> Result<(), Error> {
         match msg {
-            LowLevelMessage::None => {
+            DecodedPayload::None => {
                 // new partition announced
                 self.flush_partition().await?;
 
@@ -596,27 +694,42 @@ impl IngesterStreamDecoder {
                     .catalog_cache
                     .partition()
                     .shard_id(
+                        Arc::clone(&self.cached_table),
                         partition_id,
                         self.span_recorder
                             .child_span("cache GET partition shard ID"),
                     )
                     .await;
 
-                // Use a temporary empty partition sort key. We are going to fetch this AFTER we know all chunks because
-                // then we are able to detect all relevant primary key columns that the sort key must cover.
-                let partition_sort_key = Arc::new(None);
+                // Use a temporary empty partition sort key. We are going to fetch this AFTER we
+                // know all chunks because then we are able to detect all relevant primary key
+                // columns that the sort key must cover.
+                let partition_sort_key = None;
+
+                let ingester_uuid = if md.ingester_uuid.is_empty() {
+                    // Using the write buffer path, no UUID specified
+                    None
+                } else {
+                    Some(
+                        Uuid::parse_str(&md.ingester_uuid).context(IngesterUuidSnafu {
+                            ingester_uuid: md.ingester_uuid,
+                        })?,
+                    )
+                };
 
                 let partition = IngesterPartition::new(
                     Arc::clone(&self.ingester_address),
+                    ingester_uuid,
                     partition_id,
                     shard_id,
+                    md.completed_persistence_count,
                     status.parquet_max_sequence_number.map(SequenceNumber::new),
                     None,
                     partition_sort_key,
                 );
                 self.current_partition = Some(partition);
             }
-            LowLevelMessage::Schema(schema) => {
+            DecodedPayload::Schema(schema) => {
                 self.flush_chunk()?;
                 ensure!(
                     self.current_partition.is_some(),
@@ -625,17 +738,19 @@ impl IngesterStreamDecoder {
                     }
                 );
 
-                // don't use the transmitted arrow schema to construct the IOx schema because some metadata might be
-                // missing. Instead select the right columns from the expected schema.
+                // don't use the transmitted arrow schema to construct the IOx schema because some
+                // metadata might be missing. Instead select the right columns from the expected
+                // schema.
                 let column_names: Vec<_> =
                     schema.fields().iter().map(|f| f.name().as_str()).collect();
                 let schema = self
-                    .expected_schema
+                    .cached_table
+                    .schema
                     .select_by_names(&column_names)
                     .context(ConvertingSchemaSnafu)?;
                 self.current_chunk = Some((schema, vec![]));
             }
-            LowLevelMessage::RecordBatch(batch) => {
+            DecodedPayload::RecordBatch(batch) => {
                 let current_chunk =
                     self.current_chunk
                         .as_mut()
@@ -690,20 +805,56 @@ impl IngesterConnection for IngesterConnectionImpl {
     /// Retrieve chunks from the ingester for the particular table, shard, and predicate
     async fn partitions(
         &self,
-        shard_indexes: &[ShardIndex],
-        namespace_name: Arc<str>,
-        table_name: Arc<str>,
+        shard_indexes: Option<Vec<ShardIndex>>,
+        namespace_id: NamespaceId,
+        cached_table: Arc<CachedTable>,
         columns: Vec<String>,
         predicate: &Predicate,
-        expected_schema: Arc<Schema>,
         span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>> {
-        // If no shard indexes are specified, no ingester addresses can be found. This is a
-        // configuration problem somewhere.
-        assert!(
-            !shard_indexes.is_empty(),
-            "Called `IngesterConnection.partitions` with an empty `shard_indexes` list",
-        );
+        let relevant_ingester_addresses = match shard_indexes {
+            // If shard indexes is None, we're using the RPC write path, and all ingesters should
+            // be queried.
+            None => self.unique_ingester_addresses.clone(),
+            // If shard indexes is Some([]), no ingester addresses can be found. This is a
+            // configuration problem somewhwere.
+            Some(shard_indexes) if shard_indexes.is_empty() => {
+                panic!("Called `IngesterConnection.partitions` with an empty `shard_indexes` list");
+            }
+            // Otherwise, we're using the write buffer and need to look up the ingesters to contact
+            // by their shard index.
+            Some(shard_indexes) => {
+                // Look up the ingesters needed for the shard. Collect into a HashSet to avoid
+                // making multiple requests to the same ingester if that ingester is responsible
+                // for multiple shard_indexes relevant to this query.
+                let mut relevant_ingester_addresses = HashSet::new();
+
+                for shard_index in &shard_indexes {
+                    match self.shard_to_ingesters.get(shard_index) {
+                        None => {
+                            return NoIngesterFoundForShardSnafu {
+                                shard_index: *shard_index,
+                            }
+                            .fail()
+                        }
+                        Some(mapping) => match mapping {
+                            IngesterMapping::Addr(addr) => {
+                                relevant_ingester_addresses.insert(Arc::clone(addr));
+                            }
+                            IngesterMapping::Ignore => (),
+                            IngesterMapping::NotMapped => {
+                                return ShardNotMappedSnafu {
+                                    shard_index: *shard_index,
+                                }
+                                .fail()
+                            }
+                        },
+                    }
+                }
+                relevant_ingester_addresses
+            }
+        };
+
         let mut span_recorder = SpanRecorder::new(span);
 
         let metrics = Arc::clone(&self.metrics);
@@ -714,11 +865,10 @@ impl IngesterConnection for IngesterConnectionImpl {
                 flight_client: Arc::clone(&self.flight_client),
                 catalog_cache: Arc::clone(&self.catalog_cache),
                 ingester_address: Arc::clone(&ingester_address),
-                namespace_name: Arc::clone(&namespace_name),
-                table_name: Arc::clone(&table_name),
+                namespace_id,
+                cached_table: Arc::clone(&cached_table),
                 columns: columns.clone(),
                 predicate,
-                expected_schema: Arc::clone(&expected_schema),
             };
 
             let backoff_config = self.backoff_config.clone();
@@ -760,34 +910,6 @@ impl IngesterConnection for IngesterConnectionImpl {
                 res
             }
         };
-
-        // Look up the ingesters needed for the shard. Collect into a HashSet to avoid making
-        // multiple requests to the same ingester if that ingester is responsible for multiple
-        // shard_indexes relevant to this query.
-        let mut relevant_ingester_addresses = HashSet::new();
-
-        for shard_index in shard_indexes {
-            match self.shard_to_ingesters.get(shard_index) {
-                None => {
-                    return NoIngesterFoundForShardSnafu {
-                        shard_index: *shard_index,
-                    }
-                    .fail()
-                }
-                Some(mapping) => match mapping {
-                    IngesterMapping::Addr(addr) => {
-                        relevant_ingester_addresses.insert(Arc::clone(addr));
-                    }
-                    IngesterMapping::Ignore => (),
-                    IngesterMapping::NotMapped => {
-                        return ShardNotMappedSnafu {
-                            shard_index: *shard_index,
-                        }
-                        .fail()
-                    }
-                },
-            }
-        }
 
         let mut ingester_partitions: Vec<IngesterPartition> = relevant_ingester_addresses
             .into_iter()
@@ -861,8 +983,20 @@ async fn execute_get_write_infos(
 #[derive(Debug, Clone)]
 pub struct IngesterPartition {
     ingester: Arc<str>,
+
+    /// If using ingester2/rpc write path, the ingester UUID will be present and will identify
+    /// whether this ingester has restarted since the last time it was queried or not.
+    ///
+    /// When we fully switch over to always using the RPC write path, the `Option` in this type can
+    /// be removed.
+    ingester_uuid: Option<Uuid>,
+
     partition_id: PartitionId,
     shard_id: ShardId,
+
+    /// If using ingester2/rpc write path, this will be the number of Parquet files this ingester
+    /// UUID has persisted for this partition.
+    completed_persistence_count: u64,
 
     /// Maximum sequence number of parquet files the ingester has
     /// persisted for this partition
@@ -873,7 +1007,7 @@ pub struct IngesterPartition {
     tombstone_max_sequence_number: Option<SequenceNumber>,
 
     /// Partition-wide sort key.
-    partition_sort_key: Arc<Option<SortKey>>,
+    partition_sort_key: Option<Arc<SortKey>>,
 
     chunks: Vec<IngesterChunk>,
 }
@@ -881,18 +1015,23 @@ pub struct IngesterPartition {
 impl IngesterPartition {
     /// Creates a new IngesterPartition, translating the passed
     /// `RecordBatches` into the correct types
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         ingester: Arc<str>,
+        ingester_uuid: Option<Uuid>,
         partition_id: PartitionId,
         shard_id: ShardId,
+        completed_persistence_count: u64,
         parquet_max_sequence_number: Option<SequenceNumber>,
         tombstone_max_sequence_number: Option<SequenceNumber>,
-        partition_sort_key: Arc<Option<SortKey>>,
+        partition_sort_key: Option<Arc<SortKey>>,
     ) -> Self {
         Self {
             ingester,
+            ingester_uuid,
             partition_id,
             shard_id,
+            completed_persistence_count,
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
             partition_sort_key,
@@ -937,7 +1076,7 @@ impl IngesterPartition {
             chunk_id,
             partition_id: self.partition_id,
             schema: expected_schema,
-            partition_sort_key: Arc::clone(&self.partition_sort_key),
+            partition_sort_key: self.partition_sort_key.clone(),
             batches,
             ts_min_max,
             summary,
@@ -949,13 +1088,13 @@ impl IngesterPartition {
     }
 
     /// Update partition sort key
-    pub(crate) fn with_partition_sort_key(self, partition_sort_key: Arc<Option<SortKey>>) -> Self {
+    pub(crate) fn with_partition_sort_key(self, partition_sort_key: Option<Arc<SortKey>>) -> Self {
         Self {
-            partition_sort_key: Arc::clone(&partition_sort_key),
+            partition_sort_key: partition_sort_key.clone(),
             chunks: self
                 .chunks
                 .into_iter()
-                .map(|c| c.with_partition_sort_key(Arc::clone(&partition_sort_key)))
+                .map(|c| c.with_partition_sort_key(partition_sort_key.clone()))
                 .collect(),
             ..self
         }
@@ -965,12 +1104,20 @@ impl IngesterPartition {
         &self.ingester
     }
 
+    pub(crate) fn ingester_uuid(&self) -> Option<Uuid> {
+        self.ingester_uuid
+    }
+
     pub(crate) fn partition_id(&self) -> PartitionId {
         self.partition_id
     }
 
     pub(crate) fn shard_id(&self) -> ShardId {
         self.shard_id
+    }
+
+    pub(crate) fn completed_persistence_count(&self) -> u64 {
+        self.completed_persistence_count
     }
 
     pub(crate) fn parquet_max_sequence_number(&self) -> Option<SequenceNumber> {
@@ -997,7 +1144,7 @@ pub struct IngesterChunk {
     schema: Arc<Schema>,
 
     /// Partition-wide sort key.
-    partition_sort_key: Arc<Option<SortKey>>,
+    partition_sort_key: Option<Arc<SortKey>>,
 
     /// The raw table data
     batches: Vec<RecordBatch>,
@@ -1010,7 +1157,15 @@ pub struct IngesterChunk {
 }
 
 impl IngesterChunk {
-    pub(crate) fn with_partition_sort_key(self, partition_sort_key: Arc<Option<SortKey>>) -> Self {
+    /// [`Arc`]ed version of the partition sort key.
+    ///
+    /// Note that this might NOT be the up-to-date sort key of the partition but the one that existed when the chunk was
+    /// created. You must sync the keys to use the chunks.
+    pub(crate) fn partition_sort_key_arc(&self) -> Option<Arc<SortKey>> {
+        self.partition_sort_key.clone()
+    }
+
+    pub(crate) fn with_partition_sort_key(self, partition_sort_key: Option<Arc<SortKey>>) -> Self {
         Self {
             partition_sort_key,
             ..self
@@ -1049,7 +1204,7 @@ impl QueryChunkMeta for IngesterChunk {
     }
 
     fn partition_sort_key(&self) -> Option<&SortKey> {
-        self.partition_sort_key.as_ref().as_ref()
+        self.partition_sort_key.as_ref().map(|sk| sk.as_ref())
     }
 
     fn partition_id(&self) -> PartitionId {
@@ -1181,6 +1336,7 @@ mod tests {
         datatypes::Int32Type,
     };
     use assert_matches::assert_matches;
+    use data_types::TableId;
     use generated_types::influxdata::iox::ingester::v1::PartitionStatus;
     use influxdb_iox_client::flight::generated_types::IngesterQueryResponseMetadata;
     use iox_tests::util::TestCatalog;
@@ -1202,7 +1358,7 @@ mod tests {
                 "addr1",
                 Err(FlightClientError::Handshake {
                     ingester_address: String::from("addr1"),
-                    source: FlightError::GrpcError(tonic::Status::internal("don't know")),
+                    source: tonic::Status::internal("don't know").into(),
                 }),
             )])
             .await,
@@ -1218,7 +1374,7 @@ mod tests {
             MockFlightClient::new([(
                 "addr1",
                 Err(FlightClientError::Flight {
-                    source: FlightError::GrpcError(tonic::Status::internal("cow exploded")),
+                    source: tonic::Status::internal("cow exploded").into(),
                 }),
             )])
             .await,
@@ -1234,7 +1390,7 @@ mod tests {
             MockFlightClient::new([(
                 "addr1",
                 Err(FlightClientError::Flight {
-                    source: FlightError::GrpcError(tonic::Status::not_found("something")),
+                    source: tonic::Status::not_found("something").into(),
                 }),
             )])
             .await,
@@ -1251,9 +1407,7 @@ mod tests {
             MockFlightClient::new([(
                 "addr1",
                 Ok(MockQueryData {
-                    results: vec![Err(FlightError::GrpcError(tonic::Status::internal(
-                        "don't know",
-                    )))],
+                    results: vec![Err(tonic::Status::internal("don't know").into())],
                 }),
             )])
             .await,
@@ -1293,15 +1447,12 @@ mod tests {
             MockFlightClient::new([(
                 "addr1",
                 Ok(MockQueryData {
-                    results: vec![Ok((
-                        LowLevelMessage::None,
-                        IngesterQueryResponseMetadata {
-                            partition_id: 1,
-                            status: Some(PartitionStatus {
-                                parquet_max_sequence_number: None,
-                            }),
-                        },
-                    ))],
+                    results: vec![metadata(
+                        1,
+                        Some(PartitionStatus {
+                            parquet_max_sequence_number: None,
+                        }),
+                    )],
                 }),
             )])
             .await,
@@ -1317,6 +1468,11 @@ mod tests {
         assert_eq!(p.parquet_max_sequence_number, None);
         assert_eq!(p.tombstone_max_sequence_number, None);
         assert_eq!(p.chunks.len(), 0);
+
+        // When using the write buffer path, there should never be a UUID present and the
+        // completed_persistence_count should always be 0.
+        assert!(p.ingester_uuid.is_none());
+        assert_eq!(p.completed_persistence_count, 0);
     }
 
     #[tokio::test]
@@ -1325,13 +1481,7 @@ mod tests {
             MockFlightClient::new([(
                 "addr1",
                 Ok(MockQueryData {
-                    results: vec![Ok((
-                        LowLevelMessage::None,
-                        IngesterQueryResponseMetadata {
-                            partition_id: 1,
-                            status: None,
-                        },
-                    ))],
+                    results: vec![metadata(1, None)],
                 }),
             )])
             .await,
@@ -1348,33 +1498,24 @@ mod tests {
                 "addr1",
                 Ok(MockQueryData {
                     results: vec![
-                        Ok((
-                            LowLevelMessage::None,
-                            IngesterQueryResponseMetadata {
-                                partition_id: 1,
-                                status: Some(PartitionStatus {
-                                    parquet_max_sequence_number: None,
-                                }),
-                            },
-                        )),
-                        Ok((
-                            LowLevelMessage::None,
-                            IngesterQueryResponseMetadata {
-                                partition_id: 2,
-                                status: Some(PartitionStatus {
-                                    parquet_max_sequence_number: None,
-                                }),
-                            },
-                        )),
-                        Ok((
-                            LowLevelMessage::None,
-                            IngesterQueryResponseMetadata {
-                                partition_id: 1,
-                                status: Some(PartitionStatus {
-                                    parquet_max_sequence_number: None,
-                                }),
-                            },
-                        )),
+                        metadata(
+                            1,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: None,
+                            }),
+                        ),
+                        metadata(
+                            2,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: None,
+                            }),
+                        ),
+                        metadata(
+                            1,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: None,
+                            }),
+                        ),
                     ],
                 }),
             )])
@@ -1393,7 +1534,7 @@ mod tests {
                 "addr1",
                 Ok(MockQueryData {
                     results: vec![Ok((
-                        LowLevelMessage::Schema(record_batch.schema()),
+                        DecodedPayload::Schema(record_batch.schema()),
                         IngesterQueryResponseMetadata::default(),
                     ))],
                 }),
@@ -1413,7 +1554,7 @@ mod tests {
                 "addr1",
                 Ok(MockQueryData {
                     results: vec![Ok((
-                        LowLevelMessage::RecordBatch(record_batch),
+                        DecodedPayload::RecordBatch(record_batch),
                         IngesterQueryResponseMetadata::default(),
                     ))],
                 }),
@@ -1445,50 +1586,44 @@ mod tests {
                     "addr1",
                     Ok(MockQueryData {
                         results: vec![
+                            metadata(
+                                1,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(11),
+                                }),
+                            ),
                             Ok((
-                                LowLevelMessage::None,
-                                IngesterQueryResponseMetadata {
-                                    partition_id: 1,
-                                    status: Some(PartitionStatus {
-                                        parquet_max_sequence_number: Some(11),
-                                    }),
-                                },
-                            )),
-                            Ok((
-                                LowLevelMessage::Schema(Arc::clone(&schema_1_1)),
+                                DecodedPayload::Schema(Arc::clone(&schema_1_1)),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::RecordBatch(record_batch_1_1_1),
+                                DecodedPayload::RecordBatch(record_batch_1_1_1),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::RecordBatch(record_batch_1_1_2),
+                                DecodedPayload::RecordBatch(record_batch_1_1_2),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::Schema(Arc::clone(&schema_1_2)),
+                                DecodedPayload::Schema(Arc::clone(&schema_1_2)),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::RecordBatch(record_batch_1_2),
+                                DecodedPayload::RecordBatch(record_batch_1_2),
+                                IngesterQueryResponseMetadata::default(),
+                            )),
+                            metadata(
+                                2,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(21),
+                                }),
+                            ),
+                            Ok((
+                                DecodedPayload::Schema(Arc::clone(&schema_2_1)),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::None,
-                                IngesterQueryResponseMetadata {
-                                    partition_id: 2,
-                                    status: Some(PartitionStatus {
-                                        parquet_max_sequence_number: Some(21),
-                                    }),
-                                },
-                            )),
-                            Ok((
-                                LowLevelMessage::Schema(Arc::clone(&schema_2_1)),
-                                IngesterQueryResponseMetadata::default(),
-                            )),
-                            Ok((
-                                LowLevelMessage::RecordBatch(record_batch_2_1),
+                                DecodedPayload::RecordBatch(record_batch_2_1),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                         ],
@@ -1498,21 +1633,18 @@ mod tests {
                     "addr2",
                     Ok(MockQueryData {
                         results: vec![
+                            metadata(
+                                3,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(31),
+                                }),
+                            ),
                             Ok((
-                                LowLevelMessage::None,
-                                IngesterQueryResponseMetadata {
-                                    partition_id: 3,
-                                    status: Some(PartitionStatus {
-                                        parquet_max_sequence_number: Some(31),
-                                    }),
-                                },
-                            )),
-                            Ok((
-                                LowLevelMessage::Schema(Arc::clone(&schema_3_1)),
+                                DecodedPayload::Schema(Arc::clone(&schema_3_1)),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::RecordBatch(record_batch_3_1),
+                                DecodedPayload::RecordBatch(record_batch_3_1),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                         ],
@@ -1571,6 +1703,137 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ingester2_rpc_write_path_expects_valid_uuid() {
+        let mock_flight_client = Arc::new(
+            MockFlightClient::new([(
+                "addr1",
+                Ok(MockQueryData {
+                    results: vec![ingester2_metadata(
+                        1,
+                        Some(PartitionStatus {
+                            parquet_max_sequence_number: Some(11),
+                        }),
+                        "not-a-valid-uuid",
+                        42,
+                    )],
+                }),
+            )])
+            .await,
+        );
+        let ingester_conn = mock_flight_client.ingester_conn().await;
+        let columns = vec![String::from("col")];
+        let err = ingester_conn
+            .partitions(
+                None,
+                NamespaceId::new(1),
+                cached_table(),
+                columns,
+                &Predicate::default(),
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, Error::IngesterUuid { .. });
+    }
+
+    #[tokio::test]
+    async fn ingester2_uuid_completed_persistence_count() {
+        let ingester_uuid1 = Uuid::new_v4();
+        let ingester_uuid2 = Uuid::new_v4();
+
+        let mock_flight_client = Arc::new(
+            MockFlightClient::new([
+                (
+                    "addr1",
+                    Ok(MockQueryData {
+                        results: vec![
+                            ingester2_metadata(
+                                1,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(11),
+                                }),
+                                ingester_uuid1.to_string(),
+                                0,
+                            ),
+                            ingester2_metadata(
+                                2,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(21),
+                                }),
+                                ingester_uuid1.to_string(),
+                                42,
+                            ),
+                        ],
+                    }),
+                ),
+                (
+                    "addr2",
+                    Ok(MockQueryData {
+                        results: vec![ingester2_metadata(
+                            3,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: Some(31),
+                            }),
+                            ingester_uuid2.to_string(),
+                            9000,
+                        )],
+                    }),
+                ),
+            ])
+            .await,
+        );
+        let ingester_conn = mock_flight_client.ingester_conn().await;
+        let columns = vec![String::from("col")];
+        let partitions = ingester_conn
+            .partitions(
+                None,
+                NamespaceId::new(1),
+                cached_table(),
+                columns,
+                &Predicate::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(partitions.len(), 3);
+
+        let p1 = &partitions[0];
+        assert_eq!(p1.ingester_uuid.unwrap(), ingester_uuid1);
+        assert_eq!(p1.completed_persistence_count, 0);
+        assert_eq!(p1.partition_id.get(), 1);
+        assert_eq!(p1.shard_id.get(), 1);
+        assert_eq!(
+            p1.parquet_max_sequence_number,
+            Some(SequenceNumber::new(11))
+        );
+        assert_eq!(p1.tombstone_max_sequence_number, None);
+
+        let p2 = &partitions[1];
+        assert_eq!(p2.ingester_uuid.unwrap(), ingester_uuid1);
+        assert_eq!(p2.completed_persistence_count, 42);
+        assert_eq!(p2.partition_id.get(), 2);
+        assert_eq!(p2.shard_id.get(), 1);
+        assert_eq!(
+            p2.parquet_max_sequence_number,
+            Some(SequenceNumber::new(21))
+        );
+        assert_eq!(p2.tombstone_max_sequence_number, None);
+
+        let p3 = &partitions[2];
+        assert_eq!(p3.ingester_uuid.unwrap(), ingester_uuid2);
+        assert_eq!(p3.completed_persistence_count, 9000);
+        assert_eq!(p3.partition_id.get(), 3);
+        assert_eq!(p3.shard_id.get(), 2);
+        assert_eq!(
+            p3.parquet_max_sequence_number,
+            Some(SequenceNumber::new(31))
+        );
+        assert_eq!(p3.tombstone_max_sequence_number, None);
+    }
+
+    #[tokio::test]
     async fn test_ingester_metrics_and_tracing() {
         let mock_flight_client = Arc::new(
             MockFlightClient::new([
@@ -1580,14 +1843,14 @@ mod tests {
                     "addr3",
                     Err(FlightClientError::Handshake {
                         ingester_address: String::from("addr3"),
-                        source: FlightError::GrpcError(tonic::Status::internal("don't know")),
+                        source: tonic::Status::internal("don't know").into(),
                     }),
                 ),
                 (
                     "addr4",
                     Err(FlightClientError::Handshake {
                         ingester_address: String::from("addr4"),
-                        source: FlightError::GrpcError(tonic::Status::internal("don't know")),
+                        source: tonic::Status::internal("don't know").into(),
                     }),
                 ),
                 ("addr5", Ok(MockQueryData { results: vec![] })),
@@ -1677,21 +1940,18 @@ mod tests {
                     "addr1",
                     Ok(MockQueryData {
                         results: vec![
+                            metadata(
+                                1,
+                                Some(PartitionStatus {
+                                    parquet_max_sequence_number: Some(11),
+                                }),
+                            ),
                             Ok((
-                                LowLevelMessage::None,
-                                IngesterQueryResponseMetadata {
-                                    partition_id: 1,
-                                    status: Some(PartitionStatus {
-                                        parquet_max_sequence_number: Some(11),
-                                    }),
-                                },
-                            )),
-                            Ok((
-                                LowLevelMessage::Schema(Arc::clone(&schema_1_1)),
+                                DecodedPayload::Schema(Arc::clone(&schema_1_1)),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                             Ok((
-                                LowLevelMessage::RecordBatch(record_batch_1_1),
+                                DecodedPayload::RecordBatch(record_batch_1_1),
                                 IngesterQueryResponseMetadata::default(),
                             )),
                         ],
@@ -1700,9 +1960,8 @@ mod tests {
                 (
                     "addr2",
                     Err(FlightClientError::Flight {
-                        source: FlightError::GrpcError(tonic::Status::internal(
-                            "if this is queried, the test should fail",
-                        )),
+                        source: tonic::Status::internal("if this is queried, the test should fail")
+                            .into(),
                     }),
                 ),
             ])
@@ -1738,19 +1997,15 @@ mod tests {
         shard_indexes: &[i32],
         span: Option<Span>,
     ) -> Result<Vec<IngesterPartition>, Error> {
-        let namespace = Arc::from("namespace");
-        let table = Arc::from("table");
         let columns = vec![String::from("col")];
-        let schema = schema();
         let shard_indexes: Vec<_> = shard_indexes.iter().copied().map(ShardIndex::new).collect();
         ingester_conn
             .partitions(
-                &shard_indexes,
-                namespace,
-                table,
+                Some(shard_indexes),
+                NamespaceId::new(1),
+                cached_table(),
                 columns,
                 &Predicate::default(),
-                schema,
                 span,
             )
             .await
@@ -1772,16 +2027,48 @@ mod tests {
         lp_to_mutable_batch(lp).1.to_arrow(Projection::All).unwrap()
     }
 
+    type MockFlightResult = Result<(DecodedPayload, IngesterQueryResponseMetadata), FlightError>;
+
+    fn metadata(partition_id: i64, status: Option<PartitionStatus>) -> MockFlightResult {
+        Ok((
+            DecodedPayload::None,
+            IngesterQueryResponseMetadata {
+                partition_id,
+                status,
+                // These fields are only used in ingester2.
+                ingester_uuid: String::new(),
+                completed_persistence_count: 0,
+            },
+        ))
+    }
+
+    fn ingester2_metadata(
+        partition_id: i64,
+        status: Option<PartitionStatus>,
+        ingester_uuid: impl Into<String>,
+        completed_persistence_count: u64,
+    ) -> MockFlightResult {
+        Ok((
+            DecodedPayload::None,
+            IngesterQueryResponseMetadata {
+                partition_id,
+                status,
+                ingester_uuid: ingester_uuid.into(),
+                completed_persistence_count,
+            },
+        ))
+    }
+
     #[derive(Debug)]
     struct MockQueryData {
-        results: Vec<Result<(LowLevelMessage, IngesterQueryResponseMetadata), FlightError>>,
+        results: Vec<MockFlightResult>,
     }
 
     #[async_trait]
     impl QueryData for MockQueryData {
-        async fn next(
+        async fn next_message(
             &mut self,
-        ) -> Result<Option<(LowLevelMessage, IngesterQueryResponseMetadata)>, FlightError> {
+        ) -> Result<Option<(DecodedPayload, IngesterQueryResponseMetadata)>, FlightError> {
             if self.results.is_empty() {
                 Ok(None)
             } else {
@@ -1801,7 +2088,7 @@ mod tests {
             responses: [(&'static str, Result<MockQueryData, FlightClientError>); N],
         ) -> Self {
             let catalog = TestCatalog::new();
-            let ns = catalog.create_namespace("namespace").await;
+            let ns = catalog.create_namespace_1hr_retention("namespace").await;
             let table = ns.create_table("table").await;
 
             let s0 = ns.create_shard(0).await;
@@ -1860,7 +2147,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl FlightClient for MockFlightClient {
+    impl IngesterFlightClient for MockFlightClient {
         async fn query(
             &self,
             ingester_address: Arc<str>,
@@ -1893,11 +2180,13 @@ mod tests {
             // Construct a partition and ensure it doesn't error
             let ingester_partition = IngesterPartition::new(
                 "ingester".into(),
+                None,
                 PartitionId::new(1),
                 ShardId::new(1),
+                0,
                 parquet_max_sequence_number,
                 tombstone_max_sequence_number,
-                Arc::new(None),
+                None,
             )
             .try_add_chunk(ChunkId::new(), Arc::clone(&expected_schema), vec![case])
             .unwrap();
@@ -1926,11 +2215,13 @@ mod tests {
         let tombstone_max_sequence_number = None;
         let err = IngesterPartition::new(
             "ingester".into(),
+            None,
             PartitionId::new(1),
             ShardId::new(1),
+            0,
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
-            Arc::new(None),
+            None,
         )
         .try_add_chunk(ChunkId::new(), Arc::clone(&expected_schema), vec![batch])
         .unwrap_err();
@@ -1969,5 +2260,15 @@ mod tests {
 
     fn i64_vec() -> &'static [Option<i64>] {
         &[Some(1), Some(2), Some(3)]
+    }
+
+    fn cached_table() -> Arc<CachedTable> {
+        Arc::new(CachedTable {
+            id: TableId::new(2),
+            schema: schema(),
+            column_id_map: Default::default(),
+            column_id_map_rev: Default::default(),
+            primary_key_column_ids: Default::default(),
+        })
     }
 }

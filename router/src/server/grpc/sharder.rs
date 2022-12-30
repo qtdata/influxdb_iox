@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use data_types::{DatabaseName, ShardId, ShardIndex, TopicMetadata};
+use data_types::{NamespaceName, ShardId, ShardIndex, TopicMetadata};
 use generated_types::influxdata::iox::sharder::v1::{
     shard_service_server, MapToShardRequest, MapToShardResponse,
 };
@@ -74,7 +74,7 @@ where
         let req = request.into_inner();
 
         // Validate the namespace.
-        let ns = DatabaseName::try_from(req.namespace_name)
+        let ns = NamespaceName::try_from(req.namespace_name)
             .map_err(|e| tonic::Status::invalid_argument(e.to_string()))?;
 
         // Map the (table, namespace) tuple to the Shard for it.
@@ -149,7 +149,7 @@ mod tests {
             actual_mapping
                 .clone()
                 .into_iter()
-                .map(|(idx, _id)| Shard::new(idx, Arc::clone(&write_buffer), &*metrics))
+                .map(|(idx, _id)| Shard::new(idx, Arc::clone(&write_buffer), &metrics))
                 .map(Arc::new),
         );
 
@@ -180,7 +180,9 @@ mod tests {
 
     // Init a mock write buffer with the given number of shards.
     fn init_write_buffer() -> MockBufferForWriting {
-        let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
+        let time = iox_time::MockProvider::new(
+            iox_time::Time::from_timestamp_millis(668563200000).unwrap(),
+        );
         MockBufferForWriting::new(
             MockBufferSharedState::empty_with_n_shards(NonZeroU32::new(N_SHARDS as _).unwrap()),
             None,

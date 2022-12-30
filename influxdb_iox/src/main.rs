@@ -16,8 +16,8 @@ use crate::commands::{
 use dotenvy::dotenv;
 use influxdb_iox_client::connection::Builder;
 use iox_time::{SystemProvider, TimeProvider};
-use observability_deps::tracing::warn;
-use once_cell::sync::Lazy;
+use observability_deps::tracing::{debug, warn};
+use process_info::VERSION_STRING;
 use std::time::Duration;
 use std::{
     collections::hash_map::DefaultHasher,
@@ -42,33 +42,11 @@ mod commands {
     pub mod write;
 }
 
+mod process_info;
+
 enum ReturnCode {
     Failure = 1,
 }
-
-/// Package version.
-pub static IOX_VERSION: Lazy<&'static str> =
-    Lazy::new(|| option_env!("CARGO_PKG_VERSION").unwrap_or("UNKNOWN"));
-
-/// Build-time GIT revision hash.
-pub static IOX_GIT_HASH: &str = env!(
-    "GIT_HASH",
-    "Can not find find GIT HASH in build environment"
-);
-
-/// Version string that is combined from [`IOX_VERSION`] and [`IOX_GIT_HASH`].
-pub static VERSION_STRING: Lazy<&'static str> = Lazy::new(|| {
-    let s = format!("{}, revision {}", &IOX_VERSION[..], IOX_GIT_HASH);
-    let s: Box<str> = Box::from(s);
-    Box::leak(s)
-});
-
-/// A UUID that is unique for the process lifetime.
-pub static PROCESS_UUID: Lazy<&'static str> = Lazy::new(|| {
-    let s = uuid::Uuid::new_v4().to_string();
-    let s: Box<str> = Box::from(s);
-    Box::leak(s)
-});
 
 #[cfg(all(
     feature = "heappy",
@@ -115,9 +93,9 @@ Command are generally structured in the form:
     <type of object> <action> <arguments>
 
 For example, a command such as the following shows all actions
-    available for database chunks, including get and list.
+    available for namespaces, including `list` and `retention`.
 
-    influxdb_iox database chunk --help
+    influxdb_iox namespace --help
 "#
 )]
 struct Config {
@@ -153,6 +131,13 @@ struct Config {
     #[clap(long, global = true, action)]
     gen_trace_id: bool,
 
+    /// Add an InfluxDB Cloud style authorization header with the specified token
+    ///
+    /// This is shorthand for adding a header of the form
+    /// `Authorization: Token <token>`
+    #[clap(long, global = true, env = "INFLUX_TOKEN", action)]
+    token: Option<String>,
+
     /// Set the maximum number of threads to use. Defaults to the number of
     /// cores on the system
     #[clap(long, action)]
@@ -184,13 +169,13 @@ enum Command {
     /// Various commands for compactor manipulation
     Compactor(Box<commands::compactor::Config>),
 
-    /// Interrogate internal database data
+    /// Interrogate internal data
     Debug(commands::debug::Config),
 
     /// Initiate a read request to the gRPC storage service.
     Storage(commands::storage::Config),
 
-    /// Write data into the specified database
+    /// Write data into the specified namespace
     Write(commands::write::Config),
 
     /// Query the data with SQL
@@ -223,6 +208,7 @@ fn main() -> Result<(), std::io::Error> {
 
         let connection = || async move {
             let mut builder = headers.into_iter().fold(Builder::default(), |builder, kv| {
+                debug!(name=?kv.key, value=?kv.value, "Setting header");
                 builder.header(kv.key, kv.value)
             });
 
@@ -235,10 +221,19 @@ fn main() -> Result<(), std::io::Error> {
                 .unwrap();
                 let trace_id = gen_trace_id();
                 let value = http::header::HeaderValue::from_str(trace_id.as_str()).unwrap();
+                debug!(name=?key, value=?value, "Setting trace header");
                 builder = builder.header(key, value);
 
                 // Emit trace id information
                 println!("Trace ID set to {}", trace_id);
+            }
+
+            if let Some(token) = config.token.as_ref() {
+                let key = http::header::HeaderName::from_str("Authorization").unwrap();
+                let value =
+                    http::header::HeaderValue::from_str(&format!("Token {}", token)).unwrap();
+                debug!(name=?key, value=?value, "Setting token header");
+                builder = builder.header(key, value);
             }
 
             match builder.build(&host).await {

@@ -1,15 +1,18 @@
 //! Data for the lifecycle of the Ingester
 
-use std::{collections::BTreeMap, sync::Arc, time::Instant};
+use std::{
+    collections::BTreeMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
 use data_types::{
     CompactionLevel, NamespaceId, PartitionId, SequenceNumber, ShardId, ShardIndex, TableId,
 };
-
 use dml::DmlOperation;
-use iox_catalog::interface::{get_table_schema_by_id, Catalog};
+use iox_catalog::interface::{get_table_schema_by_id, CasFailure, Catalog};
 use iox_query::exec::Executor;
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, Metric, U64Histogram, U64HistogramOptions};
@@ -20,26 +23,50 @@ use parquet_file::{
     storage::{ParquetStorage, StorageId},
 };
 use snafu::{OptionExt, Snafu};
+use thiserror::Error;
 use uuid::Uuid;
 use write_summary::ShardProgress;
 
+use self::shard::ShardData;
 use crate::{
+    buffer_tree::{
+        namespace::name_resolver::{NamespaceNameProvider, NamespaceNameResolver},
+        partition::resolver::{CatalogPartitionResolver, PartitionCache, PartitionProvider},
+        table::name_resolver::{TableNameProvider, TableNameResolver},
+    },
     compact::{compact_persisting_batch, CompactedStream},
     lifecycle::LifecycleHandle,
 };
 
-pub(crate) mod namespace;
-pub mod partition;
-mod sequence_range;
-pub(crate) mod shard;
-pub(crate) mod table;
-
-pub(crate) use sequence_range::*;
-
-use self::{partition::resolver::PartitionProvider, shard::ShardData};
+mod shard;
 
 #[cfg(test)]
-mod triggers;
+pub mod triggers;
+
+/// The maximum duration of time between creating a [`PartitionData`] and its
+/// [`SortKey`] being fetched from the catalog.
+///
+/// [`PartitionData`]: crate::buffer_tree::partition::PartitionData
+/// [`SortKey`]: schema::sort::SortKey
+const SORT_KEY_PRE_FETCH: Duration = Duration::from_secs(30);
+
+/// The maximum duration of time between observing an initialising the
+/// [`NamespaceData`] in response to observing an operation for a namespace, and
+/// fetching the string identifier for it in the background via a
+/// [`DeferredLoad`].
+///
+/// [`NamespaceData`]: crate::buffer_tree::namespace::NamespaceData
+/// [`DeferredLoad`]: crate::deferred_load::DeferredLoad
+pub(crate) const NAMESPACE_NAME_PRE_FETCH: Duration = Duration::from_secs(60);
+
+/// The maximum duration of time between observing and initialising the
+/// [`TableData`] in response to observing an operation for a table, and
+/// fetching the string identifier for it in the background via a
+/// [`DeferredLoad`].
+///
+/// [`TableData`]: crate::buffer_tree::table::TableData
+/// [`DeferredLoad`]: crate::deferred_load::DeferredLoad
+pub const TABLE_NAME_PRE_FETCH: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
@@ -47,28 +74,17 @@ pub enum Error {
     #[snafu(display("Shard {} not found in data map", shard_id))]
     ShardNotFound { shard_id: ShardId },
 
-    #[snafu(display("Namespace {} not found in catalog", namespace))]
-    NamespaceNotFound { namespace: String },
-
-    #[snafu(display("Table {} not found in buffer", table_name))]
-    TableNotFound { table_name: String },
-
-    #[snafu(display("Error accessing catalog: {}", source))]
-    Catalog {
-        source: iox_catalog::interface::Error,
-    },
-
-    #[snafu(display("Snapshot error: {}", source))]
-    Snapshot { source: mutable_batch::Error },
-
-    #[snafu(display("Error while filtering columns from snapshot: {}", source))]
-    FilterColumn { source: arrow::error::ArrowError },
-
-    #[snafu(display("Error while copying buffer to snapshot: {}", source))]
-    BufferToSnapshot { source: mutable_batch::Error },
-
     #[snafu(display("Error adding to buffer in mutable batch: {}", source))]
     BufferWrite { source: mutable_batch::Error },
+}
+
+/// Errors that occur during initialisation of an [`IngesterData`].
+#[derive(Debug, Error)]
+pub enum InitError {
+    /// A catalog error occured while fetching the most recent partitions for
+    /// the internal cache.
+    #[error("failed to pre-warm partition cache: {0}")]
+    PreWarmPartitions(iox_catalog::interface::Error),
 }
 
 /// A specialized `Error` for Ingester Data errors
@@ -100,17 +116,16 @@ pub struct IngesterData {
 
 impl IngesterData {
     /// Create new instance.
-    pub fn new<T>(
+    pub async fn new<T>(
         object_store: Arc<DynObjectStore>,
         catalog: Arc<dyn Catalog>,
         shards: T,
         exec: Arc<Executor>,
-        partition_provider: Arc<dyn PartitionProvider>,
         backoff_config: BackoffConfig,
         metrics: Arc<metric::Registry>,
-    ) -> Self
+    ) -> Result<Self, InitError>
     where
-        T: IntoIterator<Item = (ShardId, ShardIndex)>,
+        T: IntoIterator<Item = (ShardId, ShardIndex)> + Send,
     {
         let persisted_file_size_bytes = metrics.register_metric_with_options(
             "ingester_persisted_file_size_bytes",
@@ -127,6 +142,48 @@ impl IngesterData {
             },
         );
 
+        // Read the most recently created partitions for the shards this
+        // ingester instance will be consuming from.
+        //
+        // By caching these hot partitions overall catalog load after an
+        // ingester starts up is reduced, and the associated query latency is
+        // removed from the (blocking) ingest hot path.
+        let shards = shards.into_iter().collect::<Vec<_>>();
+        let shard_ids = shards.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+        let recent_partitions = catalog
+            .repositories()
+            .await
+            .partitions()
+            .most_recent_n(10_000, &shard_ids)
+            .await
+            .map_err(InitError::PreWarmPartitions)?;
+
+        // Build the partition provider.
+        let partition_provider = CatalogPartitionResolver::new(Arc::clone(&catalog));
+        let partition_provider = PartitionCache::new(
+            partition_provider,
+            recent_partitions,
+            SORT_KEY_PRE_FETCH,
+            Arc::clone(&catalog),
+            BackoffConfig::default(),
+        );
+        let partition_provider: Arc<dyn PartitionProvider> = Arc::new(partition_provider);
+
+        // Initialise the deferred namespace name resolver.
+        let namespace_name_provider: Arc<dyn NamespaceNameProvider> =
+            Arc::new(NamespaceNameResolver::new(
+                NAMESPACE_NAME_PRE_FETCH,
+                Arc::clone(&catalog),
+                backoff_config.clone(),
+            ));
+
+        // Initialise the deferred table name resolver.
+        let table_name_provider: Arc<dyn TableNameProvider> = Arc::new(TableNameResolver::new(
+            TABLE_NAME_PRE_FETCH,
+            Arc::clone(&catalog),
+            backoff_config.clone(),
+        ));
+
         let shards = shards
             .into_iter()
             .map(|(id, index)| {
@@ -135,6 +192,8 @@ impl IngesterData {
                     ShardData::new(
                         index,
                         id,
+                        Arc::clone(&namespace_name_provider),
+                        Arc::clone(&table_name_provider),
                         Arc::clone(&partition_provider),
                         Arc::clone(&metrics),
                     ),
@@ -142,14 +201,14 @@ impl IngesterData {
             })
             .collect();
 
-        Self {
+        Ok(Self {
             store: ParquetStorage::new(object_store, StorageId::from("iox")),
             catalog,
             shards,
             exec,
             backoff_config,
             persisted_file_size_bytes,
-        }
+        })
     }
 
     /// Executor for running queries and compacting and persisting
@@ -185,7 +244,7 @@ impl IngesterData {
             .get(&shard_id)
             .context(ShardNotFoundSnafu { shard_id })?;
         shard_data
-            .buffer_operation(dml_operation, &self.catalog, lifecycle_handle)
+            .buffer_operation(dml_operation, lifecycle_handle)
             .await
     }
 
@@ -199,8 +258,7 @@ impl IngesterData {
         for shard_index in shard_indexes {
             let shard_data = self
                 .shards
-                .iter()
-                .map(|(_, shard_data)| shard_data)
+                .values()
                 .find(|shard_data| shard_data.shard_index() == shard_index);
 
             let progress = match shard_data {
@@ -256,54 +314,64 @@ impl Persister for IngesterData {
         let namespace = self
             .shards
             .get(&shard_id)
-            .and_then(|s| s.namespace_by_id(namespace_id))
+            .and_then(|s| s.namespace(namespace_id))
             .unwrap_or_else(|| panic!("namespace {namespace_id} not in shard {shard_id} state"));
+
+        // Begin resolving the load-deferred name concurrently if it is not
+        // already available.
         let namespace_name = namespace.namespace_name();
+        namespace_name.prefetch_now();
+
         // Assert the namespace ID matches the index key.
         assert_eq!(namespace.namespace_id(), namespace_id);
 
-        let table_data = namespace.table_id(table_id).unwrap_or_else(|| {
+        let table_data = namespace.table(table_id).unwrap_or_else(|| {
             panic!("table {table_id} in namespace {namespace_id} not in shard {shard_id} state")
         });
+        // Assert various properties of the table to ensure the index is
+        // correct, out of an abundance of caution.
+        assert_eq!(table_data.shard_id(), shard_id);
+        assert_eq!(table_data.namespace_id(), namespace_id);
+        assert_eq!(table_data.table_id(), table_id);
 
-        let table_name;
+        // Begin resolving the load-deferred name concurrently if it is not
+        // already available.
+        let table_name = Arc::clone(table_data.table_name());
+        table_name.prefetch_now();
+
+        let partition = table_data.get_partition(partition_id).unwrap_or_else(|| {
+                panic!(
+                    "partition {partition_id} in table {table_id} in namespace {namespace_id} not in shard {shard_id} state"
+                )
+            });
+
         let partition_key;
         let sort_key;
         let last_persisted_sequence_number;
         let batch;
         let batch_sequence_number_range;
         {
-            let mut guard = table_data.write().await;
-            // Assert various properties of the table to ensure the index is
-            // correct, out of an abundance of caution.
-            assert_eq!(guard.shard_id(), shard_id);
-            assert_eq!(guard.namespace_id(), namespace_id);
-            assert_eq!(guard.table_id(), table_id);
-            table_name = guard.table_name().clone();
-
-            let partition = guard.get_partition(partition_id).unwrap_or_else(|| {
-                panic!(
-                    "partition {partition_id} in table {table_id} in namespace {namespace_id} not in shard {shard_id} state"
-                )
-            });
+            // Acquire a write lock over the partition and extract all the
+            // necessary data.
+            let mut guard = partition.lock();
 
             // Assert various properties of the partition to ensure the index is
             // correct, out of an abundance of caution.
-            assert_eq!(partition.partition_id(), partition_id);
-            assert_eq!(partition.shard_id(), shard_id);
-            assert_eq!(partition.namespace_id(), namespace_id);
-            assert_eq!(partition.table_id(), table_id);
-            assert_eq!(*partition.table_name(), table_name);
+            assert_eq!(guard.partition_id(), partition_id);
+            assert_eq!(guard.shard_id(), shard_id);
+            assert_eq!(guard.namespace_id(), namespace_id);
+            assert_eq!(guard.table_id(), table_id);
+            assert!(Arc::ptr_eq(guard.table_name(), &table_name));
 
-            partition_key = partition.partition_key().clone();
-            sort_key = partition.sort_key().clone();
-            last_persisted_sequence_number = partition.max_persisted_sequence_number();
+            partition_key = guard.partition_key().clone();
+            sort_key = guard.sort_key().clone();
+            last_persisted_sequence_number = guard.max_persisted_sequence_number();
 
             // The sequence number MUST be read without releasing the write lock
             // to ensure a consistent snapshot of batch contents and batch
             // sequence number range.
-            batch = partition.mark_persisting();
-            batch_sequence_number_range = partition.sequence_number_range();
+            batch = guard.mark_persisting();
+            batch_sequence_number_range = guard.sequence_number_range();
         };
 
         // From this point on, the code MUST be infallible.
@@ -364,12 +432,16 @@ impl Persister for IngesterData {
             }
         };
 
+        // At this point, the table name is necessary, so demand it be resolved
+        // if it is not yet available.
+        let table_name = table_name.get().await;
+
         // Prepare the plan for CPU intensive work of compaction, de-duplication and sorting
         let CompactedStream {
             stream: record_stream,
             catalog_sort_key_update,
             data_sort_key,
-        } = compact_persisting_batch(&self.exec, sort_key, table_name.clone(), batch)
+        } = compact_persisting_batch(&self.exec, sort_key.clone(), table_name.clone(), batch)
             .await
             .expect("unable to compact persisting batch");
 
@@ -383,7 +455,7 @@ impl Persister for IngesterData {
             creation_timestamp: SystemProvider::new().now(),
             shard_id,
             namespace_id,
-            namespace_name: Arc::clone(&**namespace.namespace_name()),
+            namespace_name: Arc::clone(&*namespace.namespace_name().get().await),
             table_id,
             table_name: Arc::clone(&*table_name),
             partition_id,
@@ -408,27 +480,41 @@ impl Persister for IngesterData {
         // compactor may see a parquet file with an inconsistent
         // sort key. https://github.com/influxdata/influxdb_iox/issues/5090
         if let Some(new_sort_key) = catalog_sort_key_update {
-            let sort_key = new_sort_key.to_columns().collect::<Vec<_>>();
+            let new_sort_key_str = new_sort_key.to_columns().collect::<Vec<_>>();
+            let old_sort_key: Option<Vec<String>> =
+                sort_key.map(|v| v.to_columns().map(ToString::to_string).collect());
             Backoff::new(&self.backoff_config)
-                .retry_all_errors("update_sort_key", || async {
-                    let mut repos = self.catalog.repositories().await;
-                    let _partition = repos
-                        .partitions()
-                        .update_sort_key(partition_id, &sort_key)
-                        .await?;
-                    // compiler insisted on getting told the type of the error :shrug:
-                    Ok(()) as Result<(), iox_catalog::interface::Error>
+                .retry_all_errors("cas_sort_key", || {
+                    let old_sort_key = old_sort_key.clone();
+                    async {
+                        let mut repos = self.catalog.repositories().await;
+                        match repos
+                            .partitions()
+                            .cas_sort_key(partition_id, old_sort_key, &new_sort_key_str)
+                            .await
+                        {
+                            Ok(_) => {}
+                            Err(CasFailure::ValueMismatch(_)) => {
+                                // An ingester concurrently updated the sort key.
+                                //
+                                // This breaks a sort-key update invariant - sort
+                                // key updates MUST be serialised. This should
+                                // not happen because writes for a given table
+                                // are always mapped to a single ingester
+                                // instance.
+                                panic!("detected concurrent sort key update");
+                            }
+                            Err(CasFailure::QueryError(e)) => return Err(e),
+                        };
+                        // compiler insisted on getting told the type of the error :shrug:
+                        Ok(()) as Result<(), iox_catalog::interface::Error>
+                    }
                 })
                 .await
                 .expect("retry forever");
 
             // Update the sort key in the partition cache.
-            table_data
-                .write()
-                .await
-                .get_partition(partition_id)
-                .unwrap()
-                .update_sort_key(Some(new_sort_key.clone()));
+            partition.lock().update_sort_key(Some(new_sort_key.clone()));
 
             debug!(
                 %object_store_id,
@@ -439,7 +525,7 @@ impl Persister for IngesterData {
                 %table_name,
                 %partition_id,
                 %partition_key,
-                old_sort_key = ?sort_key,
+                ?old_sort_key,
                 %new_sort_key,
                 "adjusted sort key during batch compact & persist"
             );
@@ -545,18 +631,15 @@ impl Persister for IngesterData {
         // This SHOULD cause the data to be dropped, but there MAY be ongoing
         // queries that currently hold a reference to the data. In either case,
         // the persisted data will be dropped "shortly".
-        table_data
-            .write()
-            .await
-            .get_partition(partition_id)
-            .unwrap()
+        partition
+            .lock()
             .mark_persisted(iox_metadata.max_sequence_number);
 
         // BUG: ongoing queries retain references to the persisting data,
         // preventing it from being dropped, but memory is released back to
         // lifecycle memory tracker when this fn returns.
         //
-        //  https://github.com/influxdata/influxdb_iox/issues/5872
+        //  https://github.com/influxdata/influxdb_iox/issues/5805
         //
         info!(
             %object_store_id,
@@ -608,85 +691,219 @@ mod tests {
 
     use assert_matches::assert_matches;
     use data_types::{
-        ColumnId, ColumnSet, CompactionLevel, DeletePredicate, NamespaceSchema, NonEmptyString,
-        ParquetFileParams, Sequence, Timestamp, TimestampRange,
+        DeletePredicate, Namespace, NamespaceSchema, NonEmptyString, PartitionKey, Sequence, Shard,
+        Table, TimestampRange,
     };
-
     use dml::{DmlDelete, DmlMeta, DmlWrite};
     use futures::TryStreamExt;
-    use hashbrown::HashMap;
-    use iox_catalog::{interface::RepoCollection, mem::MemCatalog, validate_or_insert_schema};
+    use iox_catalog::{mem::MemCatalog, validate_or_insert_schema};
     use iox_time::Time;
-    use metric::{MetricObserver, Observation};
-    use mutable_batch::MutableBatch;
-    use mutable_batch_lp::lines_to_batches;
     use object_store::memory::InMemory;
-
     use schema::sort::SortKey;
-    use uuid::Uuid;
 
     use super::*;
     use crate::{
-        data::{namespace::NamespaceData, partition::resolver::CatalogPartitionResolver},
         lifecycle::{LifecycleConfig, LifecycleManager},
+        test_util::make_write_op,
     };
+
+    struct TestContext {
+        metrics: Arc<metric::Registry>,
+        catalog: Arc<dyn Catalog>,
+        object_store: Arc<DynObjectStore>,
+        namespace: Namespace,
+        table1: Table,
+        table2: Table,
+        partition_key: PartitionKey,
+        shard1: Shard,
+        shard2: Shard,
+        data: Arc<IngesterData>,
+    }
+
+    impl TestContext {
+        async fn new() -> Self {
+            let metrics = Arc::new(metric::Registry::new());
+            let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+            let partition_key = PartitionKey::from("1970-01-01");
+
+            let (namespace, table1, table2, shard1, shard2) = {
+                let mut repos = catalog.repositories().await;
+
+                let topic = repos.topics().create_or_get("whatevs").await.unwrap();
+                let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
+
+                let namespace = repos
+                    .namespaces()
+                    .create("foo", None, topic.id, query_pool.id)
+                    .await
+                    .unwrap();
+
+                let table1 = repos
+                    .tables()
+                    .create_or_get("mem", namespace.id)
+                    .await
+                    .unwrap();
+
+                let table2 = repos
+                    .tables()
+                    .create_or_get("cpu", namespace.id)
+                    .await
+                    .unwrap();
+
+                let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100, None);
+
+                let shard_index = ShardIndex::new(0);
+                let shard1 = repos
+                    .shards()
+                    .create_or_get(&topic, shard_index)
+                    .await
+                    .unwrap();
+
+                let shard2 = repos
+                    .shards()
+                    .create_or_get(&topic, shard_index)
+                    .await
+                    .unwrap();
+
+                // Put the columns in the catalog (these writes don't actually get inserted)
+                // This will be different once column IDs are used instead of names
+                let table1_write = Self::arbitrary_write_with_seq_num_at_time(
+                    1,
+                    0,
+                    &partition_key,
+                    shard_index,
+                    namespace.id,
+                    &table1,
+                );
+                validate_or_insert_schema(
+                    table1_write
+                        .tables()
+                        .map(|(_id, batch)| (table1.name.as_str(), batch)),
+                    &schema,
+                    repos.deref_mut(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+                let table2_write = Self::arbitrary_write_with_seq_num_at_time(
+                    1,
+                    0,
+                    &partition_key,
+                    shard_index,
+                    namespace.id,
+                    &table2,
+                );
+                validate_or_insert_schema(
+                    table2_write
+                        .tables()
+                        .map(|(_id, batch)| (table2.name.as_str(), batch)),
+                    &schema,
+                    repos.deref_mut(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+
+                (namespace, table1, table2, shard1, shard2)
+            };
+
+            let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+
+            let data = Arc::new(
+                IngesterData::new(
+                    Arc::clone(&object_store),
+                    Arc::clone(&catalog),
+                    [
+                        (shard1.id, shard1.shard_index),
+                        (shard2.id, shard2.shard_index),
+                    ],
+                    Arc::new(Executor::new_testing()),
+                    BackoffConfig::default(),
+                    Arc::clone(&metrics),
+                )
+                .await
+                .expect("failed to initialise ingester"),
+            );
+
+            Self {
+                metrics,
+                catalog,
+                object_store,
+                namespace,
+                table1,
+                table2,
+                partition_key,
+                shard1,
+                shard2,
+                data,
+            }
+        }
+
+        fn arbitrary_write_with_seq_num_at_time(
+            sequence_number: i64,
+            timestamp: i64,
+            partition_key: &PartitionKey,
+            shard_index: ShardIndex,
+            namespace_id: NamespaceId,
+            table: &Table,
+        ) -> DmlWrite {
+            make_write_op(
+                partition_key,
+                shard_index,
+                namespace_id,
+                &table.name,
+                table.id,
+                sequence_number,
+                &format!(
+                    "{} foo=1 {}\n{} foo=2 {}",
+                    table.name,
+                    timestamp,
+                    table.name,
+                    timestamp + 10
+                ),
+            )
+        }
+
+        fn arbitrary_write_with_seq_num(&self, table: &Table, sequence_number: i64) -> DmlWrite {
+            Self::arbitrary_write_with_seq_num_at_time(
+                sequence_number,
+                10,
+                &self.partition_key,
+                self.shard1.shard_index,
+                self.namespace.id,
+                table,
+            )
+        }
+
+        async fn persist_data(&self, table: &Table) {
+            let partition_id = {
+                let sd = self.data.shards.get(&self.shard1.id).unwrap();
+                let n = sd.namespace(self.namespace.id).unwrap();
+                let t = n.table(table.id).unwrap();
+                let p = t
+                    .get_partition_by_key(&self.partition_key)
+                    .unwrap()
+                    .lock()
+                    .partition_id();
+                p
+            };
+
+            self.data
+                .persist(self.shard1.id, self.namespace.id, table.id, partition_id)
+                .await;
+        }
+    }
 
     #[tokio::test]
     async fn buffer_write_updates_lifecycle_manager_indicates_pause() {
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard1 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
+        test_helpers::maybe_start_logging();
 
-        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let ctx = TestContext::new().await;
+        let shard = &ctx.shard1;
 
-        let data = Arc::new(IngesterData::new(
-            Arc::clone(&object_store),
-            Arc::clone(&catalog),
-            [(shard1.id, shard_index)],
-            Arc::new(Executor::new(1)),
-            Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
-            BackoffConfig::default(),
-            Arc::clone(&metrics),
-        ));
+        let w1 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 1);
 
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let ignored_ts = Time::from_timestamp_millis(42);
-
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-
-        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        std::mem::drop(repos);
         let pause_size = w1.size() + 1;
         let manager = LifecycleManager::new(
             LifecycleConfig::new(
@@ -697,36 +914,22 @@ mod tests {
                 Duration::from_secs(1),
                 1000000,
             ),
-            metrics,
+            Arc::clone(&ctx.metrics),
             Arc::new(SystemProvider::new()),
         );
-        let action = data
-            .buffer_operation(
-                shard1.id,
-                DmlOperation::Write(w1.clone()),
-                &manager.handle(),
-            )
+
+        let action = ctx
+            .data
+            .buffer_operation(shard.id, DmlOperation::Write(w1), &manager.handle())
             .await
             .unwrap();
         assert_matches!(action, DmlApplyAction::Applied(false));
 
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w2 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(&mut *catalog.repositories().await, namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(2)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
+        let w2 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 2);
 
-        let action = data
-            .buffer_operation(shard1.id, DmlOperation::Write(w2), &manager.handle())
+        let action = ctx
+            .data
+            .buffer_operation(shard.id, DmlOperation::Write(w2), &manager.handle())
             .await
             .unwrap();
         assert_matches!(action, DmlApplyAction::Applied(true));
@@ -734,58 +937,12 @@ mod tests {
 
     #[tokio::test]
     async fn persist_row_count_trigger() {
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard1 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
+        test_helpers::maybe_start_logging();
 
-        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let ctx = TestContext::new().await;
+        let shard = &ctx.shard1;
 
-        let data = Arc::new(IngesterData::new(
-            Arc::clone(&object_store),
-            Arc::clone(&catalog),
-            [(shard1.id, shard1.shard_index)],
-            Arc::new(Executor::new(1)),
-            Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
-            BackoffConfig::default(),
-            Arc::clone(&metrics),
-        ));
-
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let batch = lines_to_batches("mem foo=1 10\nmem foo=1 11", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                Time::from_timestamp_millis(42),
-                None,
-                50,
-            ),
-        );
-        let _schema = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // drop repos so the mem catalog won't deadlock.
-        std::mem::drop(repos);
+        let w1 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 1);
 
         let manager = LifecycleManager::new(
             LifecycleConfig::new(
@@ -796,35 +953,24 @@ mod tests {
                 Duration::from_secs(1),
                 1, // This row count will be hit
             ),
-            Arc::clone(&metrics),
+            Arc::clone(&ctx.metrics),
             Arc::new(SystemProvider::new()),
         );
 
-        let action = data
-            .buffer_operation(shard1.id, DmlOperation::Write(w1), &manager.handle())
+        let action = ctx
+            .data
+            .buffer_operation(shard.id, DmlOperation::Write(w1), &manager.handle())
             .await
             .unwrap();
         // Exceeding the row count doesn't pause ingest (like other partition
         // limits)
         assert_matches!(action, DmlApplyAction::Applied(false));
 
-        let (table_id, partition_id) = {
-            let sd = data.shards.get(&shard1.id).unwrap();
-            let n = sd.namespace(&"foo".into()).unwrap();
-            let mem_table = n.table_data(&"mem".into()).unwrap();
-            assert!(n.table_data(&"mem".into()).is_some());
-            let mem_table = mem_table.write().await;
-            let p = mem_table
-                .get_partition_by_key(&"1970-01-01".into())
-                .unwrap();
-            (mem_table.table_id(), p.partition_id())
-        };
-
-        data.persist(shard1.id, namespace.id, table_id, partition_id)
-            .await;
+        ctx.persist_data(&ctx.table1).await;
 
         // verify that a file got put into object store
-        let file_paths: Vec<_> = object_store
+        let file_paths: Vec<_> = ctx
+            .object_store
             .list(None)
             .await
             .unwrap()
@@ -836,101 +982,18 @@ mod tests {
 
     #[tokio::test]
     async fn persist() {
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard1 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
-        let shard2 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
+        test_helpers::maybe_start_logging();
+        let ctx = TestContext::new().await;
+        let namespace = &ctx.namespace;
+        let shard1 = &ctx.shard1;
+        let shard2 = &ctx.shard2;
+        let data = &ctx.data;
 
-        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-
-        let data = Arc::new(IngesterData::new(
-            Arc::clone(&object_store),
-            Arc::clone(&catalog),
-            [
-                (shard1.id, shard1.shard_index),
-                (shard2.id, shard2.shard_index),
-            ],
-            Arc::new(Executor::new(1)),
-            Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
-            BackoffConfig::default(),
-            Arc::clone(&metrics),
-        ));
-
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let ignored_ts = Time::from_timestamp_millis(42);
-
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-        let schema = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        let batch = lines_to_batches("cpu foo=1 10", 1).unwrap();
-        let w2 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(2), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-        let _ = validate_or_insert_schema(w2.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // drop repos so the mem catalog won't deadlock.
-        std::mem::drop(repos);
-        let batch = lines_to_batches("mem foo=1 30", 2).unwrap();
-        let w3 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(&mut *catalog.repositories().await, namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(2)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
+        let w1 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 1);
+        // different table as w1, same sequence number
+        let w2 = ctx.arbitrary_write_with_seq_num(&ctx.table2, 1);
+        // same table as w1, next sequence number
+        let w3 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 2);
 
         let manager = LifecycleManager::new(
             LifecycleConfig::new(
@@ -941,7 +1004,7 @@ mod tests {
                 Duration::from_secs(1),
                 1000000,
             ),
-            Arc::clone(&metrics),
+            Arc::clone(&ctx.metrics),
             Arc::new(SystemProvider::new()),
         );
 
@@ -958,27 +1021,22 @@ mod tests {
         let expected_progress = ShardProgress::new()
             .with_buffered(SequenceNumber::new(1))
             .with_buffered(SequenceNumber::new(2));
-        assert_progress(&data, shard_index, expected_progress).await;
+        assert_progress(data, shard1.shard_index, expected_progress).await;
 
         let sd = data.shards.get(&shard1.id).unwrap();
-        let n = sd.namespace(&"foo".into()).unwrap();
+        let n = sd.namespace(namespace.id).unwrap();
         let partition_id;
-        let table_id;
         {
-            let mem_table = n.table_data(&"mem".into()).unwrap();
-            assert!(n.table_data(&"cpu".into()).is_some());
-
-            let mem_table = mem_table.write().await;
-            table_id = mem_table.table_id();
+            let mem_table = n.table(ctx.table1.id).unwrap();
 
             let p = mem_table
                 .get_partition_by_key(&"1970-01-01".into())
                 .unwrap();
-            partition_id = p.partition_id();
+            partition_id = p.lock().partition_id();
         }
         {
             // verify the partition doesn't have a sort key before any data has been persisted
-            let mut repos = catalog.repositories().await;
+            let mut repos = ctx.catalog.repositories().await;
             let partition_info = repos
                 .partitions()
                 .get_by_id(partition_id)
@@ -988,11 +1046,12 @@ mod tests {
             assert!(partition_info.sort_key.is_empty());
         }
 
-        data.persist(shard1.id, namespace.id, table_id, partition_id)
+        data.persist(shard1.id, namespace.id, ctx.table1.id, partition_id)
             .await;
 
         // verify that a file got put into object store
-        let file_paths: Vec<_> = object_store
+        let file_paths: Vec<_> = ctx
+            .object_store
             .list(None)
             .await
             .unwrap()
@@ -1001,7 +1060,7 @@ mod tests {
             .unwrap();
         assert_eq!(file_paths.len(), 1);
 
-        let mut repos = catalog.repositories().await;
+        let mut repos = ctx.catalog.repositories().await;
         // verify it put the record in the catalog
         let parquet_files = repos
             .parquet_files()
@@ -1011,9 +1070,7 @@ mod tests {
         assert_eq!(parquet_files.len(), 1);
         let pf = parquet_files.first().unwrap();
         assert_eq!(pf.partition_id, partition_id);
-        assert_eq!(pf.table_id, table_id);
-        assert_eq!(pf.min_time, Timestamp::new(10));
-        assert_eq!(pf.max_time, Timestamp::new(30));
+        assert_eq!(pf.table_id, ctx.table1.id);
         assert_eq!(pf.max_sequence_number, SequenceNumber::new(2));
         assert_eq!(pf.shard_id, shard1.id);
         assert!(pf.to_delete.is_none());
@@ -1040,17 +1097,16 @@ mod tests {
         let cached_sort_key = data
             .shard(shard1.id)
             .unwrap()
-            .namespace_by_id(namespace.id)
+            .namespace(namespace.id)
             .unwrap()
-            .table_id(table_id)
+            .table(ctx.table1.id)
             .unwrap()
-            .write()
-            .await
             .get_partition(partition_id)
             .unwrap()
+            .lock()
             .sort_key()
-            .get()
-            .await;
+            .clone();
+        let cached_sort_key = cached_sort_key.get().await;
         assert_eq!(
             cached_sort_key,
             Some(SortKey::from_columns(partition.sort_key))
@@ -1076,7 +1132,8 @@ mod tests {
         );
 
         // verify metrics
-        let persisted_file_size_bytes: Metric<U64Histogram> = metrics
+        let persisted_file_size_bytes: Metric<U64Histogram> = ctx
+            .metrics
             .get_instrument("ingester_persisted_file_size_bytes")
             .unwrap();
 
@@ -1096,15 +1153,14 @@ mod tests {
         // Only the < 500 KB bucket has a count
         assert_eq!(buckets_with_counts, &[500 * 1024]);
 
-        let mem_table = n.table_data(&"mem".into()).unwrap();
+        let mem_table = n.table(ctx.table1.id).unwrap();
 
         // verify that the parquet_max_sequence_number got updated
         assert_eq!(
             mem_table
-                .write()
-                .await
                 .get_partition(partition_id)
                 .unwrap()
+                .lock()
                 .max_persisted_sequence_number(),
             Some(SequenceNumber::new(2))
         );
@@ -1113,94 +1169,20 @@ mod tests {
         let expected_progress = ShardProgress::new()
             .with_buffered(SequenceNumber::new(1))
             .with_persisted(SequenceNumber::new(2));
-        assert_progress(&data, shard_index, expected_progress).await;
+        assert_progress(data, shard1.shard_index, expected_progress).await;
     }
 
     #[tokio::test]
     async fn partial_write_progress() {
         test_helpers::maybe_start_logging();
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard1 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
-        let shard2 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
+        let ctx = TestContext::new().await;
+        let namespace = &ctx.namespace;
+        let shard1 = &ctx.shard1;
+        let data = &ctx.data;
 
-        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
-
-        let data = Arc::new(IngesterData::new(
-            Arc::clone(&object_store),
-            Arc::clone(&catalog),
-            [
-                (shard1.id, shard1.shard_index),
-                (shard2.id, shard2.shard_index),
-            ],
-            Arc::new(Executor::new(1)),
-            Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
-            BackoffConfig::default(),
-            Arc::clone(&metrics),
-        ));
-
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let ignored_ts = Time::from_timestamp_millis(42);
-
-        // write with sequence number 1
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
+        let w1 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 1);
         // write with sequence number 2
-        let batch = lines_to_batches("mem foo=1 30\ncpu bar=1 20", 0).unwrap();
-        let w2 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(2)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-        let _ = validate_or_insert_schema(w2.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        drop(repos); // release catalog transaction
+        let w2 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 2);
 
         let manager = LifecycleManager::new(
             LifecycleConfig::new(
@@ -1211,7 +1193,7 @@ mod tests {
                 Duration::from_secs(1),
                 1000000,
             ),
-            metrics,
+            Arc::clone(&ctx.metrics),
             Arc::new(SystemProvider::new()),
         );
 
@@ -1222,19 +1204,20 @@ mod tests {
 
         // Get the namespace
         let sd = data.shards.get(&shard1.id).unwrap();
-        let n = sd.namespace(&"foo".into()).unwrap();
+        let n = sd.namespace(namespace.id).unwrap();
 
         let expected_progress = ShardProgress::new().with_buffered(SequenceNumber::new(1));
-        assert_progress(&data, shard_index, expected_progress).await;
+        assert_progress(data, shard1.shard_index, expected_progress).await;
 
         // configure the the namespace to wait after each insert.
         n.test_triggers.enable_pause_after_write().await;
 
         // now, buffer operation 2 which has two tables,
-        let captured_data = Arc::clone(&data);
+        let captured_data = Arc::clone(data);
+        let shard1_id = shard1.id;
         let task = tokio::task::spawn(async move {
             captured_data
-                .buffer_operation(shard1.id, DmlOperation::Write(w2), &manager.handle())
+                .buffer_operation(shard1_id, DmlOperation::Write(w2), &manager.handle())
                 .await
                 .unwrap();
         });
@@ -1246,7 +1229,7 @@ mod tests {
         let expected_progress = ShardProgress::new()
             // sequence 2 hasn't been buffered yet
             .with_buffered(SequenceNumber::new(1));
-        assert_progress(&data, shard_index, expected_progress).await;
+        assert_progress(data, shard1.shard_index, expected_progress).await;
 
         // allow the write to complete
         n.test_triggers.release_pause_after_write().await;
@@ -1256,246 +1239,18 @@ mod tests {
         let expected_progress = ShardProgress::new()
             .with_buffered(SequenceNumber::new(1))
             .with_buffered(SequenceNumber::new(2));
-        assert_progress(&data, shard_index, expected_progress).await;
-    }
-
-    #[tokio::test]
-    async fn buffer_operation_ignores_already_persisted_data() {
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
-
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let ignored_ts = Time::from_timestamp_millis(42);
-
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w2 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(2)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-
-        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        // create some persisted state
-        let table = repos
-            .tables()
-            .create_or_get("mem", namespace.id)
-            .await
-            .unwrap();
-        let partition = repos
-            .partitions()
-            .create_or_get("1970-01-01".into(), shard.id, table.id)
-            .await
-            .unwrap();
-        repos
-            .partitions()
-            .update_persisted_sequence_number(partition.id, SequenceNumber::new(1))
-            .await
-            .unwrap();
-        let partition2 = repos
-            .partitions()
-            .create_or_get("1970-01-02".into(), shard.id, table.id)
-            .await
-            .unwrap();
-
-        let parquet_file_params = ParquetFileParams {
-            shard_id: shard.id,
-            namespace_id: namespace.id,
-            table_id: table.id,
-            partition_id: partition.id,
-            object_store_id: Uuid::new_v4(),
-            max_sequence_number: SequenceNumber::new(1),
-            min_time: Timestamp::new(1),
-            max_time: Timestamp::new(1),
-            file_size_bytes: 0,
-            row_count: 0,
-            compaction_level: CompactionLevel::Initial,
-            created_at: Timestamp::new(1),
-            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
-        };
-        repos
-            .parquet_files()
-            .create(parquet_file_params.clone())
-            .await
-            .unwrap();
-
-        // now create a parquet file in another partition with a much higher sequence persisted
-        // sequence number. We want to make sure that this doesn't cause our write in the other
-        // partition to get ignored.
-        let other_file_params = ParquetFileParams {
-            max_sequence_number: SequenceNumber::new(15),
-            object_store_id: Uuid::new_v4(),
-            partition_id: partition2.id,
-            ..parquet_file_params
-        };
-        repos
-            .parquet_files()
-            .create(other_file_params)
-            .await
-            .unwrap();
-        std::mem::drop(repos);
-
-        let manager = LifecycleManager::new(
-            LifecycleConfig::new(
-                1,
-                0,
-                0,
-                Duration::from_secs(1),
-                Duration::from_secs(1),
-                1000000,
-            ),
-            Arc::clone(&metrics),
-            Arc::new(SystemProvider::new()),
-        );
-
-        let partition_provider = Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog)));
-
-        let data = NamespaceData::new(
-            namespace.id,
-            "foo".into(),
-            shard.id,
-            partition_provider,
-            &*metrics,
-        );
-
-        // w1 should be ignored because the per-partition replay offset is set
-        // to 1 already, so it shouldn't be buffered and the buffer should
-        // remain empty.
-        let action = data
-            .buffer_operation(DmlOperation::Write(w1), &catalog, &manager.handle())
-            .await
-            .unwrap();
-        {
-            let table_data = data.table_data(&"mem".into()).unwrap();
-            let mut table = table_data.write().await;
-            assert!(table
-                .partition_iter_mut()
-                .all(|p| p.get_query_data().is_none()));
-            assert_eq!(
-                table
-                    .get_partition_by_key(&"1970-01-01".into())
-                    .unwrap()
-                    .max_persisted_sequence_number(),
-                Some(SequenceNumber::new(1))
-            );
-        }
-        assert_matches!(action, DmlApplyAction::Skipped);
-
-        // w2 should be in the buffer
-        data.buffer_operation(DmlOperation::Write(w2), &catalog, &manager.handle())
-            .await
-            .unwrap();
-
-        let table_data = data.table_data(&"mem".into()).unwrap();
-        let table = table_data.read().await;
-        let partition = table.get_partition_by_key(&"1970-01-01".into()).unwrap();
-        assert_eq!(
-            partition.sequence_number_range().inclusive_min(),
-            Some(SequenceNumber::new(2))
-        );
-
-        assert_matches!(data.table_count().observe(), Observation::U64Counter(v) => {
-            assert_eq!(v, 1, "unexpected table count metric value");
-        });
+        assert_progress(data, shard1.shard_index, expected_progress).await;
     }
 
     #[tokio::test]
     async fn buffer_deletes_updates_tombstone_watermark() {
-        let metrics = Arc::new(metric::Registry::new());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        let mut repos = catalog.repositories().await;
-        let topic = repos.topics().create_or_get("whatevs").await.unwrap();
-        let query_pool = repos.query_pools().create_or_get("whatevs").await.unwrap();
-        let shard_index = ShardIndex::new(0);
-        let namespace = repos
-            .namespaces()
-            .create("foo", "inf", topic.id, query_pool.id)
-            .await
-            .unwrap();
-        let shard1 = repos
-            .shards()
-            .create_or_get(&topic, shard_index)
-            .await
-            .unwrap();
-        let shard_index = ShardIndex::new(0);
+        test_helpers::maybe_start_logging();
+        let ctx = TestContext::new().await;
+        let shard1 = &ctx.shard1;
+        let data = &ctx.data;
 
-        let object_store: Arc<DynObjectStore> = Arc::new(InMemory::new());
+        let w1 = ctx.arbitrary_write_with_seq_num(&ctx.table1, 1);
 
-        let data = Arc::new(IngesterData::new(
-            Arc::clone(&object_store),
-            Arc::clone(&catalog),
-            [(shard1.id, shard_index)],
-            Arc::new(Executor::new(1)),
-            Arc::new(CatalogPartitionResolver::new(Arc::clone(&catalog))),
-            BackoffConfig::default(),
-            Arc::clone(&metrics),
-        ));
-
-        let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100);
-
-        let ignored_ts = Time::from_timestamp_millis(42);
-
-        let batch = lines_to_batches("mem foo=1 10", 0).unwrap();
-        let w1 = DmlWrite::new(
-            "foo",
-            namespace.id,
-            batch.clone(),
-            build_id_map(repos.deref_mut(), namespace.id, &batch).await,
-            "1970-01-01".into(),
-            DmlMeta::sequenced(
-                Sequence::new(ShardIndex::new(1), SequenceNumber::new(1)),
-                ignored_ts,
-                None,
-                50,
-            ),
-        );
-
-        let _ = validate_or_insert_schema(w1.tables(), &schema, repos.deref_mut())
-            .await
-            .unwrap()
-            .unwrap();
-
-        std::mem::drop(repos);
         let pause_size = w1.size() + 1;
         let manager = LifecycleManager::new(
             LifecycleConfig::new(
@@ -1506,26 +1261,23 @@ mod tests {
                 Duration::from_secs(1),
                 1000000,
             ),
-            metrics,
+            Arc::clone(&ctx.metrics),
             Arc::new(SystemProvider::new()),
         );
-        data.buffer_operation(
-            shard1.id,
-            DmlOperation::Write(w1.clone()),
-            &manager.handle(),
-        )
-        .await
-        .unwrap();
+
+        data.buffer_operation(shard1.id, DmlOperation::Write(w1), &manager.handle())
+            .await
+            .unwrap();
 
         let predicate = DeletePredicate {
             range: TimestampRange::new(1, 2),
             exprs: vec![],
         };
+        let ignored_ts = Time::from_timestamp_millis(42).unwrap();
         let d1 = DmlDelete::new(
-            "foo",
             NamespaceId::new(42),
             predicate,
-            Some(NonEmptyString::new("mem").unwrap()),
+            Some(NonEmptyString::new(&ctx.table1.name).unwrap()),
             DmlMeta::sequenced(
                 Sequence::new(ShardIndex::new(1), SequenceNumber::new(2)),
                 ignored_ts,
@@ -1550,29 +1302,5 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
 
         assert_eq!(progresses, expected_progresses);
-    }
-
-    pub async fn build_id_map<R>(
-        catalog: &mut R,
-        namespace_id: NamespaceId,
-        tables: &HashMap<String, MutableBatch>,
-    ) -> HashMap<String, TableId>
-    where
-        R: RepoCollection + ?Sized,
-    {
-        let mut ret = HashMap::with_capacity(tables.len());
-
-        for k in tables.keys() {
-            let id = catalog
-                .tables()
-                .create_or_get(k, namespace_id)
-                .await
-                .expect("table should create OK")
-                .id;
-
-            ret.insert(k.clone(), id);
-        }
-
-        ret
     }
 }

@@ -17,11 +17,14 @@ datafusion_util = { path = "../datafusion_util" }
 dml = { path = "../dml" }
 futures = "0.3"
 generated_types = { path = "../generated_types" }
+hashbrown = { workspace = true }
 influxdb_iox_client = { path = "../influxdb_iox_client" }
 ingester = { path = "../ingester" }
+iox_arrow_flight = { path = "../iox_arrow_flight" }
 iox_catalog = { path = "../iox_catalog" }
 iox_query = { path = "../iox_query" }
 iox_tests = { path = "../iox_tests" }
+iox_time = { path = "../iox_time" }
 itertools = "0.10"
 mutable_batch = { path = "../mutable_batch" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
@@ -29,10 +32,12 @@ once_cell = { version = "1.16.0", features = ["parking_lot"] }
 parquet_file = { version = "0.1.0", path = "../parquet_file" }
 predicate = { path = "../predicate" }
 querier = { path = "../querier" }
+regex = "1.7.0"
 schema = { path = "../schema" }
 sharder = { path = "../sharder" }
-tokio = { version = "1.21", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
+tokio = { version = "1.22", features = ["macros", "parking_lot", "rt-multi-thread", "time"] }
 trace = { path = "../trace" }
+uuid = "1"
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]

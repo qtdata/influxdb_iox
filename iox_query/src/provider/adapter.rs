@@ -15,7 +15,7 @@ use datafusion::physical_plan::{
 };
 use futures::Stream;
 
-/// Database schema creation / validation errors.
+/// Schema creation / validation errors.
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -236,7 +236,7 @@ impl Stream for SchemaAdapterStream {
 /// Describes how to create column in the output.
 #[derive(Debug)]
 enum ColumnMapping {
-    /// Output column is found at <index> column of the input schema
+    /// Output column is found at `<index>` column of the input schema
     FromInput(usize),
     /// Output colum should be synthesized with nulls of the specified type
     MakeNull(DataType),

@@ -18,7 +18,7 @@ use schema::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use self::column_rewrite::MissingColumnRewriter;
+use self::column_rewrite::MissingTagColumnRewriter;
 use self::field_rewrite::FieldProjectionRewriter;
 use self::measurement_rewrite::rewrite_measurement_references;
 use self::value_rewrite::rewrite_field_value_references;
@@ -56,6 +56,24 @@ pub const FIELD_COLUMN_NAME: &str = "_field";
 /// The plan for each table will have expression containing `_value` rewritten
 /// into multiple expressions (one for each field column).
 pub const VALUE_COLUMN_NAME: &str = "_value";
+
+/// Special group key for `read_group` requests.
+///
+/// Treat these specially and use `""` as a placeholder value (instead of a real column) to mirror what TSM does.
+/// See <https://github.com/influxdata/influxdb_iox/issues/2693#issuecomment-947695442>
+/// for more details.
+///
+/// See also [`GROUP_KEY_SPECIAL_STOP`].
+pub const GROUP_KEY_SPECIAL_START: &str = "_start";
+
+/// Special group key for `read_group` requests.
+///
+/// Treat these specially and use `""` as a placeholder value (instead of a real column) to mirror what TSM does.
+/// See <https://github.com/influxdata/influxdb_iox/issues/2693#issuecomment-947695442>
+/// for more details.
+///
+/// See also [`GROUP_KEY_SPECIAL_START`].
+pub const GROUP_KEY_SPECIAL_STOP: &str = "_stop";
 
 /// [`InfluxRpcPredicate`] implements the semantics of the InfluxDB
 /// Storage gRPC and handles mapping details such as `_field` and
@@ -108,7 +126,7 @@ impl InfluxRpcPredicate {
     /// Returns a list of (TableName, [`Predicate`])
     pub fn table_predicates(
         &self,
-        table_info: &dyn QueryDatabaseMeta,
+        table_info: &dyn QueryNamespaceMeta,
     ) -> DataFusionResult<Vec<(Arc<str>, Predicate)>> {
         let table_names = match &self.table_names {
             Some(table_names) => itertools::Either::Left(table_names.iter().cloned()),
@@ -146,8 +164,8 @@ impl InfluxRpcPredicate {
 }
 
 /// Information required to normalize predicates
-pub trait QueryDatabaseMeta {
-    /// Returns a list of table names in this DB
+pub trait QueryNamespaceMeta {
+    /// Returns a list of table names in this namespace
     fn table_names(&self) -> Vec<String>;
 
     /// Schema for a specific table if the table exists.
@@ -192,7 +210,7 @@ fn normalize_predicate(
     let mut predicate = predicate.clone();
 
     let mut field_projections = FieldProjectionRewriter::new(Arc::clone(&schema));
-    let mut missing_columums = MissingColumnRewriter::new(Arc::clone(&schema));
+    let mut missing_tag_columns = MissingTagColumnRewriter::new(Arc::clone(&schema));
 
     let mut field_value_exprs = vec![];
 
@@ -219,8 +237,11 @@ fn normalize_predicate(
                 // the field column projection set.
                 .and_then(|e| field_projections.rewrite_field_exprs(e))
                 .map(|e| log_rewrite(e, "field_projections"))
-                // remove references to columns that don't exist in this schema
-                .and_then(|e| e.rewrite(&mut missing_columums))
+                // Any column references that exist in the RPC predicate must exist
+                // in the table's schema as tags. Replace any column references that
+                // do not exist, or that are not tags, with NULL.
+                // Field values always use `_value` as a name and are handled above.
+                .and_then(|e| e.rewrite(&mut missing_tag_columns))
                 .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
                 .and_then(rewrite::rewrite)

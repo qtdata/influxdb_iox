@@ -282,6 +282,94 @@ mod test {
         (schema, vec![chunk1, chunk2])
     }
 
+    async fn get_sorted_test_chunks() -> (Arc<Schema>, Vec<Arc<dyn QueryChunk>>) {
+        // Chunk 1
+        let chunk1 = Arc::new(
+            TestChunk::new("t")
+                .with_time_column_with_stats(Some(1000), Some(1000))
+                .with_tag_column_with_stats("tag1", Some("A"), Some("A"))
+                .with_i64_field_column("field_int")
+                .with_one_row_of_specific_data("A", 1, 1000),
+        ) as Arc<dyn QueryChunk>;
+
+        let expected = vec![
+            "+-----------+------+-----------------------------+",
+            "| field_int | tag1 | time                        |",
+            "+-----------+------+-----------------------------+",
+            "| 1         | A    | 1970-01-01T00:00:00.000001Z |",
+            "+-----------+------+-----------------------------+",
+        ];
+        assert_batches_eq!(&expected, &raw_data(&[Arc::clone(&chunk1)]).await);
+
+        // Chunk 2
+        let chunk2 = Arc::new(
+            TestChunk::new("t")
+                .with_time_column_with_stats(Some(2000), Some(2000))
+                .with_tag_column_with_stats("tag1", Some("B"), Some("B"))
+                .with_i64_field_column("field_int")
+                .with_one_row_of_specific_data("B", 2, 2000),
+        ) as Arc<dyn QueryChunk>;
+
+        let expected = vec![
+            "+-----------+------+-----------------------------+",
+            "| field_int | tag1 | time                        |",
+            "+-----------+------+-----------------------------+",
+            "| 2         | B    | 1970-01-01T00:00:00.000002Z |",
+            "+-----------+------+-----------------------------+",
+        ];
+        assert_batches_eq!(&expected, &raw_data(&[Arc::clone(&chunk2)]).await);
+
+        (chunk1.schema(), vec![chunk1, chunk2])
+    }
+
+    #[tokio::test]
+    async fn test_compact_plan_sorted() {
+        test_helpers::maybe_start_logging();
+
+        // ensures that the output is actually sorted
+        // https://github.com/influxdata/influxdb_iox/issues/6125
+        let (schema, chunks) = get_sorted_test_chunks().await;
+
+        let chunk_orders = vec![
+            // reverse order
+            vec![Arc::clone(&chunks[1]), Arc::clone(&chunks[0])],
+            chunks,
+        ];
+
+        // executor has only 1 thread
+        let executor = Executor::new_testing();
+        for chunks in chunk_orders {
+            let sort_key = SortKeyBuilder::with_capacity(2)
+                .with_col_opts("tag1", false, true)
+                .with_col_opts(TIME_COLUMN_NAME, false, true)
+                .build();
+
+            let compact_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+                .compact_plan(Arc::from("t"), Arc::clone(&schema), chunks, sort_key)
+                .expect("created compact plan");
+
+            let physical_plan = executor
+                .new_context(ExecutorType::Reorg)
+                .create_physical_plan(&compact_plan)
+                .await
+                .unwrap();
+
+            let batches = test_collect(physical_plan).await;
+
+            // should be sorted on tag1 then timestamp
+            let expected = vec![
+                "+-----------+------+-----------------------------+",
+                "| field_int | tag1 | time                        |",
+                "+-----------+------+-----------------------------+",
+                "| 1         | A    | 1970-01-01T00:00:00.000001Z |",
+                "| 2         | B    | 1970-01-01T00:00:00.000002Z |",
+                "+-----------+------+-----------------------------+",
+            ];
+
+            assert_batches_eq!(&expected, &batches);
+        }
+    }
+
     #[tokio::test]
     async fn test_compact_plan() {
         test_helpers::maybe_start_logging();
@@ -297,7 +385,7 @@ mod test {
             .compact_plan(Arc::from("t"), schema, chunks, sort_key)
             .expect("created compact plan");
 
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&compact_plan)
@@ -329,8 +417,6 @@ mod test {
         ];
 
         assert_batches_eq!(&expected, &batches);
-
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -350,7 +436,7 @@ mod test {
             .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000])
             .expect("created compact plan");
 
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&split_plan)
@@ -395,8 +481,6 @@ mod test {
         ];
 
         assert_batches_eq!(&expected, &batches1);
-
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -416,7 +500,7 @@ mod test {
             .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000, 7000])
             .expect("created compact plan");
 
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&split_plan)
@@ -472,8 +556,6 @@ mod test {
             "+-----------+------------+------+-----------------------------+",
         ];
         assert_batches_eq!(&expected, &batches2);
-
-        executor.join().await;
     }
 
     #[tokio::test]

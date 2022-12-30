@@ -2,11 +2,11 @@ use self::generated_types::{shard_service_client::ShardServiceClient, *};
 use crate::{AggregateTSMMeasurement, AggregateTSMSchema};
 use chrono::{format::StrftimeItems, offset::FixedOffset, DateTime, Duration};
 use data_types::{
-    org_and_bucket_to_database, ColumnType, Namespace, NamespaceSchema, OrgBucketMappingError,
+    org_and_bucket_to_namespace, ColumnType, Namespace, NamespaceSchema, OrgBucketMappingError,
     Partition, PartitionKey, QueryPoolId, ShardId, TableSchema, TopicId,
 };
 use influxdb_iox_client::connection::{Connection, GrpcConnection};
-use iox_catalog::interface::{get_schema_by_name, Catalog, ColumnUpsertRequest, RepoCollection};
+use iox_catalog::interface::{get_schema_by_name, CasFailure, Catalog, RepoCollection};
 use schema::{
     sort::{adjust_sort_key_columns, SortKey, SortKeyBuilder},
     InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME,
@@ -22,6 +22,9 @@ pub mod generated_types {
 pub enum UpdateCatalogError {
     #[error("Error returned from the Catalog: {0}")]
     CatalogError(#[from] iox_catalog::interface::Error),
+
+    #[error("Error returned from the Catalog: failed to cas sort key update")]
+    SortKeyCasError,
 
     #[error("Couldn't construct namespace from org and bucket: {0}")]
     InvalidOrgBucket(#[from] OrgBucketMappingError),
@@ -55,20 +58,19 @@ pub async fn update_iox_catalog<'a>(
     merged_tsm_schema: &'a AggregateTSMSchema,
     topic: &'a str,
     query_pool_name: Option<&'a str>,
-    retention: Option<&'a str>,
     catalog: Arc<dyn Catalog>,
     connection: Connection,
 ) -> Result<(), UpdateCatalogError> {
     let namespace_name =
-        org_and_bucket_to_database(&merged_tsm_schema.org_id, &merged_tsm_schema.bucket_id)
+        org_and_bucket_to_namespace(&merged_tsm_schema.org_id, &merged_tsm_schema.bucket_id)
             .map_err(UpdateCatalogError::InvalidOrgBucket)?;
     let mut repos = catalog.repositories().await;
     let iox_schema = match get_schema_by_name(namespace_name.as_str(), repos.deref_mut()).await {
         Ok(iox_schema) => iox_schema,
         Err(iox_catalog::interface::Error::NamespaceNotFoundByName { .. }) => {
             // Namespace has to be created; ensure the user provided the required parameters
-            let (query_pool_name, retention) = match (query_pool_name, retention) {
-                (Some(query_pool_name), Some(retention)) => (query_pool_name, retention),
+            let query_pool_name = match query_pool_name {
+                Some(query_pool_name) => query_pool_name,
                 _ => {
                     return Err(UpdateCatalogError::NamespaceCreationError("in order to create the namespace you must provide query_pool_name and retention args".to_string()));
                 }
@@ -78,7 +80,6 @@ pub async fn update_iox_catalog<'a>(
                 get_topic_id_and_query_id(repos.deref_mut(), topic, query_pool_name).await?;
             let _namespace = create_namespace(
                 namespace_name.as_str(),
-                retention,
                 topic_id,
                 query_id,
                 repos.deref_mut(),
@@ -138,7 +139,6 @@ where
 
 async fn create_namespace<R>(
     name: &str,
-    retention: &str,
     topic_id: TopicId,
     query_id: QueryPoolId,
     repos: &mut R,
@@ -148,7 +148,7 @@ where
 {
     match repos
         .namespaces()
-        .create(name, retention, topic_id, query_id)
+        .create(name, None, topic_id, query_id)
         .await
     {
         Ok(ns) => Ok(ns),
@@ -201,7 +201,7 @@ where
             }
         };
         // batch of columns to add into the schema at the end
-        let mut column_batch = Vec::default();
+        let mut column_batch = HashMap::new();
         // fields and tags are both columns; tag is a special type of column.
         // check that the schema has all these columns or update accordingly.
         for tag in measurement.tags.values() {
@@ -218,10 +218,12 @@ where
                 }
                 None => {
                     // column doesn't exist; add it
-                    column_batch.push(ColumnUpsertRequest {
-                        name: tag.name.as_str(),
-                        column_type: ColumnType::Tag,
-                    });
+                    let old = column_batch.insert(tag.name.as_str(), ColumnType::Tag);
+                    assert!(
+                        old.is_none(),
+                        "duplicate column name `{}` in new column batch shouldn't be possible",
+                        tag.name
+                    );
                 }
             }
         }
@@ -254,10 +256,13 @@ where
                 }
                 None => {
                     // column doesn't exist; add it
-                    column_batch.push(ColumnUpsertRequest {
-                        name: field.name.as_str(),
-                        column_type: ColumnType::from(influx_column_type),
-                    });
+                    let old = column_batch
+                        .insert(field.name.as_str(), ColumnType::from(influx_column_type));
+                    assert!(
+                        old.is_none(),
+                        "duplicate column name `{}` in new column batch shouldn't be possible",
+                        field.name
+                    );
                 }
             }
         }
@@ -270,7 +275,7 @@ where
             // figure it's okay.
             repos
                 .columns()
-                .create_or_get_many_unchecked(table.id, &column_batch)
+                .create_or_get_many_unchecked(table.id, column_batch)
                 .await?;
         }
         // create a partition for every day in the date range.
@@ -299,9 +304,12 @@ where
                 let sort_key = sort_key.to_columns().collect::<Vec<_>>();
                 repos
                     .partitions()
-                    .update_sort_key(partition.id, &sort_key)
+                    .cas_sort_key(partition.id, Some(partition.sort_key), &sort_key)
                     .await
-                    .map_err(UpdateCatalogError::CatalogError)?;
+                    .map_err(|e| match e {
+                        CasFailure::ValueMismatch(_) => UpdateCatalogError::SortKeyCasError,
+                        CasFailure::QueryError(e) => UpdateCatalogError::CatalogError(e),
+                    })?;
             }
         }
     }
@@ -527,7 +535,6 @@ mod tests {
             &agg_schema,
             "iox-shared",
             Some("iox-shared"),
-            Some("inf"),
             Arc::clone(&catalog),
             connection,
         )
@@ -593,7 +600,7 @@ mod tests {
         // create namespace, table and columns for weather measurement
         let namespace = txn
             .namespaces()
-            .create("1234_5678", "inf", TopicId::new(1), QueryPoolId::new(1))
+            .create("1234_5678", None, TopicId::new(1), QueryPoolId::new(1))
             .await
             .expect("namespace created");
         let mut table = txn
@@ -647,7 +654,6 @@ mod tests {
             &agg_schema,
             "iox-shared",
             Some("iox-shared"),
-            Some("inf"),
             Arc::clone(&catalog),
             connection,
         )
@@ -698,7 +704,7 @@ mod tests {
         // create namespace, table and columns for weather measurement
         let namespace = txn
             .namespaces()
-            .create("1234_5678", "inf", TopicId::new(1), QueryPoolId::new(1))
+            .create("1234_5678", None, TopicId::new(1), QueryPoolId::new(1))
             .await
             .expect("namespace created");
         let mut table = txn
@@ -745,7 +751,6 @@ mod tests {
             &agg_schema,
             "iox-shared",
             Some("iox-shared"),
-            Some("inf"),
             Arc::clone(&catalog),
             connection,
         )
@@ -779,7 +784,7 @@ mod tests {
         // create namespace, table and columns for weather measurement
         let namespace = txn
             .namespaces()
-            .create("1234_5678", "inf", TopicId::new(1), QueryPoolId::new(1))
+            .create("1234_5678", None, TopicId::new(1), QueryPoolId::new(1))
             .await
             .expect("namespace created");
         let mut table = txn
@@ -825,7 +830,6 @@ mod tests {
             &agg_schema,
             "iox-shared",
             Some("iox-shared"),
-            Some("inf"),
             Arc::clone(&catalog),
             connection,
         )
@@ -877,57 +881,6 @@ mod tests {
         let err = update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            None,
-            Some("inf"),
-            Arc::clone(&catalog),
-            connection,
-        )
-        .await
-        .expect_err("should fail namespace creation");
-        assert_matches!(err, UpdateCatalogError::NamespaceCreationError(_));
-    }
-
-    #[tokio::test]
-    async fn needs_creating_but_missing_retention() {
-        // init a test catalog stack
-        let metrics = Arc::new(metric::Registry::default());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        catalog
-            .repositories()
-            .await
-            .topics()
-            .create_or_get("iox-shared")
-            .await
-            .expect("topic created");
-        let (connection, _join_handle, _requests) = create_test_shard_service(MapToShardResponse {
-            shard_id: 0,
-            shard_index: 0,
-        })
-        .await;
-
-        let json = r#"
-        {
-          "org_id": "1234",
-          "bucket_id": "5678",
-          "measurements": {
-            "cpu": {
-              "tags": [
-                { "name": "host", "values": ["server", "desktop"] }
-              ],
-             "fields": [
-                { "name": "usage", "types": ["Float"] }
-              ],
-              "earliest_time": "2022-01-01T00:00:00.00Z",
-              "latest_time": "2022-07-07T06:00:00.00Z"
-            }
-          }
-        }
-        "#;
-        let agg_schema: AggregateTSMSchema = json.try_into().unwrap();
-        let err = update_iox_catalog(
-            &agg_schema,
-            "iox-shared",
-            Some("iox-shared"),
             None,
             Arc::clone(&catalog),
             connection,
@@ -987,7 +940,6 @@ mod tests {
             &agg_schema,
             "iox-shared",
             Some("iox-shared"),
-            Some("inf"),
             Arc::clone(&catalog),
             connection,
         )

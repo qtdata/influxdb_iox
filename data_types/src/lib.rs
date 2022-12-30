@@ -438,10 +438,7 @@ pub struct Namespace {
     pub id: NamespaceId,
     /// The unique name of the namespace
     pub name: String,
-    /// The retention duration as a string. 'inf' or not present represents infinite duration (i.e.
-    /// never drop data).
     #[sqlx(default)]
-    pub retention_duration: Option<String>,
     /// The retention period in ns. None represents infinite duration (i.e. never drop data).
     pub retention_period_ns: Option<i64>,
     /// The topic that writes to this namespace will land in
@@ -468,6 +465,9 @@ pub struct NamespaceSchema {
     pub tables: BTreeMap<String, TableSchema>,
     /// the number of columns per table this namespace allows
     pub max_columns_per_table: usize,
+    /// The retention period in ns.
+    /// None represents infinite duration (i.e. never drop data).
+    pub retention_period_ns: Option<i64>,
 }
 
 impl NamespaceSchema {
@@ -477,6 +477,7 @@ impl NamespaceSchema {
         topic_id: TopicId,
         query_pool_id: QueryPoolId,
         max_columns_per_table: i32,
+        retention_period_ns: Option<i64>,
     ) -> Self {
         Self {
             id,
@@ -484,6 +485,7 @@ impl NamespaceSchema {
             topic_id,
             query_pool_id,
             max_columns_per_table: max_columns_per_table as usize,
+            retention_period_ns,
         }
     }
 
@@ -945,6 +947,8 @@ pub struct SkippedCompaction {
     pub num_files: i64,
     /// limit on num files
     pub limit_num_files: i64,
+    /// limit on num files for the first file in a partition
+    pub limit_num_files_first_in_partition: i64,
 }
 
 /// Data object for a tombstone.
@@ -1313,6 +1317,20 @@ impl DeletePredicate {
     pub fn size(&self) -> usize {
         std::mem::size_of::<Self>() + self.exprs.iter().map(|expr| expr.size()).sum::<usize>()
     }
+
+    /// Return the delete predicate for data outside retention
+    /// We need to only retain time >= retention_time.
+    /// Thus we only need to set the range to MIN < time < retention_time
+    pub fn retention_delete_predicate(retention_time: i64) -> Self {
+        let range = TimestampRange {
+            start: i64::MIN,
+            end: retention_time,
+        };
+        Self {
+            range,
+            exprs: vec![],
+        }
+    }
 }
 
 /// Single expression to be used as parts of a predicate.
@@ -1438,22 +1456,22 @@ impl std::fmt::Display for Scalar {
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
 pub enum OrgBucketMappingError {
-    #[snafu(display("Invalid database name: {}", source))]
-    InvalidDatabaseName { source: DatabaseNameError },
+    #[snafu(display("Invalid namespace name: {}", source))]
+    InvalidNamespaceName { source: NamespaceNameError },
 
     #[snafu(display("missing org/bucket value"))]
     NotSpecified,
 }
 
-/// Map an InfluxDB 2.X org & bucket into an IOx DatabaseName.
+/// Map an InfluxDB 2.X org & bucket into an IOx NamespaceName.
 ///
 /// This function ensures the mapping is unambiguous by requiring both `org` and
 /// `bucket` to not contain the `_` character in addition to the
-/// [`DatabaseName`] validation.
-pub fn org_and_bucket_to_database<'a, O: AsRef<str>, B: AsRef<str>>(
+/// [`NamespaceName`] validation.
+pub fn org_and_bucket_to_namespace<'a, O: AsRef<str>, B: AsRef<str>>(
     org: O,
     bucket: B,
-) -> Result<DatabaseName<'a>, OrgBucketMappingError> {
+) -> Result<NamespaceName<'a>, OrgBucketMappingError> {
     const SEPARATOR: char = '_';
 
     let org: Cow<'_, str> = utf8_percent_encode(org.as_ref(), NON_ALPHANUMERIC).into();
@@ -1466,7 +1484,7 @@ pub fn org_and_bucket_to_database<'a, O: AsRef<str>, B: AsRef<str>>(
 
     let db_name = format!("{}{}{}", org.as_ref(), SEPARATOR, bucket.as_ref());
 
-    DatabaseName::new(db_name).context(InvalidDatabaseNameSnafu)
+    NamespaceName::new(db_name).context(InvalidNamespaceNameSnafu)
 }
 
 /// A string that cannot be empty
@@ -1497,17 +1515,17 @@ impl Deref for NonEmptyString {
     }
 }
 
-/// Length constraints for a database name.
+/// Length constraints for a [`NamespaceName`] name.
 ///
 /// A `RangeInclusive` is a closed interval, covering [1, 64]
 const LENGTH_CONSTRAINT: RangeInclusive<usize> = 1..=64;
 
-/// Database name validation errors.
+/// [`NamespaceName`] name validation errors.
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
-pub enum DatabaseNameError {
+pub enum NamespaceNameError {
     #[snafu(display(
-        "Database name {} length must be between {} and {} characters",
+        "Namespace name {} length must be between {} and {} characters",
         name,
         LENGTH_CONSTRAINT.start(),
         LENGTH_CONSTRAINT.end()
@@ -1515,7 +1533,7 @@ pub enum DatabaseNameError {
     LengthConstraint { name: String },
 
     #[snafu(display(
-        "Database name '{}' contains invalid character. \
+        "Namespace name '{}' contains invalid character. \
         Character number {} is a control which is not allowed.",
         name,
         bad_char_offset
@@ -1526,7 +1544,7 @@ pub enum DatabaseNameError {
     },
 }
 
-/// A correctly formed database name.
+/// A correctly formed Namespace name.
 ///
 /// Using this wrapper type allows the consuming code to enforce the invariant
 /// that only valid names are provided.
@@ -1535,27 +1553,27 @@ pub enum DatabaseNameError {
 /// that is expecting a `str`:
 ///
 /// ```rust
-/// # use data_types::DatabaseName;
-/// fn print_database(s: &str) {
-///     println!("database name: {}", s);
+/// # use data_types::NamespaceName;
+/// fn print_namespace(s: &str) {
+///     println!("namespace name: {}", s);
 /// }
 ///
-/// let db = DatabaseName::new("data").unwrap();
-/// print_database(&db);
+/// let ns = NamespaceName::new("data").unwrap();
+/// print_namespace(&ns);
 /// ```
 ///
 /// But this is not reciprocal - functions that wish to accept only
-/// pre-validated names can use `DatabaseName` as a parameter.
+/// pre-validated names can use `NamespaceName` as a parameter.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct DatabaseName<'a>(Cow<'a, str>);
+pub struct NamespaceName<'a>(Cow<'a, str>);
 
-impl<'a> DatabaseName<'a> {
-    /// Create a new, valid DatabaseName.
-    pub fn new<T: Into<Cow<'a, str>>>(name: T) -> Result<Self, DatabaseNameError> {
+impl<'a> NamespaceName<'a> {
+    /// Create a new, valid NamespaceName.
+    pub fn new<T: Into<Cow<'a, str>>>(name: T) -> Result<Self, NamespaceNameError> {
         let name: Cow<'a, str> = name.into();
 
         if !LENGTH_CONSTRAINT.contains(&name.len()) {
-            return Err(DatabaseNameError::LengthConstraint {
+            return Err(NamespaceNameError::LengthConstraint {
                 name: name.to_string(),
             });
         }
@@ -1581,35 +1599,35 @@ impl<'a> DatabaseName<'a> {
     }
 }
 
-impl<'a> std::convert::From<DatabaseName<'a>> for String {
-    fn from(name: DatabaseName<'a>) -> Self {
+impl<'a> std::convert::From<NamespaceName<'a>> for String {
+    fn from(name: NamespaceName<'a>) -> Self {
         name.0.to_string()
     }
 }
 
-impl<'a> std::convert::From<&DatabaseName<'a>> for String {
-    fn from(name: &DatabaseName<'a>) -> Self {
+impl<'a> std::convert::From<&NamespaceName<'a>> for String {
+    fn from(name: &NamespaceName<'a>) -> Self {
         name.to_string()
     }
 }
 
-impl<'a> std::convert::TryFrom<&'a str> for DatabaseName<'a> {
-    type Error = DatabaseNameError;
+impl<'a> std::convert::TryFrom<&'a str> for NamespaceName<'a> {
+    type Error = NamespaceNameError;
 
     fn try_from(v: &'a str) -> Result<Self, Self::Error> {
         Self::new(v)
     }
 }
 
-impl<'a> std::convert::TryFrom<String> for DatabaseName<'a> {
-    type Error = DatabaseNameError;
+impl<'a> std::convert::TryFrom<String> for NamespaceName<'a> {
+    type Error = NamespaceNameError;
 
     fn try_from(v: String) -> Result<Self, Self::Error> {
         Self::new(v)
     }
 }
 
-impl<'a> std::ops::Deref for DatabaseName<'a> {
+impl<'a> std::ops::Deref for NamespaceName<'a> {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
@@ -1617,7 +1635,7 @@ impl<'a> std::ops::Deref for DatabaseName<'a> {
     }
 }
 
-impl<'a> std::fmt::Display for DatabaseName<'a> {
+impl<'a> std::fmt::Display for NamespaceName<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -1698,19 +1716,6 @@ pub enum InfluxDbType {
     Tag,
     Field,
     Timestamp,
-}
-
-/// Address of the chunk within the catalog
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct PartitionAddr {
-    /// Database name
-    pub db_name: Arc<str>,
-
-    /// What table does the chunk belong to?
-    pub table_name: Arc<str>,
-
-    /// What partition does the chunk belong to?
-    pub partition_key: Arc<str>,
 }
 
 /// Summary statistics for a column.
@@ -1805,7 +1810,7 @@ impl<T> StatValues<T> {
 
     /// updates the statistics keeping the min, max and incrementing count.
     ///
-    /// The type plumbing exists to allow calling with &str on a StatValues<String>
+    /// The type plumbing exists to allow calling with `&str` on a `StatValues<String>`.
     pub fn update<U: ?Sized>(&mut self, other: &U)
     where
         T: Borrow<U>,
@@ -2238,7 +2243,7 @@ impl TimestampRange {
     ///
     /// If `start > end`, this will be interpreted as an empty time range and `start` will be set to `end`.
     pub fn new(start: i64, end: i64) -> Self {
-        let start = start.max(MIN_NANO_TIME).min(end);
+        let start = start.clamp(MIN_NANO_TIME, end);
         let end = end.max(MIN_NANO_TIME);
         Self { start, end }
     }
@@ -2544,106 +2549,106 @@ mod tests {
 
     #[test]
     fn test_org_bucket_map_db_ok() {
-        let got = org_and_bucket_to_database("org", "bucket").expect("failed on valid DB mapping");
+        let got = org_and_bucket_to_namespace("org", "bucket").expect("failed on valid DB mapping");
 
         assert_eq!(got.as_str(), "org_bucket");
     }
 
     #[test]
     fn test_org_bucket_map_db_contains_underscore() {
-        let got = org_and_bucket_to_database("my_org", "bucket").unwrap();
+        let got = org_and_bucket_to_namespace("my_org", "bucket").unwrap();
         assert_eq!(got.as_str(), "my%5Forg_bucket");
 
-        let got = org_and_bucket_to_database("org", "my_bucket").unwrap();
+        let got = org_and_bucket_to_namespace("org", "my_bucket").unwrap();
         assert_eq!(got.as_str(), "org_my%5Fbucket");
 
-        let got = org_and_bucket_to_database("org", "my__bucket").unwrap();
+        let got = org_and_bucket_to_namespace("org", "my__bucket").unwrap();
         assert_eq!(got.as_str(), "org_my%5F%5Fbucket");
 
-        let got = org_and_bucket_to_database("my_org", "my_bucket").unwrap();
+        let got = org_and_bucket_to_namespace("my_org", "my_bucket").unwrap();
         assert_eq!(got.as_str(), "my%5Forg_my%5Fbucket");
     }
 
     #[test]
     fn test_org_bucket_map_db_contains_underscore_and_percent() {
-        let got = org_and_bucket_to_database("my%5Forg", "bucket").unwrap();
+        let got = org_and_bucket_to_namespace("my%5Forg", "bucket").unwrap();
         assert_eq!(got.as_str(), "my%255Forg_bucket");
 
-        let got = org_and_bucket_to_database("my%5Forg_", "bucket").unwrap();
+        let got = org_and_bucket_to_namespace("my%5Forg_", "bucket").unwrap();
         assert_eq!(got.as_str(), "my%255Forg%5F_bucket");
     }
 
     #[test]
-    fn test_bad_database_name_is_encoded() {
-        let got = org_and_bucket_to_database("org", "bucket?").unwrap();
+    fn test_bad_namespace_name_is_encoded() {
+        let got = org_and_bucket_to_namespace("org", "bucket?").unwrap();
         assert_eq!(got.as_str(), "org_bucket%3F");
 
-        let got = org_and_bucket_to_database("org!", "bucket").unwrap();
+        let got = org_and_bucket_to_namespace("org!", "bucket").unwrap();
         assert_eq!(got.as_str(), "org%21_bucket");
     }
 
     #[test]
     fn test_empty_org_bucket() {
-        let err = org_and_bucket_to_database("", "")
+        let err = org_and_bucket_to_namespace("", "")
             .expect_err("should fail with empty org/bucket valuese");
         assert!(matches!(err, OrgBucketMappingError::NotSpecified));
     }
 
     #[test]
     fn test_deref() {
-        let db = DatabaseName::new("my_example_name").unwrap();
+        let db = NamespaceName::new("my_example_name").unwrap();
         assert_eq!(&*db, "my_example_name");
     }
 
     #[test]
     fn test_too_short() {
         let name = "".to_string();
-        let got = DatabaseName::try_from(name).unwrap_err();
+        let got = NamespaceName::try_from(name).unwrap_err();
 
         assert!(matches!(
             got,
-            DatabaseNameError::LengthConstraint { name: _n }
+            NamespaceNameError::LengthConstraint { name: _n }
         ));
     }
 
     #[test]
     fn test_too_long() {
         let name = "my_example_name_that_is_quite_a_bit_longer_than_allowed_even_though_database_names_can_be_quite_long_bananas".to_string();
-        let got = DatabaseName::try_from(name).unwrap_err();
+        let got = NamespaceName::try_from(name).unwrap_err();
 
         assert!(matches!(
             got,
-            DatabaseNameError::LengthConstraint { name: _n }
+            NamespaceNameError::LengthConstraint { name: _n }
         ));
     }
 
     #[test]
     fn test_bad_chars_null() {
-        let got = DatabaseName::new("example\x00").unwrap_err();
-        assert_contains!(got.to_string() , "Database name 'example\x00' contains invalid character. Character number 7 is a control which is not allowed.");
+        let got = NamespaceName::new("example\x00").unwrap_err();
+        assert_contains!(got.to_string() , "Namespace name 'example\x00' contains invalid character. Character number 7 is a control which is not allowed.");
     }
 
     #[test]
     fn test_bad_chars_high_control() {
-        let got = DatabaseName::new("\u{007f}example").unwrap_err();
-        assert_contains!(got.to_string() , "Database name '\u{007f}example' contains invalid character. Character number 0 is a control which is not allowed.");
+        let got = NamespaceName::new("\u{007f}example").unwrap_err();
+        assert_contains!(got.to_string() , "Namespace name '\u{007f}example' contains invalid character. Character number 0 is a control which is not allowed.");
     }
 
     #[test]
     fn test_bad_chars_tab() {
-        let got = DatabaseName::new("example\tdb").unwrap_err();
-        assert_contains!(got.to_string() , "Database name 'example\tdb' contains invalid character. Character number 7 is a control which is not allowed.");
+        let got = NamespaceName::new("example\tdb").unwrap_err();
+        assert_contains!(got.to_string() , "Namespace name 'example\tdb' contains invalid character. Character number 7 is a control which is not allowed.");
     }
 
     #[test]
     fn test_bad_chars_newline() {
-        let got = DatabaseName::new("my_example\ndb").unwrap_err();
-        assert_contains!(got.to_string() , "Database name 'my_example\ndb' contains invalid character. Character number 10 is a control which is not allowed.");
+        let got = NamespaceName::new("my_example\ndb").unwrap_err();
+        assert_contains!(got.to_string() , "Namespace name 'my_example\ndb' contains invalid character. Character number 10 is a control which is not allowed.");
     }
 
     #[test]
     fn test_ok_chars() {
-        let db = DatabaseName::new("my-example-db_with_underscores and spaces").unwrap();
+        let db = NamespaceName::new("my-example-db_with_underscores and spaces").unwrap();
         assert_eq!(&*db, "my-example-db_with_underscores and spaces");
     }
 
@@ -3384,6 +3389,7 @@ mod tests {
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([]),
             max_columns_per_table: 4,
+            retention_period_ns: None,
         };
         let schema2 = NamespaceSchema {
             id: NamespaceId::new(1),
@@ -3391,6 +3397,7 @@ mod tests {
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
             max_columns_per_table: 4,
+            retention_period_ns: None,
         };
         assert!(schema1.size() < schema2.size());
     }

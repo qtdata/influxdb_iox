@@ -1,5 +1,8 @@
+use crate::cache::namespace::CachedTable;
+
 use super::IngesterConnection;
 use async_trait::async_trait;
+use data_types::NamespaceId;
 use data_types::ShardIndex;
 use generated_types::influxdata::iox::ingester::v1::GetWriteInfoResponse;
 use iox_query::util::create_basic_summary;
@@ -32,12 +35,11 @@ impl MockIngesterConnection {
 impl IngesterConnection for MockIngesterConnection {
     async fn partitions(
         &self,
-        _shard_indexes: &[ShardIndex],
-        _namespace_name: Arc<str>,
-        _table_name: Arc<str>,
+        _shard_indexes: Option<Vec<ShardIndex>>,
+        _namespace_id: NamespaceId,
+        _cached_table: Arc<CachedTable>,
         columns: Vec<String>,
         _predicate: &predicate::Predicate,
-        _expected_schema: Arc<schema::Schema>,
         _span: Option<Span>,
     ) -> super::Result<Vec<super::IngesterPartition>> {
         // see if we want to do projection pushdown

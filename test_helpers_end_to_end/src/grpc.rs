@@ -34,8 +34,12 @@ impl GrpcRequestBuilder {
     /// Creates the appropriate `Any` protobuf magic for a read source with the cluster's org and
     /// bucket name
     pub fn source(self, cluster: &MiniCluster) -> Self {
-        let org_id = cluster.org_id();
-        let bucket_id = cluster.bucket_id();
+        self.explicit_source(cluster.org_id(), cluster.bucket_id())
+    }
+
+    /// Creates the appropriate `Any` protobuf magic for a read source with the cluster's org and
+    /// bucket name
+    pub fn explicit_source(self, org_id: &str, bucket_id: &str) -> Self {
         let org_id = u64::from_str_radix(org_id, 16).unwrap();
         let bucket_id = u64::from_str_radix(bucket_id, 16).unwrap();
 
@@ -114,6 +118,29 @@ impl GrpcRequestBuilder {
         self.predicate(predicate)
     }
 
+    /// Create a predicate representing _m=measurement_name in the horrible gRPC structs
+    pub fn measurement_predicate(self, measurement_name: impl Into<String>) -> Self {
+        let predicate = Predicate {
+            root: Some(Node {
+                node_type: NodeType::ComparisonExpression as i32,
+                children: vec![
+                    Node {
+                        node_type: NodeType::TagRef as i32,
+                        children: vec![],
+                        value: Some(Value::TagRefValue([00].to_vec())),
+                    },
+                    Node {
+                        node_type: NodeType::Literal as i32,
+                        children: vec![],
+                        value: Some(Value::StringValue(measurement_name.into())),
+                    },
+                ],
+                value: Some(Value::Comparison(Comparison::Equal as _)),
+            }),
+        };
+        self.predicate(predicate)
+    }
+
     /// Set predicate to tag_name ~= /pattern/
     pub fn regex_match_predicate(
         self,
@@ -132,18 +159,20 @@ impl GrpcRequestBuilder {
         self.regex_predicate(tag_key_name, pattern, Comparison::NotRegex)
     }
 
-    /// Set predicate to tag_name <op> /pattern/
+    /// Set predicate to `tag_name <op> /pattern/`
     ///
     /// where op is `Regex` or `NotRegEx`
     /// The constitution of this request was formed by looking at a real request
     /// made to storage, which looked like this:
     ///
+    /// ```text
     /// root:<
     ///         node_type:COMPARISON_EXPRESSION
     ///         children:<node_type:TAG_REF tag_ref_value:"tag_key_name" >
     ///         children:<node_type:LITERAL regex_value:"pattern" >
     ///         comparison:REGEX
     /// >
+    /// ```
     pub fn regex_predicate(
         self,
         tag_key_name: impl Into<String>,

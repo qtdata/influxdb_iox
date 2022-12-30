@@ -7,20 +7,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-# Locking ahash to 0.8.0 because of a cargo hakari problem, see:
-# <https://github.com/influxdata/influxdb_iox/pull/6032#issuecomment-1303987709>
-ahash = { version = "=0.8.0", default-features = false, features = ["runtime-rng"] }
+ahash = { version = "0.8", default-features = false, features = ["runtime-rng"] }
 # need dyn_cmp_dict feature for comparing dictionary arrays
 arrow = { workspace = true, features = ["prettyprint", "dyn_cmp_dict"] }
 # used by arrow anyway (needed for printing workaround)
 chrono = { version = "0.4", default-features = false }
 comfy-table = { version = "6.1", default-features = false }
-datafusion = { workspace = true }
-hashbrown = "0.12"
+hashbrown = { workspace = true }
 num-traits = "0.2"
 snafu = "0.7"
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]
 arrow-flight = { workspace = true }
+datafusion = { workspace = true }
 rand = "0.8.3"

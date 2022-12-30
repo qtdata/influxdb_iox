@@ -1,6 +1,6 @@
 use super::{PruneMetrics, QuerierTable, QuerierTableArgs};
 use crate::{
-    cache::CatalogCache, chunk::ChunkAdapter, create_ingester_connection_for_testing,
+    cache::CatalogCache, create_ingester_connection_for_testing, parquet::ChunkAdapter,
     IngesterPartition,
 };
 use arrow::record_batch::RecordBatch;
@@ -10,7 +10,7 @@ use iox_tests::util::{TestCatalog, TestPartition, TestShard, TestTable};
 use mutable_batch_lp::test_helpers::lp_to_mutable_batch;
 use schema::{sort::SortKey, Projection, Schema};
 use sharder::JumpHash;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::runtime::Handle;
 
 /// Create a [`QuerierTable`] for testing.
@@ -33,16 +33,24 @@ pub async fn querier_table(catalog: &Arc<TestCatalog>, table: &Arc<TestTable>) -
 
     let namespace_name = Arc::from(table.namespace.namespace.name.as_str());
 
+    let namespace_retention_period = table
+        .namespace
+        .namespace
+        .retention_period_ns
+        .map(|retention| Duration::from_nanos(retention as u64));
     QuerierTable::new(QuerierTableArgs {
-        sharder: Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new))),
+        sharder: Some(Arc::new(JumpHash::new(
+            (0..1).map(ShardIndex::new).map(Arc::new),
+        ))),
+        namespace_id: table.namespace.namespace.id,
         namespace_name,
-        id: table.table.id,
+        namespace_retention_period,
+        table_id: table.table.id,
         table_name: table.table.name.clone().into(),
         schema,
         ingester_connection: Some(create_ingester_connection_for_testing()),
         chunk_adapter,
         exec: catalog.exec(),
-        max_query_bytes: usize::MAX,
         prune_metrics: Arc::new(PruneMetrics::new(&catalog.metric_registry())),
     })
 }
@@ -61,7 +69,7 @@ pub(crate) struct IngesterPartitionBuilder {
     ingester_name: Arc<str>,
     ingester_chunk_id: u128,
 
-    partition_sort_key: Arc<Option<SortKey>>,
+    partition_sort_key: Option<Arc<SortKey>>,
 
     /// Data returned from the partition, in line protocol format
     lp: Vec<String>,
@@ -78,7 +86,7 @@ impl IngesterPartitionBuilder {
             shard: Arc::clone(shard),
             partition: Arc::clone(partition),
             ingester_name: Arc::from("ingester1"),
-            partition_sort_key: Arc::new(None),
+            partition_sort_key: None,
             ingester_chunk_id: 1,
             lp: Vec::new(),
         }
@@ -117,11 +125,13 @@ impl IngesterPartitionBuilder {
 
         IngesterPartition::new(
             Arc::clone(&self.ingester_name),
+            None,
             self.partition.partition.id,
             self.shard.shard.id,
+            0,
             parquet_max_sequence_number,
             tombstone_max_sequence_number,
-            Arc::clone(&self.partition_sort_key),
+            self.partition_sort_key.clone(),
         )
         .try_add_chunk(
             ChunkId::new_test(self.ingester_chunk_id),

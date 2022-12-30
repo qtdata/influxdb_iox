@@ -22,12 +22,15 @@ pub async fn run_series_set_plan_maybe_error(
     ctx: &IOxSessionContext,
     plans: SeriesSetPlans,
 ) -> Result<Vec<String>, DataFusionError> {
-    Ok(ctx
-        .to_series_and_groups(plans)
+    use std::sync::Arc;
+
+    use futures::TryStreamExt;
+
+    ctx.to_series_and_groups(plans, Arc::clone(&ctx.inner().runtime_env().memory_pool))
         .await?
-        .into_iter()
-        .map(|series_or_group| series_or_group.to_string())
-        .collect())
+        .map_ok(|series_or_group| series_or_group.to_string())
+        .try_collect()
+        .await
 }
 
 /// https://github.com/influxdata/influxdb_iox/issues/3635

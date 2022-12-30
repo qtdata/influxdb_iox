@@ -1,6 +1,6 @@
 use crate::{
-    get_write_token, run_query, token_is_persisted, try_run_query, wait_for_persisted,
-    wait_for_readable, MiniCluster,
+    check_flight_error, get_write_token, run_sql, token_is_persisted, try_run_influxql,
+    try_run_sql, wait_for_persisted, wait_for_readable, MiniCluster,
 };
 use arrow::record_batch::RecordBatch;
 use arrow_util::assert_batches_sorted_eq;
@@ -80,6 +80,9 @@ pub enum Step {
     /// Assert that all previously written data is NOT persisted yet
     AssertNotPersisted,
 
+    /// Assert that last previously written data is NOT persisted yet.
+    AssertLastNotPersisted,
+
     /// Wait for all previously written data to be persisted
     WaitForPersisted,
 
@@ -90,7 +93,7 @@ pub enum Step {
     /// Run one hot and one cold compaction operation and wait for it to finish.
     Compact,
 
-    /// Run a query using the FlightSQL interface and verify that the
+    /// Run a SQL query using the FlightSQL interface and verify that the
     /// results match the expected results using the
     /// `assert_batches_eq!` macro
     Query {
@@ -98,7 +101,7 @@ pub enum Step {
         expected: Vec<&'static str>,
     },
 
-    /// Run a query that's expected to fail using the FlightSQL interface and verify that the
+    /// Run a SQL query that's expected to fail using the FlightSQL interface and verify that the
     /// request returns the expected error code and message
     QueryExpectingError {
         sql: String,
@@ -106,7 +109,7 @@ pub enum Step {
         expected_message: String,
     },
 
-    /// Run a query using the FlightSQL interface, and then verifies
+    /// Run a SQL query using the FlightSQL interface, and then verifies
     /// the results using the provided validation function on the
     /// results.
     ///
@@ -115,6 +118,14 @@ pub enum Step {
     VerifiedQuery {
         sql: String,
         verify: Box<dyn Fn(Vec<RecordBatch>)>,
+    },
+
+    /// Run an InfluxQL query that's expected to fail using the FlightSQL interface and verify that the
+    /// request returns the expected error code and message
+    InfluxQLExpectingError {
+        sql: String,
+        expected_error_code: tonic::Code,
+        expected_message: String,
     },
 
     /// Retrieve the metrics and verify the results using the provided
@@ -199,15 +210,25 @@ impl<'a> StepTest<'a> {
                     }
                     info!("====Done checking all tokens not persisted");
                 }
+                Step::AssertLastNotPersisted => {
+                    info!("====Begin checking last tokens not persisted");
+                    let querier_grpc_connection =
+                        state.cluster().querier().querier_grpc_connection();
+                    let write_token = state.write_tokens.last().expect("No data written yet");
+                    let persisted =
+                        token_is_persisted(write_token, querier_grpc_connection.clone()).await;
+                    assert!(!persisted);
+                    info!("====Done checking last tokens not persisted");
+                }
                 Step::Compact => {
                     info!("====Begin running compaction");
                     state.cluster.run_compaction();
                     info!("====Done running compaction");
                 }
                 Step::Query { sql, expected } => {
-                    info!("====Begin running query: {}", sql);
+                    info!("====Begin running SQL query: {}", sql);
                     // run query
-                    let batches = run_query(
+                    let batches = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
@@ -221,9 +242,9 @@ impl<'a> StepTest<'a> {
                     expected_error_code,
                     expected_message,
                 } => {
-                    info!("====Begin running query expected to error: {}", sql);
+                    info!("====Begin running SQL query expected to error: {}", sql);
 
-                    let err = try_run_query(
+                    let err = try_run_sql(
                         sql,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
@@ -231,31 +252,42 @@ impl<'a> StepTest<'a> {
                     .await
                     .unwrap_err();
 
-                    if let influxdb_iox_client::flight::Error::GrpcError(status) = err {
-                        assert_eq!(
-                            status.code(),
-                            expected_error_code,
-                            "Wrong status code: {}\n\nStatus:\n{}",
-                            status.code(),
-                            status,
-                        );
-                        assert_eq!(status.message(), expected_message);
-                    } else {
-                        panic!("Not a gRPC error: {err}");
-                    }
+                    check_flight_error(err, expected_error_code, Some(&expected_message));
 
                     info!("====Done running");
                 }
                 Step::VerifiedQuery { sql, verify } => {
-                    info!("====Begin running verified query: {}", sql);
+                    info!("====Begin running SQL verified query: {}", sql);
                     // run query
-                    let batches = run_query(
+                    let batches = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
                     )
                     .await;
                     verify(batches);
+                    info!("====Done running");
+                }
+                Step::InfluxQLExpectingError {
+                    sql,
+                    expected_error_code,
+                    expected_message,
+                } => {
+                    info!(
+                        "====Begin running InfluxQL query expected to error: {}",
+                        sql
+                    );
+
+                    let err = try_run_influxql(
+                        sql,
+                        state.cluster().namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                    )
+                    .await
+                    .unwrap_err();
+
+                    check_flight_error(err, expected_error_code, Some(&expected_message));
+
                     info!("====Done running");
                 }
                 Step::VerifiedMetrics(verify) => {

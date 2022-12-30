@@ -56,34 +56,67 @@ pub enum Error {
     NamespaceNotFound { namespace_id: NamespaceId },
 
     #[snafu(display(
-        "Error getting the most recent highest ingested throughput partitions for shard {}. {}",
+        "Error getting the most recent highest ingested throughput partitions for shard {:?}. {}",
         shard_id,
         source
     ))]
     HighestThroughputPartitions {
         source: iox_catalog::interface::Error,
-        shard_id: ShardId,
+        shard_id: Option<ShardId>,
     },
 
     #[snafu(display(
-        "Error getting the most level 0 + level 1 file cold partitions for shard {}. {}",
+        "Error getting partitions with small L1 files for warm compaction for shard {:?}. {}",
+        shard_id,
+        source
+    ))]
+    PartitionsWithSmallL1Files {
+        source: iox_catalog::interface::Error,
+        shard_id: Option<ShardId>,
+    },
+
+    #[snafu(display(
+        "Error getting the most level 0 + level 1 file cold partitions for shard {:?}. {}",
         shard_id,
         source
     ))]
     MostColdPartitions {
         source: iox_catalog::interface::Error,
-        shard_id: ShardId,
+        shard_id: Option<ShardId>,
     },
 }
 
 /// A specialized `Error` for Compactor Data errors
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A temporary type for the transition between the write buffer architecture and the RPC write
+/// path. In the RPC write path, shards are irrelevant, so the compactor should look for data to
+/// compact across all shards.
+#[derive(Debug)]
+pub enum ShardAssignment {
+    /// Compact everything regardless of shard (for the RPC path that doesn't use shards)
+    All,
+    /// Compact only partitions on these specified shards
+    Only(Vec<ShardId>),
+}
+
+impl ShardAssignment {
+    /// Useful for multiplying to get a total capacity needed for, say, number of partitions per
+    /// shard needed.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            // When querying all shards, there is no "per shard" amount, only the total.
+            Self::All => 1,
+            Self::Only(v) => v.len(),
+        }
+    }
+}
+
 /// Data points needed to run a compactor
 #[derive(Debug)]
 pub struct Compactor {
     /// Shards assigned to this compactor
-    pub(crate) shards: Vec<ShardId>,
+    pub(crate) shards: ShardAssignment,
 
     /// Object store for reading and persistence of parquet files
     pub(crate) store: ParquetStorage,
@@ -149,7 +182,7 @@ impl Compactor {
     /// Initialize the Compactor Data
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        shards: Vec<ShardId>,
+        shards: ShardAssignment,
         catalog: Arc<dyn Catalog>,
         store: ParquetStorage,
         exec: Arc<Executor>,
@@ -258,7 +291,8 @@ impl Compactor {
     /// Return a list of partitions that:
     ///
     /// - Have not received any writes in 8 hours (determined by all level 0 and level 1 parquet
-    ///   files having a created_at time older than 8 hours ago)
+    ///   files having a created_at time older than 8 hours ago). Note that 8 is the default but
+    ///   it's configurable
     /// - Have some level 0 or level 1 parquet files that need to be upgraded or compacted
     /// - Sorted by the number of level 0 files + number of level 1 files descending
     pub async fn cold_partitions_to_compact(
@@ -269,40 +303,66 @@ impl Compactor {
         let compaction_type = "cold";
         let mut candidates = Vec::with_capacity(self.shards.len() * max_num_partitions_per_shard);
 
-        for shard_id in &self.shards {
-            let attributes = Attributes::from([
-                ("shard_id", format!("{}", *shard_id).into()),
-                ("partition_type", compaction_type.into()),
-            ]);
+        let minutes = self.config.minutes_without_new_writes_to_be_cold;
+        let time_in_the_past = Timestamp::from(self.time_provider.minutes_ago(minutes));
 
-            let minutes = self.config.minutes_without_new_writes_to_be_cold;
-            let time_in_the_past = Timestamp::from(self.time_provider.minutes_ago(minutes));
+        match &self.shards {
+            ShardAssignment::All => {
+                let attributes = Attributes::from([("partition_type", compaction_type.into())]);
 
-            let mut repos = self.catalog.repositories().await;
-            let mut partitions = repos
-                .parquet_files()
-                .most_cold_files_partitions(
-                    *shard_id,
-                    time_in_the_past,
-                    max_num_partitions_per_shard,
-                )
-                .await
-                .context(MostColdPartitionsSnafu {
-                    shard_id: *shard_id,
-                })?;
+                let mut repos = self.catalog.repositories().await;
+                let mut partitions = repos
+                    .parquet_files()
+                    .most_cold_files_partitions(
+                        None,
+                        time_in_the_past,
+                        max_num_partitions_per_shard,
+                    )
+                    .await
+                    .context(MostColdPartitionsSnafu { shard_id: None })?;
 
-            let num_partitions = partitions.len();
-            candidates.append(&mut partitions);
+                let num_partitions = partitions.len();
+                candidates.append(&mut partitions);
 
-            // Record metric for candidates per shard
-            debug!(
-                shard_id = shard_id.get(),
-                n = num_partitions,
-                compaction_type,
-                "compaction candidates",
-            );
-            let number_gauge = self.compaction_candidate_gauge.recorder(attributes);
-            number_gauge.set(num_partitions as u64);
+                // Record metric for candidates
+                debug!(n = num_partitions, compaction_type, "compaction candidates",);
+                let number_gauge = self.compaction_candidate_gauge.recorder(attributes);
+                number_gauge.set(num_partitions as u64);
+            }
+            ShardAssignment::Only(shards) => {
+                for shard_id in shards {
+                    let attributes = Attributes::from([
+                        ("shard_id", format!("{}", *shard_id).into()),
+                        ("partition_type", compaction_type.into()),
+                    ]);
+
+                    let mut repos = self.catalog.repositories().await;
+                    let mut partitions = repos
+                        .parquet_files()
+                        .most_cold_files_partitions(
+                            Some(*shard_id),
+                            time_in_the_past,
+                            max_num_partitions_per_shard,
+                        )
+                        .await
+                        .context(MostColdPartitionsSnafu {
+                            shard_id: Some(*shard_id),
+                        })?;
+
+                    let num_partitions = partitions.len();
+                    candidates.append(&mut partitions);
+
+                    // Record metric for candidates per shard
+                    debug!(
+                        shard_id = shard_id.get(),
+                        n = num_partitions,
+                        compaction_type,
+                        "compaction candidates",
+                    );
+                    let number_gauge = self.compaction_candidate_gauge.recorder(attributes);
+                    number_gauge.set(num_partitions as u64);
+                }
+            }
         }
 
         // Get extra needed information for selected partitions
@@ -559,6 +619,10 @@ pub mod tests {
     use parquet_file::storage::StorageId;
     use uuid::Uuid;
 
+    const DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_1: u64 = 4;
+    const DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_2: u64 = 24;
+    const DEFAULT_MAX_PARALLEL_PARTITIONS: u64 = 20;
+
     impl PartitionCompactionCandidateWithInfo {
         pub(crate) async fn from_test_partition(test_partition: &TestPartition) -> Self {
             Self {
@@ -686,10 +750,17 @@ pub mod tests {
             max_number_partitions_per_shard: 1,
             min_number_recent_ingested_files_per_partition: 1,
             hot_multiple: 4,
+            warm_multiple: 1,
             memory_budget_bytes: 10 * 1024 * 1024,
             min_num_rows_allocated_per_record_batch_to_datafusion_plan: 100,
             max_num_compacting_files: 20,
+            max_num_compacting_files_first_in_partition: 40,
             minutes_without_new_writes_to_be_cold: 10,
+            hot_compaction_hours_threshold_1: DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_1,
+            hot_compaction_hours_threshold_2: DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_2,
+            max_parallel_partitions: DEFAULT_MAX_PARALLEL_PARTITIONS,
+            warm_compaction_small_size_threshold_bytes: 5_000,
+            warm_compaction_min_small_file_count: 10,
         }
     }
 
@@ -707,7 +778,7 @@ pub mod tests {
             .namespaces()
             .create(
                 "namespace_hot_partitions_to_compact",
-                "inf",
+                None,
                 topic.id,
                 pool.id,
             )
@@ -771,7 +842,11 @@ pub mod tests {
         // update sort key for this another_partition
         let another_partition = txn
             .partitions()
-            .update_sort_key(another_partition.id, &["tag1", "time"])
+            .cas_sort_key(
+                another_partition.id,
+                Some(another_partition.sort_key),
+                &["tag1", "time"],
+            )
             .await
             .unwrap();
         txn.commit().await.unwrap();
@@ -782,7 +857,7 @@ pub mod tests {
         // 8 hours to be cold
         config.minutes_without_new_writes_to_be_cold = 8 * 60;
         let compactor = Compactor::new(
-            vec![shard.id, another_shard.id],
+            ShardAssignment::Only(vec![shard.id, another_shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),

@@ -80,14 +80,10 @@ impl RecordAggregator {
             .producer_ts()
             .unwrap_or_else(|| self.time_provider.now());
 
-        let headers = IoxHeaders::new(
-            ContentType::Protobuf,
-            op.meta().span_context().cloned(),
-            op.namespace().to_owned(),
-        );
+        let headers = IoxHeaders::new(ContentType::Protobuf, op.meta().span_context().cloned());
 
         let mut buf = Vec::new();
-        crate::codec::encode_operation(op.namespace(), op, &mut buf)?;
+        crate::codec::encode_operation(op, &mut buf)?;
         buf.shrink_to_fit();
 
         let record = Record {
@@ -207,13 +203,10 @@ mod tests {
     use mutable_batch::{writer::Writer, MutableBatch};
     use trace::LogTraceCollector;
 
-    use crate::codec::{
-        CONTENT_TYPE_PROTOBUF, HEADER_CONTENT_TYPE, HEADER_NAMESPACE, HEADER_TRACE_CONTEXT,
-    };
+    use crate::codec::{CONTENT_TYPE_PROTOBUF, HEADER_CONTENT_TYPE, HEADER_TRACE_CONTEXT};
 
     use super::*;
 
-    const NAMESPACE: &str = "bananas";
     const SHARD_INDEX: ShardIndex = ShardIndex::new(42);
     const TIMESTAMP_MILLIS: i64 = 1659990497000;
 
@@ -230,19 +223,13 @@ mod tests {
         writer.commit();
 
         let mut m = HashMap::default();
-        m.insert("table".to_string(), batch);
+        m.insert(TableId::new(24), batch);
 
         let span = SpanContext::new(Arc::new(LogTraceCollector::new()));
 
-        let ids = [("table".to_string(), TableId::new(24))]
-            .into_iter()
-            .collect();
-
         DmlOperation::Write(DmlWrite::new(
-            NAMESPACE.to_string(),
             NamespaceId::new(42),
             m,
-            ids,
             "1970-01-01".into(),
             DmlMeta::unsequenced(Some(span)),
         ))
@@ -250,9 +237,9 @@ mod tests {
 
     #[test]
     fn test_record_aggregate() {
-        let clock = Arc::new(MockProvider::new(Time::from_timestamp_millis(
-            TIMESTAMP_MILLIS,
-        )));
+        let clock = Arc::new(MockProvider::new(
+            Time::from_timestamp_millis(TIMESTAMP_MILLIS).unwrap(),
+        ));
         let mut agg = RecordAggregator::new(SHARD_INDEX, usize::MAX, clock);
         let write = test_op();
 
@@ -281,13 +268,6 @@ mod tests {
                 .expect("no content type"),
             Vec::<u8>::from(CONTENT_TYPE_PROTOBUF),
         );
-        assert_eq!(
-            *record
-                .headers
-                .get(HEADER_NAMESPACE)
-                .expect("no namespace header"),
-            Vec::<u8>::from(NAMESPACE),
-        );
         assert!(record.headers.get(HEADER_TRACE_CONTEXT).is_some());
         assert_eq!(record.timestamp.timestamp(), 1659990497);
 
@@ -304,7 +284,7 @@ mod tests {
         );
         assert_eq!(
             got.producer_ts().expect("no producer timestamp"),
-            Time::from_timestamp_millis(TIMESTAMP_MILLIS)
+            Time::from_timestamp_millis(TIMESTAMP_MILLIS).unwrap(),
         );
         assert_eq!(
             got.bytes_read().expect("no approx size"),
@@ -314,9 +294,9 @@ mod tests {
 
     #[test]
     fn test_record_aggregate_no_capacity() {
-        let clock = Arc::new(MockProvider::new(Time::from_timestamp_millis(
-            TIMESTAMP_MILLIS,
-        )));
+        let clock = Arc::new(MockProvider::new(
+            Time::from_timestamp_millis(TIMESTAMP_MILLIS).unwrap(),
+        ));
         let mut agg = RecordAggregator::new(SHARD_INDEX, usize::MIN, clock);
         let write = test_op();
 
@@ -324,7 +304,7 @@ mod tests {
             .try_push(write.clone())
             .expect("aggregate call should succeed");
         match res {
-            TryPush::NoCapacity(res) => assert_eq!(res.namespace(), write.namespace()),
+            TryPush::NoCapacity(res) => assert_eq!(res.namespace_id(), write.namespace_id()),
             TryPush::Aggregated(_) => panic!("expected no capacity"),
         };
     }

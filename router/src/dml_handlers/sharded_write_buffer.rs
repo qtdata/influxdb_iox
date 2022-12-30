@@ -6,7 +6,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate, NamespaceId, NonEmptyString, TableId};
+use data_types::{DeletePredicate, NamespaceId, NamespaceName, NonEmptyString, TableId};
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
 use futures::{stream::FuturesUnordered, StreamExt};
 use hashbrown::HashMap;
@@ -93,7 +93,7 @@ where
     /// Shard `writes` and dispatch the resultant DML operations.
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         writes: Self::WriteInput,
         span_ctx: Option<SpanContext>,
@@ -103,8 +103,7 @@ where
 
         // Sets of maps collated by destination shard for batching/merging of
         // shard data.
-        let mut collated: HashMap<_, HashMap<String, MutableBatch>> = HashMap::new();
-        let mut table_ids: HashMap<_, HashMap<String, TableId>> = HashMap::new();
+        let mut collated: HashMap<_, HashMap<TableId, MutableBatch>> = HashMap::new();
 
         // Shard each entry in `writes` and collate them into one DML operation
         // per shard to maximise the size of each write, and therefore increase
@@ -115,26 +114,14 @@ where
             let existing = collated
                 .entry(Arc::clone(&shard))
                 .or_default()
-                .insert(table_name.clone(), batch);
-            assert!(existing.is_none());
-
-            let existing = table_ids
-                .entry(shard)
-                .or_default()
-                .insert(table_name.clone(), table_id);
+                .insert(table_id, batch);
             assert!(existing.is_none());
         }
 
-        // This will be used in a future PR, and eliminated in a dead code pass
-        // by LLVM in the meantime.
-        let _ = table_ids;
-
         let iter = collated.into_iter().map(|(shard, batch)| {
             let dml = DmlWrite::new(
-                namespace,
                 namespace_id,
                 batch,
-                table_ids.remove(&shard).unwrap(),
                 partition_key.clone(),
                 DmlMeta::unsequenced(span_ctx.clone()),
             );
@@ -158,7 +145,7 @@ where
     /// Shard `predicate` and dispatch it to the appropriate shard.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
@@ -168,7 +155,6 @@ where
         let shards = self.sharder.shard(table_name, namespace, &predicate);
 
         let dml = DmlDelete::new(
-            namespace,
             namespace_id,
             predicate,
             NonEmptyString::new(table_name),
@@ -258,7 +244,9 @@ mod tests {
 
     // Init a mock write buffer with the given number of shards.
     fn init_write_buffer(n_shards: u32) -> MockBufferForWriting {
-        let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
+        let time = iox_time::MockProvider::new(
+            iox_time::Time::from_timestamp_millis(668563200000).unwrap(),
+        );
         MockBufferForWriting::new(
             MockBufferSharedState::empty_with_n_shards(
                 n_shards.try_into().expect("cannot have 0 shards"),
@@ -299,7 +287,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(Arc::clone(&sharder));
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("bananas").unwrap();
+        let ns = NamespaceName::new("bananas").unwrap();
         w.write(&ns, NamespaceId::new(42), writes, None)
             .await
             .expect("write failed");
@@ -367,7 +355,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(Arc::clone(&sharder));
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("bananas").unwrap();
+        let ns = NamespaceName::new("bananas").unwrap();
         w.write(&ns, NamespaceId::new(42), writes, None)
             .await
             .expect("write failed");
@@ -445,7 +433,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(Arc::clone(&sharder));
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("bananas").unwrap();
+        let ns = NamespaceName::new("bananas").unwrap();
         let err = w
             .write(&ns, NamespaceId::new(42), writes, None)
             .await
@@ -485,7 +473,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(Arc::clone(&sharder));
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("namespace").unwrap();
+        let ns = NamespaceName::new("namespace").unwrap();
         w.delete(&ns, NamespaceId::new(42), TABLE, &predicate, None)
             .await
             .expect("delete failed");
@@ -507,7 +495,7 @@ mod tests {
             .expect("write should have been successful");
         assert_matches!(got, DmlOperation::Delete(d) => {
             assert_eq!(d.table_name(), Some(TABLE));
-            assert_eq!(d.namespace(), &*ns);
+            assert_eq!(d.namespace_id().get(), 42);
             assert_eq!(*d.predicate(), predicate);
         });
     }
@@ -534,7 +522,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(Arc::clone(&sharder));
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("namespace").unwrap();
+        let ns = NamespaceName::new("namespace").unwrap();
         w.delete(&ns, NamespaceId::new(42), "", &predicate, None)
             .await
             .expect("delete failed");
@@ -572,7 +560,7 @@ mod tests {
         fn shard(
             &self,
             _table: &str,
-            _namespace: &DatabaseName<'_>,
+            _namespace: &NamespaceName<'_>,
             _payload: &DeletePredicate,
         ) -> Self::Item {
             self.0.clone()
@@ -585,7 +573,7 @@ mod tests {
         fn shard(
             &self,
             _table: &str,
-            _namespace: &DatabaseName<'_>,
+            _namespace: &NamespaceName<'_>,
             _payload: &MutableBatch,
         ) -> Self::Item {
             unreachable!()
@@ -624,7 +612,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(sharder);
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("namespace").unwrap();
+        let ns = NamespaceName::new("namespace").unwrap();
         w.delete(&ns, NamespaceId::new(42), TABLE, &predicate, None)
             .await
             .expect("delete failed");
@@ -680,7 +668,7 @@ mod tests {
         let w = ShardedWriteBuffer::new(sharder);
 
         // Call the ShardedWriteBuffer and drive the test
-        let ns = DatabaseName::new("namespace").unwrap();
+        let ns = NamespaceName::new("namespace").unwrap();
         let err = w
             .delete(&ns, NamespaceId::new(42), TABLE, &predicate, None)
             .await

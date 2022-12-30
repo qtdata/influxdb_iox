@@ -1,6 +1,6 @@
 //! Compactor handler
 
-use crate::{cold, compact::Compactor, hot};
+use crate::{cold, compact::Compactor, hot, warm};
 use async_trait::async_trait;
 use data_types::{PartitionId, SkippedCompaction};
 use futures::{
@@ -124,6 +124,11 @@ pub struct CompactorConfig {
     /// equally.
     pub hot_multiple: usize,
 
+    /// The multiple of times that compacting warm partitions should run for every one time that
+    /// compacting cold partitions runs. Set to 1 to compact warm partitions and cold partitions
+    /// equally.
+    pub warm_multiple: usize,
+
     /// The memory budget assigned to this compactor.
     ///
     /// For each partition candidate, we will estimate the memory needed to compact each file
@@ -157,8 +162,35 @@ pub struct CompactorConfig {
     /// per partition.
     pub max_num_compacting_files: usize,
 
+    /// Max number of files to compact for a partition in which the first file and its
+    /// overlaps push the file count limit over `max_num_compacting_files`.
+    /// It's a special case of `max_num_compacting_files` that's higher just for the first
+    /// file in a partition
+    pub max_num_compacting_files_first_in_partition: usize,
+
     /// Minutes without any new data before a partition is considered cold
     pub minutes_without_new_writes_to_be_cold: u64,
+
+    /// When querying for partitions with data for hot compaction, how many hours to look
+    /// back for a first pass.
+    pub hot_compaction_hours_threshold_1: u64,
+
+    /// When querying for partitions with data for hot compaction, how many hours to look
+    /// back for a second pass if we found nothing in the first pass.
+    pub hot_compaction_hours_threshold_2: u64,
+
+    /// Max number of partitions that can be compacted in parallel at once
+    /// We use memory budget to estimate how many partitions can be compacted in parallel at once.
+    /// However, we do not want to have that number too large which will cause the high usage of CPU cores
+    /// and may also lead to inaccuracy of memory estimation. This number is to cap that.
+    pub max_parallel_partitions: u64,
+
+    /// Upper bound on file size to be counted as "small" for warm compaction.
+    pub warm_compaction_small_size_threshold_bytes: i64,
+
+    /// Minimum number of small files a partition must have in order for it to be selected
+    /// as a candidate for warm compaction.
+    pub warm_compaction_min_small_file_count: usize,
 }
 
 /// How long to pause before checking for more work again if there was
@@ -180,8 +212,10 @@ async fn run_compactor(compactor: Arc<Compactor>, shutdown: CancellationToken) {
 /// as the configuration will allow.
 pub async fn run_compactor_once(compactor: Arc<Compactor>) {
     let num_hot_cycles = compactor.config.hot_multiple;
+    let num_warm_cycles = compactor.config.warm_multiple;
     debug!(
         ?num_hot_cycles,
+        ?num_warm_cycles,
         num_cold_cycles = 1,
         "start running compactor once that includes"
     );
@@ -190,7 +224,15 @@ pub async fn run_compactor_once(compactor: Arc<Compactor>) {
         debug!(?i, "start hot cycle");
         compacted_partitions += hot::compact(Arc::clone(&compactor)).await;
         if compacted_partitions == 0 {
-            // No hot candidates, should move to compact cold partitions
+            // No hot candidates, should move on to warm compaction
+            break;
+        }
+    }
+    for i in 0..num_warm_cycles {
+        debug!(?i, "start warm cycle");
+        compacted_partitions += warm::compact(Arc::clone(&compactor)).await;
+        if compacted_partitions == 0 {
+            // No warm candidates, should move to compact cold partitions
             break;
         }
     }
@@ -304,7 +346,15 @@ mod tests {
             let mut repos = compactor.catalog.repositories().await;
             repos
                 .partitions()
-                .record_skipped_compaction(partition.partition.id, "Not today", 3, 2, 100_000, 100)
+                .record_skipped_compaction(
+                    partition.partition.id,
+                    "Not today",
+                    3,
+                    2,
+                    4,
+                    100_000,
+                    100,
+                )
                 .await
                 .unwrap()
         }
@@ -340,7 +390,15 @@ mod tests {
             let mut repos = compactor.catalog.repositories().await;
             repos
                 .partitions()
-                .record_skipped_compaction(partition.partition.id, "Not today", 3, 2, 100_000, 100)
+                .record_skipped_compaction(
+                    partition.partition.id,
+                    "Not today",
+                    3,
+                    2,
+                    4,
+                    100_000,
+                    100,
+                )
                 .await
                 .unwrap();
         }

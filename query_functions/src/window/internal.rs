@@ -145,7 +145,7 @@ fn timestamp_to_datetime(ts: i64) -> DateTime<Utc> {
     let nsec = ts % 1_000_000_000;
     // Note that nsec as u32 is safe here because modulo on a negative ts value
     //  still produces a positive remainder.
-    let datetime = NaiveDateTime::from_timestamp(secs, nsec as u32);
+    let datetime = NaiveDateTime::from_timestamp_opt(secs, nsec as u32).expect("ts in range");
     DateTime::from_utc(datetime, Utc)
 }
 
@@ -193,8 +193,9 @@ fn to_timestamp_nanos_utc(
     sec: u32,
     nano: u32,
 ) -> i64 {
-    let ndate = NaiveDate::from_ymd(year, month, day);
-    let ntime = NaiveTime::from_hms_nano(hour, min, sec, nano);
+    let ndate = NaiveDate::from_ymd_opt(year, month, day).expect("year-month-day in range");
+    let ntime =
+        NaiveTime::from_hms_nano_opt(hour, min, sec, nano).expect("hour-min-sec-nano in range");
     let ndatetime = NaiveDateTime::new(ndate, ntime);
 
     let datetime = DateTime::<Utc>::from_utc(ndatetime, Utc);
@@ -356,7 +357,7 @@ fn truncate_by_months(t: i64, d: &Duration) -> i64 {
 
     // Determine the total number of months and truncate
     // the number of months by the duration amount.
-    let mut total = (year * 12) as i32 + (month - 1) as i32;
+    let mut total = (year * 12) + (month - 1) as i32;
     let remainder = total % d.months() as i32;
     total -= remainder;
 

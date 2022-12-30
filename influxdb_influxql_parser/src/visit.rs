@@ -21,10 +21,12 @@
 //! let vis = MyVisitor;
 //! statement.accept(vis);
 //! ```
+use self::Recursion::*;
 use crate::common::{
     LimitClause, MeasurementName, OffsetClause, OrderByClause, QualifiedMeasurementName,
     WhereClause,
 };
+use crate::create::CreateDatabaseStatement;
 use crate::delete::DeleteStatement;
 use crate::drop::DropMeasurementStatement;
 use crate::explain::ExplainStatement;
@@ -44,7 +46,6 @@ use crate::show_tag_keys::ShowTagKeysStatement;
 use crate::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
 use crate::simple_from_clause::{DeleteFromClause, ShowFromClause};
 use crate::statement::Statement;
-use crate::visit::Recursion::*;
 
 /// The result type for a [`Visitor`].
 pub type VisitorResult<T, E = &'static str> = Result<T, E>;
@@ -69,6 +70,23 @@ pub trait Visitor: Sized {
 
     /// Invoked after all children of the InfluxQL statement are visited.
     fn post_visit_statement(self, _n: &Statement) -> VisitorResult<Self> {
+        Ok(self)
+    }
+
+    /// Invoked before any children of `n` are visited.
+    fn pre_visit_create_database_statement(
+        self,
+        _n: &CreateDatabaseStatement,
+    ) -> VisitorResult<Recursion<Self>> {
+        Ok(Continue(self))
+    }
+
+    /// Invoked after all children of `n` are visited. Default
+    /// implementation does nothing.
+    fn post_visit_create_database_statement(
+        self,
+        _n: &CreateDatabaseStatement,
+    ) -> VisitorResult<Self> {
         Ok(self)
     }
 
@@ -487,6 +505,7 @@ impl Visitable for Statement {
         };
 
         let visitor = match self {
+            Self::CreateDatabase(s) => s.accept(visitor),
             Self::Delete(s) => s.accept(visitor),
             Self::DropMeasurement(s) => s.accept(visitor),
             Self::Explain(s) => s.accept(visitor),
@@ -500,6 +519,17 @@ impl Visitable for Statement {
         }?;
 
         visitor.post_visit_statement(self)
+    }
+}
+
+impl Visitable for CreateDatabaseStatement {
+    fn accept<V: Visitor>(&self, visitor: V) -> VisitorResult<V> {
+        let visitor = match visitor.pre_visit_create_database_statement(self)? {
+            Continue(visitor) => visitor,
+            Stop(visitor) => return Ok(visitor),
+        };
+
+        visitor.post_visit_create_database_statement(self)
     }
 }
 
@@ -1138,6 +1168,8 @@ impl Visitable for OnClause {
 
 #[cfg(test)]
 mod test {
+    use super::Recursion::Continue;
+    use super::{Recursion, Visitable, Visitor, VisitorResult};
     use crate::common::{
         LimitClause, MeasurementName, OffsetClause, OrderByClause, QualifiedMeasurementName,
         WhereClause,
@@ -1161,8 +1193,6 @@ mod test {
     use crate::show_tag_values::{ShowTagValuesStatement, WithKeyClause};
     use crate::simple_from_clause::{DeleteFromClause, ShowFromClause};
     use crate::statement::{statement, Statement};
-    use crate::visit::Recursion::Continue;
-    use crate::visit::{Recursion, Visitable, Visitor, VisitorResult};
     use std::fmt::Debug;
 
     struct TestVisitor(Vec<String>);

@@ -1,11 +1,13 @@
+use futures::TryStreamExt;
 use generated_types::ingester::{
     decode_proto_predicate_from_base64, DecodeProtoPredicateFromBase64Error,
 };
 use influxdb_iox_client::{
     connection::Connection,
-    flight::{self, low_level::LowLevelMessage},
+    flight::{self},
     format::QueryOutputFormat,
 };
+use iox_arrow_flight::prost::Message;
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -15,7 +17,7 @@ pub enum Error {
     Formatting(#[from] influxdb_iox_client::format::Error),
 
     #[error("Error querying: {0}")]
-    Query(#[from] influxdb_iox_client::flight::Error),
+    Query(#[from] iox_arrow_flight::FlightError),
 
     #[error("Error decoding base64-encoded predicate from argument: {0}")]
     PredicateFromBase64(#[from] DecodeProtoPredicateFromBase64Error),
@@ -32,11 +34,11 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct Config {
     /// The IOx namespace to query
     #[clap(action)]
-    namespace: String,
+    namespace_id: i64,
 
     /// The table for which to retrieve data
     #[clap(action)]
-    table: String,
+    table_id: i64,
 
     /// The columns to request
     #[clap(long = "columns", use_value_delimiter = true, action)]
@@ -53,11 +55,11 @@ pub struct Config {
 }
 
 pub async fn command(connection: Connection, config: Config) -> Result<()> {
-    let mut client = flight::low_level::Client::new(connection, None);
+    let client = influxdb_iox_client::flight::Client::new(connection);
     let Config {
-        namespace,
+        namespace_id,
         format,
-        table,
+        table_id,
         columns,
         predicate_base64,
     } = config;
@@ -71,22 +73,19 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
     };
 
     let request = flight::generated_types::IngesterQueryRequest {
-        table,
+        table_id,
         columns,
         predicate,
-        namespace,
+        namespace_id,
     };
 
-    let mut query_results = client.perform_query(request).await?;
+    // send the message directly encoded as bytes to the ingester.
+    let request = request.encode_to_vec();
+    let query_results = client.into_inner().do_get(request).await?;
 
     // It might be nice to do some sort of streaming write
     // rather than buffering the whole thing.
-    let mut batches = vec![];
-    while let Some((msg, _md)) = query_results.next().await? {
-        if let LowLevelMessage::RecordBatch(batch) = msg {
-            batches.push(batch);
-        }
-    }
+    let batches: Vec<_> = query_results.try_collect().await?;
 
     let formatted_result = format.format(&batches)?;
 

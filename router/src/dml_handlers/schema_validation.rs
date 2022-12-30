@@ -1,7 +1,7 @@
 use std::{ops::DerefMut, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate, NamespaceId, NamespaceSchema, TableId};
+use data_types::{DeletePredicate, NamespaceId, NamespaceName, NamespaceSchema, TableId};
 use hashbrown::HashMap;
 use iox_catalog::{
     interface::{get_schema_by_name, Catalog, Error as CatalogError},
@@ -146,7 +146,7 @@ where
     type WriteError = SchemaError;
     type DeleteError = SchemaError;
 
-    // Accepts a map of "TableName -> MutableBatch"
+    // Accepts a map of TableName -> MutableBatch
     type WriteInput = HashMap<String, MutableBatch>;
     // And returns a map of TableId -> (TableName, MutableBatch)
     type WriteOutput = HashMap<TableId, (String, MutableBatch)>;
@@ -168,7 +168,7 @@ where
     /// as a whole - calling this method has "all or nothing" semantics.
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         batches: Self::WriteInput,
         _span_ctx: Option<SpanContext>,
@@ -287,7 +287,7 @@ where
             }
         };
 
-        // Map the "TableName -> Data" into "(TableName, TableId) -> Data" for
+        // Map the "TableName -> Data" into "TableId -> (TableName, Data)" for
         // downstream handlers.
         let batches = batches
             .into_iter()
@@ -305,7 +305,7 @@ where
     /// on deletes.
     async fn delete(
         &self,
-        _namespace: &DatabaseName<'static>,
+        _namespace: &NamespaceName<'static>,
         _namespace_id: NamespaceId,
         _table_name: &str,
         _predicate: &DeletePredicate,
@@ -377,7 +377,7 @@ mod tests {
 
     use super::*;
 
-    static NAMESPACE: Lazy<DatabaseName<'static>> = Lazy::new(|| "bananas".try_into().unwrap());
+    static NAMESPACE: Lazy<NamespaceName<'static>> = Lazy::new(|| "bananas".try_into().unwrap());
 
     #[tokio::test]
     async fn validate_limits() {
@@ -491,12 +491,12 @@ mod tests {
             // namespace schema gets cached
             let writes1_valid = lp_to_writes("dragonfruit val=42i 123456");
             handler1
-                .write(&*NAMESPACE, NamespaceId::new(42), writes1_valid, None)
+                .write(&NAMESPACE, NamespaceId::new(42), writes1_valid, None)
                 .await
                 .expect("request should succeed");
             let writes2_valid = lp_to_writes("dragonfruit val=43i 123457");
             handler2
-                .write(&*NAMESPACE, NamespaceId::new(42), writes2_valid, None)
+                .write(&NAMESPACE, NamespaceId::new(42), writes2_valid, None)
                 .await
                 .expect("request should succeed");
 
@@ -504,12 +504,12 @@ mod tests {
             // putting the table over the limit
             let writes1_add_column = lp_to_writes("dragonfruit,tag1=A val=42i 123456");
             handler1
-                .write(&*NAMESPACE, NamespaceId::new(42), writes1_add_column, None)
+                .write(&NAMESPACE, NamespaceId::new(42), writes1_add_column, None)
                 .await
                 .expect("request should succeed");
             let writes2_add_column = lp_to_writes("dragonfruit,tag2=B val=43i 123457");
             handler2
-                .write(&*NAMESPACE, NamespaceId::new(42), writes2_add_column, None)
+                .write(&NAMESPACE, NamespaceId::new(42), writes2_add_column, None)
                 .await
                 .expect("request should succeed");
 
@@ -543,7 +543,7 @@ mod tests {
     /// named [`NAMESPACE`].
     async fn test_setup() -> (Arc<TestCatalog>, Arc<TestNamespace>) {
         let catalog = TestCatalog::new();
-        let namespace = catalog.create_namespace(&NAMESPACE).await;
+        let namespace = catalog.create_namespace_1hr_retention(&NAMESPACE).await;
 
         (catalog, namespace)
     }
@@ -555,7 +555,7 @@ mod tests {
         // The cache should be populated.
         let ns = handler
             .cache
-            .get_schema(&*NAMESPACE)
+            .get_schema(&NAMESPACE)
             .expect("cache should be populated");
         let table = ns.tables.get(table).expect("table should exist in cache");
         assert_eq!(
@@ -579,12 +579,12 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i 123456");
         let got = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
             .await
             .expect("request should succeed");
 
@@ -606,10 +606,10 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
-        let ns = DatabaseName::try_from("A_DIFFERENT_NAMESPACE").unwrap();
+        let ns = NamespaceName::try_from("A_DIFFERENT_NAMESPACE").unwrap();
 
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i 123456");
         let err = handler
@@ -630,13 +630,13 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         // First write sets the schema
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i 123456"); // val=i64
         let got = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes.clone(), None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes.clone(), None)
             .await
             .expect("request should succeed");
         assert_eq!(writes.len(), got.len());
@@ -644,7 +644,7 @@ mod tests {
         // Second write attempts to violate it causing an error
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42.0 123456"); // val=float
         let err = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
             .await
             .expect_err("request should fail");
 
@@ -668,13 +668,13 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         // First write sets the schema
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i 123456");
         let got = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes.clone(), None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes.clone(), None)
             .await
             .expect("request should succeed");
         assert_eq!(writes.len(), got.len());
@@ -692,7 +692,7 @@ mod tests {
         // Second write attempts to violate limits, causing an error
         let writes = lp_to_writes("bananas2,tag1=A,tag2=B val=42i 123456");
         let err = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
             .await
             .expect_err("request should fail");
 
@@ -707,13 +707,13 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         // First write sets the schema
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i 123456");
         let got = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes.clone(), None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes.clone(), None)
             .await
             .expect("request should succeed");
         assert_eq!(writes.len(), got.len());
@@ -723,13 +723,13 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         // Second write attempts to violate limits, causing an error
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i,val2=42i 123456");
         let err = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
             .await
             .expect_err("request should fail");
 
@@ -744,7 +744,7 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         // Configure the service limit to be hit next request
@@ -760,7 +760,7 @@ mod tests {
         // First write attempts to add columns over the limit, causing an error
         let writes = lp_to_writes("bananas,tag1=A,tag2=B val=42i,val2=42i 123456");
         let err = handler
-            .write(&*NAMESPACE, NamespaceId::new(42), writes, None)
+            .write(&NAMESPACE, NamespaceId::new(42), writes, None)
             .await
             .expect_err("request should fail");
 
@@ -778,7 +778,7 @@ mod tests {
         let handler = SchemaValidator::new(
             catalog.catalog(),
             Arc::new(MemoryNamespaceCache::default()),
-            &*metrics,
+            &metrics,
         );
 
         let predicate = DeletePredicate {
@@ -786,7 +786,7 @@ mod tests {
             exprs: vec![],
         };
 
-        let ns = DatabaseName::try_from(NAMESPACE).unwrap();
+        let ns = NamespaceName::try_from(NAMESPACE).unwrap();
 
         handler
             .delete(&ns, NamespaceId::new(42), TABLE, &predicate, None)

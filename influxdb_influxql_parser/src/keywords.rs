@@ -25,6 +25,8 @@ fn keyword_follow_char(i: &str) -> ParseResult<&str, &str> {
         tag("\t"),
         tag(","),
         tag("="),
+        tag("/"), // possible comment
+        tag("-"), // possible comment
         eof,
         fail, // Return a failure if we reach the end of this alternation
     )))(i)
@@ -265,6 +267,11 @@ mod test {
         // Not case sensitive
         let (rem, got) = or_keyword("or").unwrap();
         assert_eq!(rem, "");
+        assert_eq!(got, "or");
+
+        // Does not consume input that follows a keyword
+        let (rem, got) = or_keyword("or(a AND b)").unwrap();
+        assert_eq!(rem, "(a AND b)");
         assert_eq!(got, "or");
 
         // Will fail because keyword `OR` in `ORDER` is not recognized, as is not terminated by a valid character

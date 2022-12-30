@@ -1,5 +1,4 @@
-//! This module provides a reference implementation of
-//! [`QueryDatabase`] for use in testing.
+//! This module provides a reference implementation of [`QueryNamespace`] for use in testing.
 //!
 //! AKA it is a Mock
 
@@ -9,7 +8,7 @@ use crate::{
         ExecutionContextProvider, Executor, ExecutorType, IOxSessionContext,
     },
     Predicate, PredicateMatch, QueryChunk, QueryChunkData, QueryChunkMeta, QueryCompletedToken,
-    QueryDatabase, QueryText,
+    QueryNamespace, QueryText,
 };
 use arrow::{
     array::{
@@ -27,7 +26,7 @@ use datafusion::error::DataFusionError;
 use hashbrown::HashSet;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
-use predicate::rpc_predicate::QueryDatabaseMeta;
+use predicate::rpc_predicate::QueryNamespaceMeta;
 use schema::{
     builder::SchemaBuilder, merge::SchemaMerger, sort::SortKey, InfluxColumnType, Projection,
     Schema, TIME_COLUMN_NAME,
@@ -100,12 +99,12 @@ impl TestDatabase {
 }
 
 #[async_trait]
-impl QueryDatabase for TestDatabase {
+impl QueryNamespace for TestDatabase {
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
-        _projection: &Option<Vec<usize>>,
+        _projection: Option<&Vec<usize>>,
         _ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         // save last predicate
@@ -137,12 +136,12 @@ impl QueryDatabase for TestDatabase {
         QueryCompletedToken::new(|_| {})
     }
 
-    fn as_meta(&self) -> &dyn QueryDatabaseMeta {
+    fn as_meta(&self) -> &dyn QueryNamespaceMeta {
         self
     }
 }
 
-impl QueryDatabaseMeta for TestDatabase {
+impl QueryNamespaceMeta for TestDatabase {
     fn table_schema(&self, table_name: &str) -> Option<Arc<Schema>> {
         let mut merger = SchemaMerger::new();
         let mut found_one = false;
@@ -592,6 +591,7 @@ impl TestChunk {
 
     /// Prepares this chunk to return a specific record batch with one
     /// row of non null data.
+    /// tag: MA
     pub fn with_one_row_of_data(mut self) -> Self {
         // create arrays
         let columns = self
@@ -607,6 +607,44 @@ impl TestChunk {
                     if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
                 {
                     let dict: DictionaryArray<Int32Type> = vec!["MA"].into_iter().collect();
+                    Arc::new(dict) as ArrayRef
+                }
+                _ => unimplemented!(
+                    "Unimplemented data type for test database: {:?}",
+                    field.data_type()
+                ),
+            })
+            .collect::<Vec<_>>();
+
+        let batch =
+            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+        println!("TestChunk batch data: {:#?}", batch);
+
+        self.table_data.push(Arc::new(batch));
+        self
+    }
+
+    /// Prepares this chunk to return a specific record batch with a single tag, field and timestamp like
+    pub fn with_one_row_of_specific_data(
+        mut self,
+        tag_val: impl AsRef<str>,
+        field_val: i64,
+        ts_val: i64,
+    ) -> Self {
+        // create arrays
+        let columns = self
+            .schema
+            .iter()
+            .map(|(_influxdb_column_type, field)| match field.data_type() {
+                DataType::Int64 => Arc::new(Int64Array::from(vec![field_val])) as ArrayRef,
+                DataType::Timestamp(TimeUnit::Nanosecond, _) => {
+                    Arc::new(TimestampNanosecondArray::from(vec![ts_val])) as ArrayRef
+                }
+                DataType::Dictionary(key, value)
+                    if key.as_ref() == &DataType::Int32 && value.as_ref() == &DataType::Utf8 =>
+                {
+                    let dict: DictionaryArray<Int32Type> =
+                        vec![tag_val.as_ref()].into_iter().collect();
                     Arc::new(dict) as ArrayRef
                 }
                 _ => unimplemented!(

@@ -18,6 +18,8 @@ use ioxd_common::server_type::{CommonServerState, CommonServerStateError};
 use ioxd_common::Service;
 use ioxd_compactor::create_compactor_server_type;
 
+use crate::process_info::{setup_metric_registry, USIZE_MAX};
+
 use super::main;
 
 #[derive(Debug, Error)]
@@ -74,13 +76,29 @@ pub struct Config {
         action
     )]
     pub query_exec_thread_count: usize,
+
+    /// Size of memory pool used during query exec, in bytes.
+    #[clap(
+        long = "exec-mem-pool-bytes",
+        env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
+        default_value = &USIZE_MAX[..],
+        action
+    )]
+    pub exec_mem_pool_bytes: usize,
 }
 
 pub async fn command(config: Config) -> Result<(), Error> {
+    if std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok() {
+        panic!(
+            "`INFLUXDB_IOX_RPC_MODE` was specified but `compactor` was the command run. Either unset
+             `INFLUXDB_IOX_RPC_MODE` or run the `compactor2` command."
+        );
+    }
+
     let common_state = CommonServerState::from_config(config.run_config.clone())?;
 
     let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
-    let metric_registry: Arc<metric::Registry> = Default::default();
+    let metric_registry = setup_metric_registry();
     let catalog = config
         .catalog_dsn
         .get_catalog("compactor", Arc::clone(&metric_registry))
@@ -93,7 +111,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
     let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
         Arc::clone(&time_provider),
-        &*metric_registry,
+        &metric_registry,
     ));
 
     let parquet_store = ParquetStorage::new(object_store, StorageId::from("iox"));
@@ -105,6 +123,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
             parquet_store.id(),
             Arc::clone(parquet_store.object_store()),
         )]),
+        mem_pool_size: config.exec_mem_pool_bytes,
     }));
     let time_provider = Arc::new(SystemProvider::new());
 

@@ -51,6 +51,18 @@ pub struct QuerierConfig {
     )]
     pub num_query_threads: Option<usize>,
 
+    /// Size of memory pool used during query exec, in bytes.
+    ///
+    /// If queries attempt to allocate more than this many bytes
+    /// during execution, they will error with "ResourcesExhausted".
+    #[clap(
+        long = "exec-mem-pool-bytes",
+        env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
+        default_value = "8589934592",  // 8GB
+        action
+    )]
+    pub exec_mem_pool_bytes: usize,
+
     /// Path to a JSON file containing a Shard index to ingesters gRPC mapping. For example:
     ///
     /// ```json
@@ -189,6 +201,19 @@ pub struct QuerierConfig {
     )]
     pub shard_to_ingesters: Option<String>,
 
+    /// gRPC address for the router to talk with the ingesters. For
+    /// example:
+    ///
+    /// "http://127.0.0.1:8083"
+    ///
+    /// or
+    ///
+    /// "http://10.10.10.1:8083,http://10.10.10.2:8083"
+    ///
+    /// for multiple addresses.
+    #[clap(long = "ingester-addresses", env = "INFLUXDB_IOX_INGESTER_ADDRESSES")]
+    pub ingester_addresses: Vec<String>,
+
     /// Size of the RAM cache used to store catalog metadata information in bytes.
     #[clap(
         long = "ram-pool-metadata-bytes",
@@ -216,18 +241,27 @@ pub struct QuerierConfig {
     )]
     pub max_concurrent_queries: usize,
 
-    /// Maximum bytes to scan for a table in a query (estimated).
+    /// After how many ingester query errors should the querier enter circuit breaker mode?
     ///
-    /// If IOx estimates that it will scan more than this many bytes
-    /// in a query, the query will error. This protects against potentially unbounded
-    /// memory growth leading to OOMs in certain pathological queries.
+    /// The querier normally contacts the ingester for any unpersisted data during query planning.
+    /// However, when the ingester can not be contacted for some reason, the querier will begin
+    /// returning results that do not include unpersisted data and enter "circuit breaker mode"
+    /// to avoid continually retrying the failing connection on subsequent queries.
+    ///
+    /// If circuits are open, the querier will NOT contact the ingester and no unpersisted data will be presented to the user.
+    ///
+    /// Circuits will switch to "half open" after some jittered timeout and the querier will try to use the ingester in
+    /// question again. If this succeeds, we are back to normal, otherwise it will back off exponentially before trying
+    /// again (and again ...).
+    ///
+    /// In a production environment the `ingester_circuit_state` metric should be monitored.
     #[clap(
-        long = "max-table-query-bytes",
-        env = "INFLUXDB_IOX_MAX_TABLE_QUERY_BYTES",
-        default_value = "1073741824",  // 1 GB
+        long = "ingester-circuit-breaker-threshold",
+        env = "INFLUXDB_IOX_INGESTER_CIRCUIT_BREAKER_THRESHOLD",
+        default_value = "10",
         action
     )]
-    pub max_table_query_bytes: usize,
+    pub ingester_circuit_breaker_threshold: u64,
 }
 
 impl QuerierConfig {
@@ -240,6 +274,14 @@ impl QuerierConfig {
     /// Return the querier config's ingester addresses. If `--shard-to-ingesters-file` is used to
     /// specify a JSON file containing shard to ingester address mappings, this returns `Err` if
     /// there are any problems reading, deserializing, or interpreting the file.
+
+    // When we have switched to using the RPC write path only, this method can be changed to be
+    // infallible as clap will handle failure to parse the list of strings.
+    //
+    // Switching into the RPC write path mode requires *both* the `INFLUXDB_IOX_RPC_MODE`
+    // environment variable to be specified *and* `--ingester-addresses` to be set in order to
+    // switch. Setting `INFLUXDB_IOX_RPC_MODE` and shard-to-ingesters mapping, or not setting
+    // `INFLUXDB_IOX_RPC_MODE` and setting ingester addresses, will panic.
     pub fn ingester_addresses(&self) -> Result<IngesterAddresses, Error> {
         if let Some(file) = &self.shard_to_ingesters_file {
             let contents =
@@ -257,6 +299,13 @@ impl QuerierConfig {
             } else {
                 Ok(IngesterAddresses::ByShardIndex(map))
             }
+        } else if !self.ingester_addresses.is_empty() {
+            Ok(IngesterAddresses::List(
+                self.ingester_addresses
+                    .iter()
+                    .map(|s| s.as_str().into())
+                    .collect(),
+            ))
         } else {
             Ok(IngesterAddresses::None)
         }
@@ -275,12 +324,6 @@ impl QuerierConfig {
     /// Number of queries allowed to run concurrently
     pub fn max_concurrent_queries(&self) -> usize {
         self.max_concurrent_queries
-    }
-
-    /// Query will error if it estimated that a single table will provide more
-    /// than this many bytes.
-    pub fn max_table_query_bytes(&self) -> usize {
-        self.max_table_query_bytes
     }
 }
 
@@ -359,6 +402,9 @@ fn deserialize_shard_ingester_map(
 pub enum IngesterAddresses {
     /// A mapping from shard index to ingesters.
     ByShardIndex(HashMap<ShardIndex, IngesterMapping>),
+
+    /// A list of ingester2 addresses.
+    List(Vec<Arc<str>>),
 
     /// No connections, meaning only persisted data should be used.
     None,

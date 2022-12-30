@@ -1,5 +1,4 @@
 //! Routines for error handling
-
 use datafusion::error::DataFusionError;
 
 /// Converts a [`DataFusionError`] into the appropriate [`tonic::Code`]
@@ -22,6 +21,8 @@ use datafusion::error::DataFusionError;
 /// for example, you can get an Arrow error if you try and divide a
 /// column by zero, depending on the data.
 pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
+    let e = e.find_root();
+
     match e {
         DataFusionError::ResourcesExhausted(_) => tonic::Code::ResourceExhausted,
         // Map as many as possible back into user visible (non internal) errors
@@ -35,10 +36,6 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         // Since we are not sure they are all internal errors we
         // classify them as InvalidArgument so the user has a chance
         // to see them
-        //
-        // Potential future TODO: we could inspect the error and
-        // decide.  e.g. For Box<dyn ...> we could downcast the type
-        // if IOx only puts a single concrete enum in there.
         | DataFusionError::Execution(_)
         | DataFusionError::ArrowError(_)
         | DataFusionError::ParquetError(_)
@@ -55,10 +52,7 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
         // https://github.com/apache/arrow-datafusion/search?q=NotImplemented
         | DataFusionError::NotImplemented(_)
         | DataFusionError::Plan(_) => tonic::Code::InvalidArgument,
-        e @ DataFusionError::Context(_,_) => {
-            // traverse context chain without recursion
-            datafusion_error_to_tonic_code(leaf_error(e))
-        }
+        DataFusionError::Context(_,_) => unreachable!("handled in chain traversal above"),
         // Map as many as possible back into user visible
         // (non internal) errors and only treat the ones
         // the user likely can't do anything about as internal
@@ -75,15 +69,6 @@ pub fn datafusion_error_to_tonic_code(e: &DataFusionError) -> tonic::Code {
     }
 }
 
-/// Returns a reference to the bottommost error in the chain
-fn leaf_error(inner: &DataFusionError) -> &DataFusionError {
-    let mut source = inner;
-    while let DataFusionError::Context(_msg, inner) = source {
-        source = inner;
-    }
-    source
-}
-
 #[cfg(test)]
 mod test {
     use datafusion::sql::sqlparser::parser::ParserError;
@@ -95,37 +80,36 @@ mod test {
         let s = "foo".to_string();
 
         // this is basically a second implementation of the translation table to help avoid mistakes
-        do_test(
+        do_transl_test(
             DataFusionError::ResourcesExhausted(s.clone()),
             tonic::Code::ResourceExhausted,
         );
 
         let e = ParserError::ParserError(s.clone());
-        do_test(DataFusionError::SQL(e), tonic::Code::InvalidArgument);
+        do_transl_test(DataFusionError::SQL(e), tonic::Code::InvalidArgument);
 
-        do_test(
+        do_transl_test(
             DataFusionError::NotImplemented(s.clone()),
             tonic::Code::InvalidArgument,
         );
-        do_test(
+        do_transl_test(
             DataFusionError::Plan(s.clone()),
             tonic::Code::InvalidArgument,
         );
 
-        do_test(DataFusionError::Internal(s), tonic::Code::Internal);
-    }
+        do_transl_test(DataFusionError::Internal(s), tonic::Code::Internal);
 
-    #[test]
-    fn test_error_context_traversal() {
-        let inner_error = DataFusionError::ResourcesExhausted("foo".to_string());
-
-        do_test(
-            DataFusionError::Context("it happened!".to_string(), Box::new(inner_error)),
+        // traversal
+        do_transl_test(
+            DataFusionError::Context(
+                "it happened!".to_string(),
+                Box::new(DataFusionError::ResourcesExhausted("foo".to_string())),
+            ),
             tonic::Code::ResourceExhausted,
         );
     }
 
-    fn do_test(e: DataFusionError, code: tonic::Code) {
+    fn do_transl_test(e: DataFusionError, code: tonic::Code) {
         assert_eq!(datafusion_error_to_tonic_code(&e), code);
     }
 }

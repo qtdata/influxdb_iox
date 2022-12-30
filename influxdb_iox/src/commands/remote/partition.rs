@@ -25,6 +25,8 @@ use thiserror::Error;
 use tokio_stream::StreamExt;
 use uuid::Uuid;
 
+use crate::process_info::setup_metric_registry;
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, Error)]
 pub enum Error {
@@ -116,7 +118,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Error
             Ok(())
         }
         Command::Pull(pull) => {
-            let metrics = Arc::new(metric::Registry::new());
+            let metrics = setup_metric_registry();
             let catalog = pull.catalog_dsn.get_catalog("cli", metrics).await?;
             let mut schema_client = schema::Client::new(connection.clone());
             println!(
@@ -246,7 +248,7 @@ async fn load_schema(
 
     let namespace = match repos
         .namespaces()
-        .create(namespace, "inf", topic.id, query_pool.id)
+        .create(namespace, None, topic.id, query_pool.id)
         .await
     {
         Ok(n) => n,
@@ -527,7 +529,7 @@ mod tests {
                 .unwrap();
             namespace = repos
                 .namespaces()
-                .create("load_parquet_files", "", topic.id, query_pool.id)
+                .create("load_parquet_files", None, topic.id, query_pool.id)
                 .await
                 .unwrap();
             table = repos

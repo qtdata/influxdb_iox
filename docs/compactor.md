@@ -35,9 +35,11 @@ In the case the Compactor cannot compact the smallest set of files of a partitio
 Even though we have tried to avoid OOMs by estimating needed memory, it still happens in extreme cases. Currently, OOMs in compactor won't be resolved by themselves without human actions because the compactor will likely choose the same heavy partitions to compact after it is restarted. The easiest way to stop OOMs is to increase memory. Doubling memory or even more is recommended. We can bring the memory down after all the high volume partitions are compacted.
 
 If increasing memory a lot does not help, consider changing one or a combination of config parameters below but please be aware that by choosing to do this, you may be telling the compactor that it has a lot less memory budget to use and it will push one or many partitions into the `skipped_compactions` list. Moreover, reducing memory budget also means reducing the concurrency capacity of the compactor. It is recommended that you do not try this unless you know the workload of the compactor very well.
+- `INFLUXDB_IOX_COMPACTION_MAX_PARALLEL_PARTITIONS`: Reduce this value in half or more. This will put a hard cap on the maximun number of partitions to be compacted in parallel. This will help reduce both CPU and memory usage a lot and should be your first choice to adjust.
 - `INFLUXDB_IOX_COMPACTION_MIN_ROWS_PER_RECORD_BATCH_TO_PLAN`: double or triple this value. This will tell the compactor the compaction plans need more memory, and will reduce the number of files that can be compacted at once
+- `INFLUXDB_IOX_COMPACTION_MEMORY_BUDGET_BYTES`: reduce this value in half or more. This tells the compactor its total budget is less so it will reduce the number of partitions it can compact concurrently or reduce the number of files to be compacted for a partition.
 - `INFLUXDB_IOX_COMPACTION_MAX_COMPACTING_FILES`: reduce this value in half or more. This puts a hard cap on the maximum number of files of a partition it can compact, even if its memory budget estimate would allow for more.
-- `INFLUXDB_IOX_COMPACTION_MEMORY_BUDGET_BYTES`: reduce this value in half or more. This tells the compact its total budget is less so it will reduce the number of partitions it can compact concurrently or reduce the number of files to be compacted for a partition.
+- `INFLUXDB_IOX_COMPACTION_MAX_COMPACTING_FILES_FIRST_IN_PARTITION`: This should be the last choice to adjust. Reduce this value in half or more but this action only helps if the number of L1s that overlap with the first L0 are large. This is similar to `INFLUXDB_IOX_COMPACTION_MAX_COMPACTING_FILES` but on the set of files that the compactor must compact first for a partition. If the number of files in this set is larger than the settings, the compactor will ignore compacting this partition and put it in `skipped_comapctions` catalog table.
 
 # Compactor Config Parameters
 
@@ -202,19 +204,19 @@ WHERE partition.id = skipped_compactions.partition_id and partition.shard_id = s
 ORDER BY shard_index, table_id, partition_key, skipped_at;
 
 -- Number of files per level for top 50 partitions with most files of a specified day
-SELECT s.shard_index, pf.table_id, partition_id, partition_key,
-   count(case when to_delete is null then 1 end) total_not_deleted,
-   count(case when compaction_level=0 and to_delete is null then 1 end) num_l0,
-   count(case when compaction_level=1 and to_delete is null then 1 end) num_l1,
-   count(case when compaction_level=2 and to_delete is null then 1 end) num_l2 ,
-   count(case when compaction_level=0 and to_delete is not null then 1 end) deleted_num_l0,
-   count(case when compaction_level=1 and to_delete is not null then 1 end) deleted_num_l1,
-   count(case when compaction_level=2 and to_delete is not null then 1 end) deleted_num_l2
+SELECT s.shard_index, pf.table_id, pf.partition_id, p.partition_key,
+   count(case when pf.to_delete is null then 1 end) total_not_deleted,
+   count(case when pf.compaction_level=0 and pf.to_delete is null then 1 end) num_l0,
+   count(case when pf.compaction_level=1 and pf.to_delete is null then 1 end) num_l1,
+   count(case when pf.compaction_level=2 and pf.to_delete is null then 1 end) num_l2 ,
+   count(case when pf.compaction_level=0 and pf.to_delete is not null then 1 end) deleted_num_l0,
+   count(case when pf.compaction_level=1 and pf.to_delete is not null then 1 end) deleted_num_l1,
+   count(case when pf.compaction_level=2 and pf.to_delete is not null then 1 end) deleted_num_l2
 FROM parquet_file pf, partition p, shard s
 WHERE pf.partition_id = p.id AND pf.shard_id = s.id
-  AND partition_key = '2022-10-11'
-GROUP BY s.shard_index, pf.table_id, partition_id, partition_key
-ORDER BY count(case when to_delete is null then 1 end) DESC
+  AND p.partition_key = '2022-10-11'
+GROUP BY s.shard_index, pf.table_id, pf.partition_id, p.partition_key
+ORDER BY count(case when pf.to_delete is null then 1 end) DESC
 LIMIT 50;
 
 -- Partitions with level-0 files ingested within the last 4 hours

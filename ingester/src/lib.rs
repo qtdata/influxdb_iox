@@ -18,16 +18,19 @@
 )]
 
 mod arcmap;
+mod buffer_tree;
 pub(crate) mod compact;
 pub mod data;
+mod deferred_load;
+mod dml_sink;
 pub mod handler;
 mod job;
 pub mod lifecycle;
 mod poison;
 pub mod querier_handler;
 pub(crate) mod query_adaptor;
+mod sequence_range;
 pub mod server;
 pub(crate) mod stream_handler;
-
 #[cfg(test)]
 pub(crate) mod test_util;

@@ -39,16 +39,22 @@ pub async fn compact(compactor: Arc<Compactor>, do_full_compact: bool) -> usize 
 
     let start_time = compactor.time_provider.now();
 
+    debug!("Start cold compaction first step (L0+L1 -> L1)");
+
     // Compact any remaining level 0 files in parallel
     compact_candidates_with_memory_budget(
         Arc::clone(&compactor),
         compaction_type,
         CompactionLevel::Initial,
+        CompactionLevel::FileNonOverlapped,
         compact_in_parallel,
         true, // split
         candidates.clone().into(),
     )
     .await;
+
+    debug!("Finish cold compaction first step");
+    debug!("Start cold compaction second step (L1+L2 -> L2)");
 
     if do_full_compact {
         //Compact level 1 files in parallel ("full compaction")
@@ -56,12 +62,14 @@ pub async fn compact(compactor: Arc<Compactor>, do_full_compact: bool) -> usize 
             Arc::clone(&compactor),
             compaction_type,
             CompactionLevel::FileNonOverlapped,
+            CompactionLevel::Final,
             compact_in_parallel,
             true, // split
             candidates.into(),
         )
         .await;
     }
+    debug!("Finish cold compaction second step");
 
     // Done compacting all candidates in the cycle, record its time
     if let Some(delta) = compactor
@@ -100,8 +108,8 @@ pub(crate) enum Error {
 mod tests {
     use super::*;
     use crate::{
-        compact_one_partition, handler::CompactorConfig, parquet_file_filtering,
-        ParquetFilesForCompaction,
+        compact::ShardAssignment, compact_one_partition, handler::CompactorConfig,
+        parquet_file_filtering, ParquetFilesForCompaction,
     };
     use ::parquet_file::storage::ParquetStorage;
     use arrow_util::assert_batches_sorted_eq;
@@ -111,6 +119,10 @@ mod tests {
     use iox_time::{SystemProvider, TimeProvider};
     use parquet_file::storage::StorageId;
     use std::collections::HashMap;
+
+    const DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_1: u64 = 4;
+    const DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_2: u64 = 24;
+    const DEFAULT_MAX_PARALLEL_PARTITIONS: u64 = 20;
 
     #[tokio::test]
     async fn test_compact_remaining_level_0_files_many_files() {
@@ -161,7 +173,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -176,7 +188,7 @@ mod tests {
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -292,6 +304,7 @@ mod tests {
             level_1,
             compactor.config.memory_budget_bytes,
             compactor.config.max_num_compacting_files,
+            compactor.config.max_num_compacting_files_first_in_partition,
             compactor.config.max_desired_file_size_bytes,
             &compactor.parquet_file_candidate_gauge,
             &compactor.parquet_file_candidate_bytes,
@@ -400,7 +413,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -415,7 +428,7 @@ mod tests {
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -487,6 +500,7 @@ mod tests {
             level_1,
             compactor.config.memory_budget_bytes,
             compactor.config.max_num_compacting_files,
+            compactor.config.max_num_compacting_files_first_in_partition,
             compactor.config.max_desired_file_size_bytes,
             &compactor.parquet_file_candidate_gauge,
             &compactor.parquet_file_candidate_bytes,
@@ -580,6 +594,7 @@ mod tests {
             level_2,
             compactor.config.memory_budget_bytes,
             compactor.config.max_num_compacting_files,
+            compactor.config.max_num_compacting_files_first_in_partition,
             compactor.config.max_desired_file_size_bytes,
             &compactor.parquet_file_candidate_gauge,
             &compactor.parquet_file_candidate_bytes,
@@ -628,7 +643,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -640,7 +655,7 @@ mod tests {
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Arc::new(Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -697,10 +712,17 @@ mod tests {
             max_number_partitions_per_shard: 1,
             min_number_recent_ingested_files_per_partition: 1,
             hot_multiple: 4,
+            warm_multiple: 1,
             memory_budget_bytes: 100_000_000,
             min_num_rows_allocated_per_record_batch_to_datafusion_plan: 1,
             max_num_compacting_files: 20,
+            max_num_compacting_files_first_in_partition: 40,
             minutes_without_new_writes_to_be_cold: 10,
+            hot_compaction_hours_threshold_1: DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_1,
+            hot_compaction_hours_threshold_2: DEFAULT_HOT_COMPACTION_HOURS_THRESHOLD_2,
+            max_parallel_partitions: DEFAULT_MAX_PARALLEL_PARTITIONS,
+            warm_compaction_small_size_threshold_bytes: 5_000,
+            warm_compaction_min_small_file_count: 10,
         }
     }
 
@@ -724,6 +746,7 @@ mod tests {
             Arc::clone(&compactor),
             "cold",
             CompactionLevel::Initial,
+            CompactionLevel::FileNonOverlapped,
             compact_in_parallel,
             false, // no split
             candidates.clone().into(),
@@ -772,6 +795,7 @@ mod tests {
             Arc::clone(&compactor),
             "cold",
             CompactionLevel::Initial,
+            CompactionLevel::FileNonOverlapped,
             compact_in_parallel,
             true, // split
             candidates.clone().into(),
@@ -896,7 +920,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -915,7 +939,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Arc::new(Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -1001,7 +1025,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -1020,7 +1044,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Arc::new(Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -1141,7 +1165,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -1160,7 +1184,7 @@ mod tests {
 
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Arc::new(Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),
@@ -1391,7 +1415,7 @@ mod tests {
         ]
         .join("\n");
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let shard = ns.create_shard(1).await;
         let table = ns.create_table("table").await;
         table.create_column("field_int", ColumnType::I64).await;
@@ -1406,7 +1430,7 @@ mod tests {
         let config = make_compactor_config();
         let metrics = Arc::new(metric::Registry::new());
         let compactor = Arc::new(Compactor::new(
-            vec![shard.shard.id],
+            ShardAssignment::Only(vec![shard.shard.id]),
             Arc::clone(&catalog.catalog),
             ParquetStorage::new(Arc::clone(&catalog.object_store), StorageId::from("iox")),
             catalog.exec(),

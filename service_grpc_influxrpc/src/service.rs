@@ -1,23 +1,29 @@
 //! This module contains implementations for the storage gRPC service
-//! implemented in terms of the [`QueryDatabase`](iox_query::QueryDatabase).
+//! implemented in terms of the [`QueryNamespace`](iox_query::QueryNamespace).
 
 use super::{TAG_KEY_FIELD, TAG_KEY_MEASUREMENT};
 use crate::{
     data::{
-        fieldlist_to_measurement_fields_response, series_or_groups_to_read_response,
-        tag_keys_to_byte_vecs,
+        fieldlist_to_measurement_fields_response, series_or_groups_to_frames, tag_keys_to_byte_vecs,
     },
     expr::{self, DecodedTagKey, GroupByAndAggregate, InfluxRpcPredicateBuilder, Loggable},
     input::GrpcInputs,
+    permit::StreamWithPermit,
+    query_completed_token::QueryCompletedTokenStream,
+    response_chunking::ChunkReadResponses,
     StorageService,
 };
-use data_types::{org_and_bucket_to_database, DatabaseName};
+use data_types::{org_and_bucket_to_namespace, NamespaceName};
 use datafusion::error::DataFusionError;
-use futures::Stream;
+use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::{
-    google::protobuf::Empty, literal_or_regex::Value as RegexOrLiteralValue,
-    offsets_response::PartitionOffsetResponse, storage_server::Storage, tag_key_predicate,
-    CapabilitiesResponse, Capability, Int64ValuesResponse, LiteralOrRegex,
+    google::protobuf::{Any as ProtoAny, Empty},
+    influxdata::platform::errors::InfluxDbError,
+    literal_or_regex::Value as RegexOrLiteralValue,
+    offsets_response::PartitionOffsetResponse,
+    read_response::Frame,
+    storage_server::Storage,
+    tag_key_predicate, CapabilitiesResponse, Capability, Int64ValuesResponse, LiteralOrRegex,
     MeasurementFieldsRequest, MeasurementFieldsResponse, MeasurementNamesRequest,
     MeasurementTagKeysRequest, MeasurementTagValuesRequest, OffsetsResponse, Predicate,
     ReadFilterRequest, ReadGroupRequest, ReadResponse, ReadSeriesCardinalityRequest,
@@ -30,72 +36,78 @@ use iox_query::{
         fieldlist::FieldList, seriesset::converter::Error as SeriesSetError,
         ExecutionContextProvider, IOxSessionContext,
     },
-    QueryDatabase, QueryText,
+    QueryCompletedToken, QueryNamespace, QueryText,
 };
 use observability_deps::tracing::{error, info, trace};
-use pin_project::pin_project;
-use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryDatabaseProvider};
+use prost::{bytes::BytesMut, Message};
+use service_common::{datafusion_error_to_tonic_code, planner::Planner, QueryNamespaceProvider};
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::{
     collections::{BTreeSet, HashMap},
+    fmt::{Display, Formatter, Result as FmtResult},
     sync::Arc,
 };
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tonic::{metadata::MetadataMap, Status};
+use tonic::{metadata::MetadataMap, Response, Status};
 use trace::{ctx::SpanContext, span::SpanExt};
 use trace_http::ctx::{RequestLogContext, RequestLogContextExt};
 use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 
+/// The size to which we limit our [`ReadResponse`] payloads.
+///
+/// We will regroup the returned frames (preserving order) to only produce [`ReadResponse`] objects of approximately
+/// this size (there's a bit of additional encoding overhead on top of that, but that should be OK).
+const MAX_READ_RESPONSE_SIZE: usize = 4194304 - 100_000; // 4MB - <wiggle room>
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Database not found: {}", db_name))]
-    DatabaseNotFound { db_name: String },
+    #[snafu(display("Namespace not found: {}", db_name))]
+    NamespaceNotFound { db_name: String },
 
-    #[snafu(display("Error listing tables in database '{}': {}", db_name, source))]
+    #[snafu(display("Error listing tables in namespace '{}': {}", db_name, source))]
     ListingTables {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error listing columns in database '{}': {}", db_name, source))]
+    #[snafu(display("Error listing columns in namespace '{}': {}", db_name, source))]
     ListingColumns {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error listing fields in database '{}': {}", db_name, source))]
+    #[snafu(display("Error listing fields in namespace '{}': {}", db_name, source))]
     ListingFields {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error creating series plans for database '{}': {}", db_name, source))]
+    #[snafu(display("Error creating series plans for namespace '{}': {}", db_name, source))]
     PlanningFilteringSeries {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error creating group plans for database '{}': {}", db_name, source))]
+    #[snafu(display("Error creating group plans for namespace '{}': {}", db_name, source))]
     PlanningGroupSeries {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error running series plans for database '{}': {}", db_name, source))]
+    #[snafu(display("Error running series plans for namespace '{}': {}", db_name, source))]
     FilteringSeries {
         db_name: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Error running grouping plans for database '{}': {}", db_name, source))]
+    #[snafu(display("Error running grouping plans for namespace '{}': {}", db_name, source))]
     GroupingSeries {
         db_name: String,
         source: DataFusionError,
     },
 
     #[snafu(display(
-        "Can not retrieve tag values for '{}' in database '{}': {}",
+        "Can not retrieve tag values for '{}' in namespace '{}': {}",
         tag_name,
         db_name,
         source
@@ -173,7 +185,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-impl From<Error> for tonic::Status {
+impl From<Error> for Status {
     /// Converts a result from the business logic into the appropriate tonic
     /// status
     fn from(err: Error) -> Self {
@@ -185,11 +197,11 @@ impl From<Error> for tonic::Status {
 impl Error {
     /// Converts a result from the business logic into the appropriate tonic
     /// status
-    fn into_status(self) -> tonic::Status {
+    fn into_status(self) -> Status {
         let msg = self.to_string();
 
         let code = match self {
-            Self::DatabaseNotFound { .. } => tonic::Code::NotFound,
+            Self::NamespaceNotFound { .. } => tonic::Code::NotFound,
             Self::ListingTables { source, .. }
             | Self::ListingColumns { source, .. }
             | Self::ListingFields { source, .. }
@@ -214,9 +226,101 @@ impl Error {
             Self::NotYetImplemented { .. } => tonic::Code::Unimplemented,
         };
 
-        let mut status = tonic::Status::new(code, msg);
-        add_headers(status.metadata_mut());
-        status
+        // InfluxRPC clients expect an instance of InfluxDbError
+        // (or another error type from platform.influxdata.errors)
+        // to appear in the `details` field of the gRPC status, which
+        // helps the client determine if the error should be
+        // displayed to users, is retryable, etc.
+        let influxdb_error = InfluxDbError {
+            code: InfluxCode::from(code).to_string(),
+            message: msg.clone(),
+            op: "iox/influxrpc".to_string(),
+            error: None,
+        };
+        let mut err_bytes = BytesMut::new();
+        match influxdb_error.encode(&mut err_bytes) {
+            Ok(()) => (),
+            Err(e) => {
+                error!(e=%e, "failed to serialized InfluxDBError");
+                return Status::unknown(format!("failed to serialize InfluxDB error: {}", e));
+            }
+        }
+
+        let any_err = ProtoAny {
+            type_url: generated_types::protobuf_type_url(
+                "influxdata.platform.errors.InfluxDBError",
+            ),
+            value: err_bytes.freeze(),
+        };
+
+        let mut tonic_status = generated_types::google::encode_status(code, msg, any_err);
+        add_headers(tonic_status.metadata_mut());
+        tonic_status
+    }
+}
+
+/// These are the set of error codes that can appear in an InfluxDBError.
+/// Taken from here:
+/// <https://github.com/influxdata/idpe/blob/master/pkg/influxerror/errors.go>
+/// Disabling Clippy warning about variant names so that they can match what
+/// is in idpe.
+#[allow(clippy::enum_variant_names)]
+enum InfluxCode {
+    EInternal,
+    ENotFound,
+    EConflict,
+    EInvalid,
+    // EUnprocessableEntity,
+    // EEmptyValue,
+    EUnavailable,
+    // EForbidden,
+    // ETooManyRequests,
+    EUnauthorized,
+    // EMethodNotAllowed,
+    ETooLarge,
+    ENotImplemented,
+    // EUpstreamServer,
+    ERequestCanceled,
+}
+
+impl Display for InfluxCode {
+    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+        let str = match self {
+            InfluxCode::EInternal => "internal error",
+            InfluxCode::ENotFound => "not found",
+            InfluxCode::EConflict => "conflict",
+            InfluxCode::EInvalid => "invalid",
+            // InfluxCode::EUnprocessableEntity => "unprocessable entity",
+            // InfluxCode::EEmptyValue => "empty value",
+            InfluxCode::EUnavailable => "unavailable",
+            // InfluxCode::EForbidden => "forbidden",
+            // InfluxCode::ETooManyRequests => "too many requests",
+            InfluxCode::EUnauthorized => "unauthorized",
+            // InfluxCode::EMethodNotAllowed => "method not allowed",
+            InfluxCode::ETooLarge => "request too large",
+            InfluxCode::ENotImplemented => "not implemented",
+            // InfluxCode::EUpstreamServer => "upstream server",
+            InfluxCode::ERequestCanceled => "request canceled",
+        };
+        f.write_str(str)
+    }
+}
+
+impl From<tonic::Code> for InfluxCode {
+    fn from(tonic_code: tonic::Code) -> InfluxCode {
+        match tonic_code {
+            tonic::Code::Cancelled => InfluxCode::ERequestCanceled,
+            tonic::Code::InvalidArgument => InfluxCode::EInvalid,
+            tonic::Code::NotFound => InfluxCode::ENotFound,
+            tonic::Code::AlreadyExists => InfluxCode::EConflict,
+            tonic::Code::PermissionDenied => InfluxCode::EUnauthorized,
+            tonic::Code::ResourceExhausted => InfluxCode::ETooLarge,
+            tonic::Code::FailedPrecondition => InfluxCode::EInvalid,
+            tonic::Code::OutOfRange => InfluxCode::EInvalid,
+            tonic::Code::Unimplemented => InfluxCode::ENotImplemented,
+            tonic::Code::Unavailable => InfluxCode::EUnavailable,
+            _ => InfluxCode::EInternal,
+        }
     }
 }
 
@@ -230,19 +334,19 @@ fn add_headers(metadata: &mut MetadataMap) {
     metadata.insert("storage-type", "iox".parse().unwrap());
 }
 
-/// Implements the protobuf defined Storage service for a DatabaseStore
+/// Implements the protobuf defined Storage service for a [`QueryNamespaceProvider`]
 #[tonic::async_trait]
 impl<T> Storage for StorageService<T>
 where
-    T: QueryDatabaseProvider + 'static,
+    T: QueryNamespaceProvider + 'static,
 {
     type ReadFilterStream =
-        StreamWithPermit<futures::stream::Iter<std::vec::IntoIter<Result<ReadResponse, Status>>>>;
+        StreamWithPermit<QueryCompletedTokenStream<ChunkReadResponses, ReadResponse, Status>>;
 
     async fn read_filter(
         &self,
         req: tonic::Request<ReadFilterRequest>,
-    ) -> Result<tonic::Response<Self::ReadFilterStream>, Status> {
+    ) -> Result<Response<Self::ReadFilterStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
@@ -251,7 +355,7 @@ where
             .db_store
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -264,31 +368,29 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token = db.record_query(&ctx, "read_filter", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "read_filter", defer_json(&req));
 
-        let results = read_filter_impl(Arc::clone(&db), db_name, req, &ctx)
+        let frames = read_filter_impl(Arc::clone(&db), db_name, req, &ctx)
             .await?
-            .into_iter()
-            .map(Ok)
-            .collect::<Vec<_>>();
+            .map_err(|e| e.into_status());
 
-        if results.iter().all(|r| r.is_ok()) {
-            query_completed_token.set_success();
-        }
-
-        make_response(futures::stream::iter(results), permit)
+        make_response(
+            ChunkReadResponses::new(frames, MAX_READ_RESPONSE_SIZE),
+            query_completed_token,
+            permit,
+        )
     }
 
     type ReadGroupStream =
-        StreamWithPermit<futures::stream::Iter<std::vec::IntoIter<Result<ReadResponse, Status>>>>;
+        StreamWithPermit<QueryCompletedTokenStream<ChunkReadResponses, ReadResponse, Status>>;
 
     async fn read_group(
         &self,
         req: tonic::Request<ReadGroupRequest>,
-    ) -> Result<tonic::Response<Self::ReadGroupStream>, Status> {
+    ) -> Result<Response<Self::ReadGroupStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
         let req = req.into_inner();
@@ -297,7 +399,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
 
         info!(
             %db_name,
@@ -314,10 +416,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token = db.record_query(&ctx, "read_group", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "read_group", defer_json(&req));
 
         let ReadGroupRequest {
             read_source: _read_source,
@@ -340,7 +442,7 @@ where
         let gby_agg = expr::make_read_group_aggregate(aggregate, group, group_keys)
             .context(ConvertingReadGroupAggregateSnafu { aggregate_string })?;
 
-        let results = query_group_impl(
+        let frames = query_group_impl(
             Arc::clone(&db),
             db_name,
             range,
@@ -351,24 +453,22 @@ where
         )
         .await
         .map_err(|e| e.into_status())?
-        .into_iter()
-        .map(Ok)
-        .collect::<Vec<_>>();
+        .map_err(|e| e.into_status());
 
-        if results.iter().all(|r| r.is_ok()) {
-            query_completed_token.set_success();
-        }
-
-        make_response(futures::stream::iter(results), permit)
+        make_response(
+            ChunkReadResponses::new(frames, MAX_READ_RESPONSE_SIZE),
+            query_completed_token,
+            permit,
+        )
     }
 
     type ReadWindowAggregateStream =
-        StreamWithPermit<futures::stream::Iter<std::vec::IntoIter<Result<ReadResponse, Status>>>>;
+        StreamWithPermit<QueryCompletedTokenStream<ChunkReadResponses, ReadResponse, Status>>;
 
     async fn read_window_aggregate(
         &self,
         req: tonic::Request<ReadWindowAggregateRequest>,
-    ) -> Result<tonic::Response<Self::ReadGroupStream>, Status> {
+    ) -> Result<Response<Self::ReadGroupStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
         let req = req.into_inner();
@@ -377,7 +477,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -394,10 +494,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token =
+        let query_completed_token =
             db.record_query(&ctx, "read_window_aggregate", defer_json(&req));
 
         let ReadWindowAggregateRequest {
@@ -419,7 +519,7 @@ where
         let gby_agg = expr::make_read_window_aggregate(aggregate, window_every, offset, window)
             .context(ConvertingWindowAggregateSnafu { aggregate_string })?;
 
-        let results = query_group_impl(
+        let frames = query_group_impl(
             Arc::clone(&db),
             db_name,
             range,
@@ -430,26 +530,29 @@ where
         )
         .await
         .map_err(|e| e.into_status())?
-        .into_iter()
-        .map(Ok)
-        .collect::<Vec<_>>();
+        .map_err(|e| e.into_status());
 
-        if results.iter().all(|r| r.is_ok()) {
-            query_completed_token.set_success();
-        }
-
-        make_response(futures::stream::iter(results), permit)
+        make_response(
+            ChunkReadResponses::new(frames, MAX_READ_RESPONSE_SIZE),
+            query_completed_token,
+            permit,
+        )
     }
 
-    type TagKeysStream = StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
+    type TagKeysStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<StringValuesResponse, Status>>,
+            StringValuesResponse,
+            Status,
+        >,
+    >;
 
     async fn tag_keys(
         &self,
         req: tonic::Request<TagKeysRequest>,
-    ) -> Result<tonic::Response<Self::TagKeysStream>, Status> {
+    ) -> Result<Response<Self::TagKeysStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -457,7 +560,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -470,10 +573,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token = db.record_query(&ctx, "tag_keys", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "tag_keys", defer_json(&req));
 
         let TagKeysRequest {
             tags_source: _tag_source,
@@ -494,26 +597,27 @@ where
         .await
         .map_err(|e| e.into_status());
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending tag_keys response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
-    type TagValuesStream = StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
+    type TagValuesStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<StringValuesResponse, Status>>,
+            StringValuesResponse,
+            Status,
+        >,
+    >;
 
     async fn tag_values(
         &self,
         req: tonic::Request<TagValuesRequest>,
-    ) -> Result<tonic::Response<Self::TagValuesStream>, Status> {
+    ) -> Result<Response<Self::TagValuesStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -521,7 +625,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         let tag_key = DecodedTagKey::try_from(req.tag_key.clone())
             .context(ConvertingTagKeyInTagValuesSnafu)?;
         info!(
@@ -537,10 +641,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token = db.record_query(&ctx, "tag_values", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "tag_values", defer_json(&req));
 
         let TagValuesRequest {
             tags_source: _tag_source,
@@ -595,25 +699,25 @@ where
 
         let response = response.map_err(|e| e.into_status());
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending tag_values response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
     type TagValuesGroupedByMeasurementAndTagKeyStream = StreamWithPermit<
-        futures::stream::Iter<std::vec::IntoIter<Result<TagValuesResponse, Status>>>,
+        QueryCompletedTokenStream<
+            futures::stream::Iter<std::vec::IntoIter<Result<TagValuesResponse, Status>>>,
+            TagValuesResponse,
+            Status,
+        >,
     >;
 
     async fn tag_values_grouped_by_measurement_and_tag_key(
         &self,
         req: tonic::Request<TagValuesGroupedByMeasurementAndTagKeyRequest>,
-    ) -> Result<tonic::Response<Self::TagValuesGroupedByMeasurementAndTagKeyStream>, Status> {
+    ) -> Result<Response<Self::TagValuesGroupedByMeasurementAndTagKeyStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
@@ -623,7 +727,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.measurement_patterns,
@@ -637,10 +741,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token = db.record_query(
+        let query_completed_token = db.record_query(
             &ctx,
             "tag_values_grouped_by_measurement_and_tag_key",
             defer_json(&req),
@@ -654,11 +758,11 @@ where
                 .map(Ok)
                 .collect::<Vec<_>>();
 
-        if results.iter().all(|r| r.is_ok()) {
-            query_completed_token.set_success();
-        }
-
-        make_response(futures::stream::iter(results), permit)
+        make_response(
+            futures::stream::iter(results),
+            query_completed_token,
+            permit,
+        )
     }
 
     type ReadSeriesCardinalityStream = ReceiverStream<Result<Int64ValuesResponse, Status>>;
@@ -666,14 +770,14 @@ where
     async fn read_series_cardinality(
         &self,
         _req: tonic::Request<ReadSeriesCardinalityRequest>,
-    ) -> Result<tonic::Response<Self::ReadSeriesCardinalityStream>, Status> {
+    ) -> Result<Response<Self::ReadSeriesCardinalityStream>, Status> {
         unimplemented!("read_series_cardinality not yet implemented. https://github.com/influxdata/influxdb_iox/issues/447");
     }
 
     async fn capabilities(
         &self,
         _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<CapabilitiesResponse>, Status> {
+    ) -> Result<Response<CapabilitiesResponse>, Status> {
         // Full list of go capabilities in
         // idpe/storage/read/capabilities.go (aka window aggregate /
         // pushdown)
@@ -709,19 +813,23 @@ where
             .collect::<HashMap<String, Capability>>();
 
         let caps = CapabilitiesResponse { caps };
-        Ok(tonic::Response::new(caps))
+        Ok(Response::new(caps))
     }
 
-    type MeasurementNamesStream =
-        StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
+    type MeasurementNamesStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<StringValuesResponse, Status>>,
+            StringValuesResponse,
+            Status,
+        >,
+    >;
 
     async fn measurement_names(
         &self,
         req: tonic::Request<MeasurementNamesRequest>,
-    ) -> Result<tonic::Response<Self::MeasurementNamesStream>, Status> {
+    ) -> Result<Response<Self::MeasurementNamesStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -729,7 +837,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -742,11 +850,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token =
-            db.record_query(&ctx, "measurement_names", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "measurement_names", defer_json(&req));
 
         let MeasurementNamesRequest {
             source: _source,
@@ -758,27 +865,27 @@ where
             .await
             .map_err(|e| e.into_status());
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending measurement names response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
-    type MeasurementTagKeysStream =
-        StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
+    type MeasurementTagKeysStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<StringValuesResponse, Status>>,
+            StringValuesResponse,
+            Status,
+        >,
+    >;
 
     async fn measurement_tag_keys(
         &self,
         req: tonic::Request<MeasurementTagKeysRequest>,
-    ) -> Result<tonic::Response<Self::MeasurementTagKeysStream>, Status> {
+    ) -> Result<Response<Self::MeasurementTagKeysStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -786,7 +893,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -800,11 +907,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token =
-            db.record_query(&ctx, "measurement_tag_keys", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "measurement_tag_keys", defer_json(&req));
 
         let MeasurementTagKeysRequest {
             source: _source,
@@ -826,27 +932,27 @@ where
         .await
         .map_err(|e| e.into_status());
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending measurement_tag_keys response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
-    type MeasurementTagValuesStream =
-        StreamWithPermit<ReceiverStream<Result<StringValuesResponse, Status>>>;
+    type MeasurementTagValuesStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<StringValuesResponse, Status>>,
+            StringValuesResponse,
+            Status,
+        >,
+    >;
 
     async fn measurement_tag_values(
         &self,
         req: tonic::Request<MeasurementTagValuesRequest>,
-    ) -> Result<tonic::Response<Self::MeasurementTagValuesStream>, Status> {
+    ) -> Result<Response<Self::MeasurementTagValuesStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -854,7 +960,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -869,10 +975,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token =
+        let query_completed_token =
             db.record_query(&ctx, "measurement_tag_values", defer_json(&req));
 
         let MeasurementTagValuesRequest {
@@ -897,27 +1003,27 @@ where
         .await
         .map_err(|e| e.into_status());
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending measurement_tag_values response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
-    type MeasurementFieldsStream =
-        StreamWithPermit<ReceiverStream<Result<MeasurementFieldsResponse, Status>>>;
+    type MeasurementFieldsStream = StreamWithPermit<
+        QueryCompletedTokenStream<
+            BoxStream<'static, Result<MeasurementFieldsResponse, Status>>,
+            MeasurementFieldsResponse,
+            Status,
+        >,
+    >;
 
     async fn measurement_fields(
         &self,
         req: tonic::Request<MeasurementFieldsRequest>,
-    ) -> Result<tonic::Response<Self::MeasurementFieldsStream>, Status> {
+    ) -> Result<Response<Self::MeasurementFieldsStream>, Status> {
         let external_span_ctx: Option<RequestLogContext> = req.extensions().get().cloned();
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
-        let (tx, rx) = mpsc::channel(4);
 
         let req = req.into_inner();
         let permit = self
@@ -925,7 +1031,7 @@ where
             .acquire_semaphore(span_ctx.child_span("query rate limit semaphore"))
             .await;
 
-        let db_name = get_database_name(&req)?;
+        let db_name = get_namespace_name(&req)?;
         info!(
             %db_name,
             ?req.range,
@@ -939,11 +1045,10 @@ where
             .db_store
             .db(&db_name, span_ctx.child_span("get namespace"))
             .await
-            .context(DatabaseNotFoundSnafu { db_name: &db_name })?;
+            .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
         let ctx = db.new_query_context(span_ctx);
-        let mut query_completed_token =
-            db.record_query(&ctx, "measurement_fields", defer_json(&req));
+        let query_completed_token = db.record_query(&ctx, "measurement_fields", defer_json(&req));
 
         let MeasurementFieldsRequest {
             source: _source,
@@ -970,32 +1075,28 @@ where
         })
         .map_err(|e| e.into_status())?;
 
-        if response.is_ok() {
-            query_completed_token.set_success();
-        }
-
-        tx.send(response)
-            .await
-            .expect("sending measurement_fields response to server");
-
-        make_response(ReceiverStream::new(rx), permit)
+        make_response(
+            futures::stream::once(async move { response }).boxed(),
+            query_completed_token,
+            permit,
+        )
     }
 
     async fn offsets(
         &self,
         _req: tonic::Request<Empty>,
-    ) -> Result<tonic::Response<OffsetsResponse>, Status> {
+    ) -> Result<Response<OffsetsResponse>, Status> {
         // We present ourselves to the rest of IDPE as a single storage node with 1 partition.
         // (Returning offset 1 just in case offset 0 is interpreted by query nodes as being special)
         let the_partition = PartitionOffsetResponse { id: 0, offset: 1 };
-        Ok(tonic::Response::new(OffsetsResponse {
+        Ok(Response::new(OffsetsResponse {
             partitions: vec![the_partition],
         }))
     }
 }
 
-fn get_database_name(input: &impl GrpcInputs) -> Result<DatabaseName<'static>, Status> {
-    org_and_bucket_to_database(input.org_id()?.to_string(), &input.bucket_name()?)
+fn get_namespace_name(input: &impl GrpcInputs) -> Result<NamespaceName<'static>, Status> {
+    org_and_bucket_to_namespace(input.org_id()?.to_string(), &input.bucket_name()?)
         .map_err(|e| Status::internal(e.to_string()))
 }
 
@@ -1006,15 +1107,15 @@ fn get_database_name(input: &impl GrpcInputs) -> Result<DatabaseName<'static>, S
 
 /// Gathers all measurement names that have data in the specified
 /// (optional) range
-async fn measurement_name_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn measurement_name_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     range: Option<TimestampRange>,
     rpc_predicate: Option<Predicate>,
     ctx: &IOxSessionContext,
 ) -> Result<StringValuesResponse>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let rpc_predicate_string = format!("{:?}", rpc_predicate);
     let db_name = db_name.as_str();
@@ -1049,16 +1150,16 @@ where
 
 /// Return tag keys with optional measurement, timestamp and arbitrary
 /// predicates
-async fn tag_keys_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn tag_keys_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     measurement: Option<String>,
     range: Option<TimestampRange>,
     rpc_predicate: Option<Predicate>,
     ctx: &IOxSessionContext,
 ) -> Result<StringValuesResponse>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let rpc_predicate_string = format!("{:?}", rpc_predicate);
     let db_name = db_name.as_str();
@@ -1091,9 +1192,9 @@ where
 
 /// Return tag values for tag_name, with optional measurement, timestamp and
 /// arbitratry predicates
-async fn tag_values_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn tag_values_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     tag_name: String,
     measurement: Option<String>,
     range: Option<TimestampRange>,
@@ -1101,7 +1202,7 @@ async fn tag_values_impl<D>(
     ctx: &IOxSessionContext,
 ) -> Result<StringValuesResponse>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let rpc_predicate_string = format!("{:?}", rpc_predicate);
 
@@ -1139,14 +1240,14 @@ where
 
 /// Return tag values grouped by one or more measurements with optional
 /// filtering predicate and optionally scoped to one or more tag keys.
-async fn tag_values_grouped_by_measurement_and_tag_key_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn tag_values_grouped_by_measurement_and_tag_key_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     req: TagValuesGroupedByMeasurementAndTagKeyRequest,
     ctx: &IOxSessionContext,
 ) -> Result<Vec<TagValuesResponse>, Error>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     // Extract the tag key predicate.
     // See https://docs.influxdata.com/influxdb/v1.8/query_language/explore-schema/#show-tag-values
@@ -1213,14 +1314,14 @@ where
 }
 
 /// Launch async tasks that materialises the result of executing read_filter.
-async fn read_filter_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn read_filter_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     req: ReadFilterRequest,
     ctx: &IOxSessionContext,
-) -> Result<Vec<ReadResponse>, Error>
+) -> Result<impl Stream<Item = Result<Frame, Error>>, Error>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let db_name = db_name.as_str();
 
@@ -1245,30 +1346,42 @@ where
         .context(PlanningFilteringSeriesSnafu { db_name })?;
 
     // Execute the plans.
+    let db_name = db_name.to_owned();
     let series_or_groups = ctx
-        .to_series_and_groups(series_plan)
+        .to_series_and_groups(
+            series_plan,
+            Arc::clone(&ctx.inner().runtime_env().memory_pool),
+        )
         .await
-        .context(FilteringSeriesSnafu { db_name })
-        .log_if_error("Running series set plan")?;
+        .context(FilteringSeriesSnafu {
+            db_name: db_name.clone(),
+        })
+        .log_if_error("Running series set plan")?
+        .map_err(move |e| Error::FilteringSeries {
+            db_name: db_name.clone(),
+            source: e,
+        });
 
     let emit_tag_keys_binary_format = req.tag_key_meta_names == TagKeyMetaNames::Binary as i32;
-    let response = series_or_groups_to_read_response(series_or_groups, emit_tag_keys_binary_format);
 
-    Ok(vec![response])
+    Ok(series_or_groups_to_frames(
+        series_or_groups,
+        emit_tag_keys_binary_format,
+    ))
 }
 
 /// Launch async tasks that send the result of executing read_group to `tx`
-async fn query_group_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn query_group_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     range: Option<TimestampRange>,
     rpc_predicate: Option<Predicate>,
     gby_agg: GroupByAndAggregate,
     tag_key_meta_names: TagKeyMetaNames,
     ctx: &IOxSessionContext,
-) -> Result<Vec<ReadResponse>, Error>
+) -> Result<impl Stream<Item = Result<Frame, Error>>>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let db_name = db_name.as_str();
 
@@ -1301,30 +1414,42 @@ where
     // if big queries are causing a significant latency in TTFB.
 
     // Execute the plans
+    let db_name = db_name.to_owned();
     let series_or_groups = ctx
-        .to_series_and_groups(grouped_series_set_plan)
+        .to_series_and_groups(
+            grouped_series_set_plan,
+            Arc::clone(&ctx.inner().runtime_env().memory_pool),
+        )
         .await
-        .context(GroupingSeriesSnafu { db_name })
-        .log_if_error("Running Grouped SeriesSet Plan")?;
+        .context(GroupingSeriesSnafu {
+            db_name: db_name.clone(),
+        })
+        .log_if_error("Running Grouped SeriesSet Plan")?
+        .map_err(move |e| Error::FilteringSeries {
+            db_name: db_name.clone(),
+            source: e,
+        });
 
     let tag_key_binary_format = tag_key_meta_names == TagKeyMetaNames::Binary;
-    let response = series_or_groups_to_read_response(series_or_groups, tag_key_binary_format);
 
-    Ok(vec![response])
+    Ok(series_or_groups_to_frames(
+        series_or_groups,
+        tag_key_binary_format,
+    ))
 }
 
 /// Return field names, restricted via optional measurement, timestamp and
 /// predicate
-async fn field_names_impl<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn field_names_impl<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     measurement: Option<String>,
     range: Option<TimestampRange>,
     rpc_predicate: Option<Predicate>,
     ctx: &IOxSessionContext,
 ) -> Result<FieldList>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     let rpc_predicate_string = format!("{:?}", rpc_predicate);
 
@@ -1355,14 +1480,14 @@ where
 
 /// Materialises a collection of measurement names. Typically used as part of
 /// a plan to scope and group multiple plans by measurement name.
-async fn materialise_measurement_names<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn materialise_measurement_names<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     measurement_exprs: Vec<LiteralOrRegex>,
     ctx: &IOxSessionContext,
 ) -> Result<BTreeSet<String>, Error>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     use generated_types::{
         node::{Comparison, Type, Value},
@@ -1433,15 +1558,15 @@ where
 ///
 /// TODO(edd): this might be better represented as a plan against the `columns`
 /// system table.
-async fn materialise_tag_keys<D>(
-    db: Arc<D>,
-    db_name: DatabaseName<'static>,
+async fn materialise_tag_keys<N>(
+    db: Arc<N>,
+    db_name: NamespaceName<'static>,
     measurement_name: String,
     tag_key_predicate: tag_key_predicate::Value,
     ctx: &IOxSessionContext,
 ) -> Result<BTreeSet<String>, Error>
 where
-    D: QueryDatabase + ExecutionContextProvider + 'static,
+    N: QueryNamespace + ExecutionContextProvider + 'static,
 {
     use generated_types::tag_key_predicate::Value;
 
@@ -1527,7 +1652,7 @@ pub trait ErrorLogger {
     /// Log the contents of self with a string of context. The context
     /// should appear in a message such as
     ///
-    /// "Error <context>: <formatted error message>
+    /// "Error `<context>`: `<formatted error message>`
     fn log_if_error(self, context: &str) -> Self;
 
     /// Provided method to log an error via the `error!` macro
@@ -1547,43 +1672,21 @@ impl<T, E: std::fmt::Debug> ErrorLogger for Result<T, E> {
 }
 
 /// Return the stream of results as a gRPC (tonic) response
-pub fn make_response<S>(
+#[allow(clippy::type_complexity)]
+pub fn make_response<S, T, E>(
     stream: S,
+    token: QueryCompletedToken,
     permit: InstrumentedAsyncOwnedSemaphorePermit,
-) -> Result<tonic::Response<StreamWithPermit<S>>, tonic::Status> {
-    let mut response = tonic::Response::new(StreamWithPermit::new(stream, permit));
+) -> Result<Response<StreamWithPermit<QueryCompletedTokenStream<S, T, E>>>, Status>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+{
+    let mut response = Response::new(StreamWithPermit::new(
+        QueryCompletedTokenStream::new(stream, token),
+        permit,
+    ));
     add_headers(response.metadata_mut());
     Ok(response)
-}
-
-/// Helper to keep a semaphore permit attached to a stream.
-#[pin_project]
-pub struct StreamWithPermit<S> {
-    #[pin]
-    stream: S,
-    #[allow(dead_code)]
-    permit: InstrumentedAsyncOwnedSemaphorePermit,
-}
-
-impl<S> StreamWithPermit<S> {
-    fn new(stream: S, permit: InstrumentedAsyncOwnedSemaphorePermit) -> Self {
-        Self { stream, permit }
-    }
-}
-
-impl<S> Stream for StreamWithPermit<S>
-where
-    S: Stream,
-{
-    type Item = S::Item;
-
-    fn poll_next(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Option<Self::Item>> {
-        let this = self.project();
-        this.stream.poll_next(cx)
-    }
 }
 
 #[cfg(test)]
@@ -1593,7 +1696,10 @@ mod tests {
     use datafusion::prelude::{col, Expr};
     use datafusion_util::lit_dict;
     use futures::Future;
-    use generated_types::{i_ox_testing_client::IOxTestingClient, tag_key_predicate::Value};
+    use generated_types::{
+        google::rpc::Status as GrpcStatus, i_ox_testing_client::IOxTestingClient,
+        tag_key_predicate::Value,
+    };
     use influxdb_storage_client::{
         connection::{Builder as ConnectionBuilder, Connection, GrpcConnection},
         generated_types::*,
@@ -1773,7 +1879,7 @@ mod tests {
     }
 
     /// test the plumbing of the RPC layer for tag_keys -- specifically that
-    /// the right parameters are passed into the Database interface
+    /// the right parameters are passed into the Namespace interface
     /// and that the returned values are sent back via gRPC.
     #[tokio::test]
     async fn test_storage_rpc_tag_keys() {
@@ -1869,7 +1975,7 @@ mod tests {
     }
 
     /// test the plumbing of the RPC layer for measurement_tag_keys--
-    /// specifically that the right parameters are passed into the Database
+    /// specifically that the right parameters are passed into the Namespace
     /// interface and that the returned values are sent back via gRPC.
     #[tokio::test]
     async fn test_storage_rpc_measurement_tag_keys() {
@@ -1976,7 +2082,7 @@ mod tests {
     }
 
     /// test the plumbing of the RPC layer for tag_values -- specifically that
-    /// the right parameters are passed into the Database interface
+    /// the right parameters are passed into the Namespace interface
     /// and that the returned values are sent back via gRPC.
     #[tokio::test]
     async fn test_storage_rpc_tag_values() {
@@ -2505,7 +2611,7 @@ mod tests {
             tag_key: "the_tag_key".into(),
         };
 
-        // Note we don't set the column_names on the test database, so we expect an
+        // Note we don't set the column_names on the test namespace, so we expect an
         // error
         let response_string = fixture
             .storage_client
@@ -2691,6 +2797,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_filter_field_as_tag() {
+        test_helpers::maybe_start_logging();
+        // Start a test gRPC server on a randomally allocated port
+        let mut fixture = Fixture::new().await.expect("Connecting to test server");
+
+        let db_info = org_and_bucket();
+
+        // Add a chunk with a field
+        let chunk = TestChunk::new("TheMeasurement")
+            .with_time_column()
+            .with_tag_column("state")
+            .with_string_field_column_with_stats("fff", None, None)
+            .with_one_row_of_data();
+
+        fixture
+            .test_storage
+            .db_or_create(db_info.db_name())
+            .await
+            .add_chunk("my_partition_key", Arc::new(chunk));
+
+        let source = Some(StorageClient::read_source(&db_info, 1));
+
+        // Create a tag predicate that happens to match the name
+        // of a field.
+        let request = ReadFilterRequest {
+            read_source: source.clone(),
+            range: None,
+            predicate: Some(make_tag_predicate("fff", "MA", node::Comparison::Equal)),
+            ..Default::default()
+        };
+
+        let frames = fixture
+            .storage_client
+            .read_filter(request.clone())
+            .await
+            .unwrap();
+
+        // should return no data because `fff` is not a tag, it is a field.
+        assert_eq!(
+            frames.len(),
+            0,
+            "unexpected frames returned by query_series"
+        );
+
+        grpc_request_metric_has_count(&fixture, "ReadFilter", "ok", 1);
+    }
+
+    #[tokio::test]
     async fn test_read_filter_error() {
         test_helpers::maybe_start_logging();
         // Start a test gRPC server on a randomally allocated port
@@ -2718,7 +2872,7 @@ mod tests {
             ..Default::default()
         };
 
-        // Note we don't set the response on the test database, so we expect an error
+        // Note we don't set the response on the test namespace, so we expect an error
         let response = fixture.storage_client.read_filter(request).await;
         assert_contains!(response.unwrap_err().to_string(), "Sugar we are going down");
 
@@ -2792,7 +2946,7 @@ mod tests {
         let group = generated_types::read_group_request::Group::By as i32;
 
         // ---
-        // test error returned in database processing
+        // test error returned in namespace processing
         // ---
         let request = ReadGroupRequest {
             read_source: source.clone(),
@@ -2805,7 +2959,7 @@ mod tests {
             }),
         };
 
-        // Note we don't set the response on the test database, so we expect an error
+        // Note we don't set the response on the test namespace, so we expect an error
         let response_string = fixture
             .storage_client
             .read_group(request)
@@ -3472,6 +3626,83 @@ mod tests {
 
         println!("Result is {:?}", response);
         assert_eq!(response.metadata().get("storage-type").unwrap(), "iox");
+    }
+
+    #[tokio::test]
+    async fn test_marshal_errors() {
+        test_helpers::maybe_start_logging();
+        // Start a test gRPC server on a randomally allocated port
+        let fixture = Fixture::new().await.expect("Connecting to test server");
+
+        let db_info = org_and_bucket();
+
+        // Add a chunk with a field
+        let chunk = TestChunk::new("TheMeasurement")
+            .with_time_column()
+            .with_string_field_column_with_stats("str", None, None)
+            .with_tag_column("state")
+            .with_one_row_of_data();
+
+        fixture
+            .test_storage
+            .db_or_create(db_info.db_name())
+            .await
+            .add_chunk("my_partition_key", Arc::new(chunk));
+
+        let mut storage_client = storage_client::StorageClient::new(
+            fixture.client_connection.clone().into_grpc_connection(),
+        );
+
+        let source = Some(StorageClient::read_source(&db_info, 1));
+
+        let request = ReadWindowAggregateRequest {
+            read_source: source.clone(),
+            range: Some(make_timestamp_range(1000, 2000)),
+            predicate: None,
+            window_every: 0,
+            offset: 0,
+            aggregate: vec![Aggregate {
+                r#type: aggregate::AggregateType::Mean as i32,
+            }],
+            window: Some(Window {
+                every: Some(Duration {
+                    nsecs: 1122,
+                    months: 0,
+                    negative: false,
+                }),
+                offset: Some(Duration {
+                    nsecs: 0,
+                    months: 4,
+                    negative: false,
+                }),
+            }),
+            tag_key_meta_names: TagKeyMetaNames::Text as i32,
+        };
+
+        let tonic_status = storage_client
+            .read_window_aggregate(request)
+            .await
+            .unwrap_err();
+        assert!(tonic_status
+            .message()
+            .contains("Avg does not support inputs of type Utf8"));
+        assert_eq!(tonic::Code::InvalidArgument, tonic_status.code());
+
+        let mut rpc_status = GrpcStatus::decode(tonic_status.details()).unwrap();
+        assert!(rpc_status
+            .message
+            .contains("Avg does not support inputs of type Utf8"));
+        assert_eq!(tonic::Code::InvalidArgument as i32, rpc_status.code);
+        assert_eq!(1, rpc_status.details.len());
+
+        let detail = rpc_status.details.pop().unwrap();
+        let influx_err = InfluxDbError::decode(detail.value).unwrap();
+        assert_eq!("invalid", influx_err.code);
+        assert!(influx_err
+            .message
+            .contains("Avg does not support inputs of type Utf8"));
+        assert_eq!("iox/influxrpc", influx_err.op);
+        assert_eq!(None, influx_err.error);
     }
 
     fn make_timestamp_range(start: i64, end: i64) -> TimestampRange {

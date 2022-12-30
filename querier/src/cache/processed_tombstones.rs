@@ -14,7 +14,7 @@ use cache_system::{
 use data_types::{ParquetFileId, TombstoneId};
 use iox_catalog::interface::Catalog;
 use iox_time::TimeProvider;
-use std::{collections::HashMap, mem::size_of_val, sync::Arc, time::Duration};
+use std::{mem::size_of_val, sync::Arc, time::Duration};
 use trace::span::Span;
 
 use super::ram::RamSize;
@@ -78,7 +78,7 @@ impl ProcessedTombstonesCache {
             testing,
         ));
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider));
+        let mut backend = PolicyBackend::hashmap_backed(Arc::clone(&time_provider));
         backend.add_policy(TtlPolicy::new(
             Arc::new(KeepExistsForever {}),
             CACHE_ID,
@@ -147,7 +147,7 @@ mod tests {
     async fn test() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table").await;
         table.create_column("foo", ColumnType::F64).await;
         table.create_column("time", ColumnType::Time).await;

@@ -12,7 +12,7 @@
 )]
 
 use datafusion::{
-    execution::FunctionRegistry,
+    execution::{context::SessionState, FunctionRegistry},
     prelude::{lit, Expr},
 };
 use group_by::WindowDuration;
@@ -33,6 +33,7 @@ mod window;
 /// Function registry
 mod registry;
 
+pub use crate::regex::clean_non_meta_escapes;
 pub use crate::regex::REGEX_MATCH_UDF_NAME;
 pub use crate::regex::REGEX_NOT_MATCH_UDF_NAME;
 
@@ -89,6 +90,17 @@ pub fn make_window_bound_expr(
 /// Return an [`FunctionRegistry`] with the implementations of IOx UDFs
 pub fn registry() -> &'static dyn FunctionRegistry {
     registry::instance()
+}
+
+/// registers scalar functions so they can be invoked via SQL
+pub fn register_scalar_functions(mut state: SessionState) -> SessionState {
+    let registry = registry();
+    for f in registry.udfs() {
+        let udf = registry.udf(&f).unwrap();
+        state.scalar_functions.insert(f, udf);
+    }
+
+    state
 }
 
 #[cfg(test)]

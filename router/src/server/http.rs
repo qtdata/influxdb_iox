@@ -2,10 +2,8 @@
 
 mod delete_predicate;
 
-use std::{str::Utf8Error, time::Instant};
-
 use bytes::{Bytes, BytesMut};
-use data_types::{org_and_bucket_to_database, OrgBucketMappingError};
+use data_types::{org_and_bucket_to_namespace, OrgBucketMappingError};
 use futures::StreamExt;
 use hashbrown::HashMap;
 use hyper::{header::CONTENT_ENCODING, Body, Method, Request, Response, StatusCode};
@@ -16,6 +14,7 @@ use mutable_batch_lp::LinesConverter;
 use observability_deps::tracing::*;
 use predicate::delete_predicate::parse_delete_predicate;
 use serde::Deserialize;
+use std::{str::Utf8Error, time::Instant};
 use thiserror::Error;
 use tokio::sync::{Semaphore, TryAcquireError};
 use trace::ctx::SpanContext;
@@ -23,7 +22,9 @@ use write_summary::WriteSummary;
 
 use self::delete_predicate::parse_http_delete_request;
 use crate::{
-    dml_handlers::{DmlError, DmlHandler, PartitionError, SchemaError},
+    dml_handlers::{
+        DmlError, DmlHandler, PartitionError, RetentionError, RpcWriteError, SchemaError,
+    },
     namespace_resolver::NamespaceResolver,
 };
 
@@ -113,6 +114,10 @@ impl Error {
                 StatusCode::UNSUPPORTED_MEDIA_TYPE
             }
             Error::DmlHandler(err) => StatusCode::from(err),
+            // Error from the namespace resolver is 4xx if autocreation is disabled, 5xx otherwise
+            Error::NamespaceResolver(crate::namespace_resolver::Error::Create(
+                crate::namespace_resolver::ns_autocreation::NamespaceCreationError::Reject(_),
+            )) => StatusCode::BAD_REQUEST,
             Error::NamespaceResolver(_) => StatusCode::INTERNAL_SERVER_ERROR,
             Error::RequestLimit => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -122,7 +127,7 @@ impl Error {
 impl From<&DmlError> for StatusCode {
     fn from(e: &DmlError) -> Self {
         match e {
-            DmlError::DatabaseNotFound(_) => StatusCode::NOT_FOUND,
+            DmlError::NamespaceNotFound(_) => StatusCode::NOT_FOUND,
 
             // Schema validation error cases
             DmlError::Schema(SchemaError::NamespaceLookup(_)) => {
@@ -141,12 +146,19 @@ impl From<&DmlError> for StatusCode {
 
             DmlError::Internal(_) | DmlError::WriteBuffer(_) => StatusCode::INTERNAL_SERVER_ERROR,
             DmlError::Partition(PartitionError::BatchWrite(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::Retention(RetentionError::NamespaceLookup(_)) => {
+                StatusCode::INTERNAL_SERVER_ERROR
+            }
+            DmlError::Retention(RetentionError::OutsideRetention(_)) => StatusCode::FORBIDDEN,
+            DmlError::RpcWrite(RpcWriteError::Upstream(_)) => StatusCode::INTERNAL_SERVER_ERROR,
+            DmlError::RpcWrite(RpcWriteError::DeletesUnsupported) => StatusCode::NOT_IMPLEMENTED,
+            DmlError::RpcWrite(RpcWriteError::Timeout(_)) => StatusCode::GATEWAY_TIMEOUT,
         }
     }
 }
 
 /// Errors returned when decoding the organisation / bucket information from a
-/// HTTP request and deriving the database name from it.
+/// HTTP request and deriving the namespace name from it.
 #[derive(Debug, Error)]
 pub enum OrgBucketError {
     /// The request contains no org/bucket destination information.
@@ -157,7 +169,7 @@ pub enum OrgBucketError {
     #[error("failed to deserialize org/bucket/precision in request: {0}")]
     DecodeFail(#[from] serde::de::value::Error),
 
-    /// The provided org/bucket could not be converted into a database name.
+    /// The provided org/bucket could not be converted into a namespace name.
     #[error(transparent)]
     MappingFail(#[from] OrgBucketMappingError),
 }
@@ -367,10 +379,15 @@ where
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
         let write_info = WriteInfo::try_from(&req)?;
-        let namespace = org_and_bucket_to_database(&write_info.org, &write_info.bucket)
+        let namespace = org_and_bucket_to_namespace(&write_info.org, &write_info.bucket)
             .map_err(OrgBucketError::MappingFail)?;
 
-        trace!(org=%write_info.org, bucket=%write_info.bucket, %namespace, "processing write request");
+        trace!(
+            org=%write_info.org,
+            bucket=%write_info.bucket,
+            %namespace,
+            "processing write request"
+        );
 
         // Read the HTTP body and convert it to a str.
         let body = self.read_body(req).await?;
@@ -429,7 +446,7 @@ where
         let span_ctx: Option<SpanContext> = req.extensions().get().cloned();
 
         let account = WriteInfo::try_from(&req)?;
-        let namespace = org_and_bucket_to_database(&account.org, &account.bucket)
+        let namespace = org_and_bucket_to_namespace(&account.org, &account.bucket)
             .map_err(OrgBucketError::MappingFail)?;
 
         trace!(org=%account.org, bucket=%account.bucket, %namespace, "processing delete request");
@@ -538,23 +555,22 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::{io::Write, iter, sync::Arc, time::Duration};
-
-    use assert_matches::assert_matches;
-    use data_types::NamespaceId;
-    use flate2::{write::GzEncoder, Compression};
-    use hyper::header::HeaderValue;
-    use metric::{Attributes, Metric};
-    use mutable_batch::column::ColumnData;
-    use mutable_batch_lp::LineWriteError;
-    use test_helpers::timeout::FutureTimeout;
-    use tokio_stream::wrappers::ReceiverStream;
-
     use super::*;
     use crate::{
         dml_handlers::mock::{MockDmlHandler, MockDmlHandlerCall},
         namespace_resolver::mock::MockNamespaceResolver,
     };
+    use assert_matches::assert_matches;
+    use data_types::{NamespaceId, NamespaceNameError};
+    use flate2::{write::GzEncoder, Compression};
+    use hyper::header::HeaderValue;
+    use metric::{Attributes, Metric};
+    use mutable_batch::column::ColumnData;
+    use mutable_batch_lp::LineWriteError;
+    use serde::de::Error as _;
+    use std::{io::Write, iter, sync::Arc, time::Duration};
+    use test_helpers::timeout::FutureTimeout;
+    use tokio_stream::wrappers::ReceiverStream;
 
     const MAX_BYTES: usize = 1024;
     const NAMESPACE_ID: NamespaceId = NamespaceId::new(42);
@@ -918,8 +934,8 @@ mod tests {
         db_not_found,
         query_string = "?org=bananas&bucket=test",
         body = "platanos,tag1=A,tag2=B val=42i 123456".as_bytes(),
-        dml_handler = [Err(DmlError::DatabaseNotFound("bananas_test".to_string()))],
-        want_result = Err(Error::DmlHandler(DmlError::DatabaseNotFound(_))),
+        dml_handler = [Err(DmlError::NamespaceNotFound("bananas_test".to_string()))],
+        want_result = Err(Error::DmlHandler(DmlError::NamespaceNotFound(_))),
         want_dml_calls = [MockDmlHandlerCall::Write{namespace, ..}] => {
             assert_eq!(namespace, "bananas_test");
         }
@@ -1035,8 +1051,8 @@ mod tests {
         db_not_found,
         query_string = "?org=bananas&bucket=test",
         body = r#"{"start":"2021-04-01T14:00:00Z","stop":"2021-04-02T14:00:00Z", "predicate":"_measurement=its_a_table and location=Boston"}"#.as_bytes(),
-        dml_handler = [Err(DmlError::DatabaseNotFound("bananas_test".to_string()))],
-        want_result = Err(Error::DmlHandler(DmlError::DatabaseNotFound(_))),
+        dml_handler = [Err(DmlError::NamespaceNotFound("bananas_test".to_string()))],
+        want_result = Err(Error::DmlHandler(DmlError::NamespaceNotFound(_))),
         want_dml_calls = [MockDmlHandlerCall::Delete{namespace, namespace_id, table, predicate}] => {
             assert_eq!(table, "its_a_table");
             assert_eq!(namespace, "bananas_test");
@@ -1249,7 +1265,7 @@ mod tests {
         // immediate drop of any subsequent requests.
         //
 
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(0));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(0));
 
         // Retain this tx handle for the second request and use it to prove the
         // request dropped before anything was read from the body - the request
@@ -1275,7 +1291,7 @@ mod tests {
         assert_matches!(err, Error::RequestLimit);
 
         // Ensure the "rejected requests" metric was incremented
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(1));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(1));
 
         // Prove the dropped request body is not being read:
         body_2_tx
@@ -1311,6 +1327,196 @@ mod tests {
             .expect("empty write should succeed");
 
         // And the request rejected metric must remain unchanged
-        assert_metric_hit(&*metrics, "http_request_limit_rejected", Some(1));
+        assert_metric_hit(&metrics, "http_request_limit_rejected", Some(1));
+    }
+
+    // The display text of Error gets passed through `ioxd_router::IoxHttpErrorAdaptor` then
+    // `ioxd_common::http::error::HttpApiError` as the JSON "message" value in error response
+    // bodies. These are fixture tests to document error messages that users might see when
+    // making requests to `/api/v2/write`.
+    macro_rules! check_errors {
+        (
+            $((                   // This macro expects a list of tuples, each specifying:
+                $variant:ident        // - One of the error enum variants
+                $(($data:expr))?,     // - If needed, an expression to construct the variant's data
+                $msg:expr $(,)?       // - The string expected for `Display`ing this variant
+            )),*,
+        ) => {
+            // Generate code that contains all possible error variants, to ensure a compiler error
+            // if any errors are not explicitly covered in this test.
+            #[test]
+            fn all_error_variants_are_checked() {
+                #[allow(dead_code)]
+                fn all_documented(ensure_all_error_variants_are_checked: Error) {
+                    #[allow(unreachable_patterns)]
+                    match ensure_all_error_variants_are_checked {
+                        $(Error::$variant { .. } => {},)*
+                        // If this test doesn't compile because of a non-exhaustive pattern,
+                        // a variant needs to be added to the `check_errors!` call with the
+                        // expected `to_string()` text.
+                    }
+                }
+            }
+
+            // A test that covers all errors given to this macro.
+            #[tokio::test]
+            async fn error_messages_match() {
+                // Generate an assert for each error given to this macro.
+                $(
+                    let e = Error::$variant $(($data))?;
+                    assert_eq!(e.to_string(), $msg);
+                )*
+            }
+
+            #[test]
+            fn print_out_error_text() {
+                println!("{}", concat!($(stringify!($variant), "\t", $msg, "\n",)*),)
+            }
+        };
+    }
+
+    check_errors! {
+        (
+            NoHandler,
+            "not found",
+        ),
+
+        (InvalidOrgBucket(OrgBucketError::NotSpecified), "no org/bucket destination provided"),
+
+        (
+            InvalidOrgBucket({
+                let e = serde::de::value::Error::custom("[deserialization error]");
+                OrgBucketError::DecodeFail(e)
+            }),
+            "failed to deserialize org/bucket/precision in request: [deserialization error]",
+        ),
+
+        (
+            InvalidOrgBucket(OrgBucketError::MappingFail(OrgBucketMappingError::NotSpecified)),
+            "missing org/bucket value",
+        ),
+
+        (
+            InvalidOrgBucket({
+                let e = NamespaceNameError::LengthConstraint { name: "[too long name]".into() };
+                let e = OrgBucketMappingError::InvalidNamespaceName { source: e };
+                OrgBucketError::MappingFail(e)
+            }),
+            "Invalid namespace name: \
+             Namespace name [too long name] length must be between 1 and 64 characters",
+        ),
+
+        (
+            NonUtf8Body(std::str::from_utf8(&[0, 159]).unwrap_err()),
+            "body content is not valid utf8: invalid utf-8 sequence of 1 bytes from index 1",
+        ),
+
+        (
+            NonUtf8ContentHeader({
+                hyper::header::HeaderValue::from_bytes(&[159]).unwrap().to_str().unwrap_err()
+            }),
+            "invalid content-encoding header: failed to convert header to a str",
+        ),
+
+        (
+            InvalidContentEncoding("[invalid content encoding value]".into()),
+            "unacceptable content-encoding: [invalid content encoding value]",
+        ),
+
+        (
+            ClientHangup({
+                let url = "wrong://999.999.999.999:999999".parse().unwrap();
+                hyper::Client::new().get(url).await.unwrap_err()
+            }),
+            "client disconnected",
+        ),
+
+        (
+            RequestSizeExceeded(1337),
+            "max request size (1337 bytes) exceeded",
+        ),
+
+        (
+            InvalidGzip(std::io::Error::new(std::io::ErrorKind::Other, "[io Error]")),
+            "error decoding gzip stream: [io Error]",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::LineProtocol {
+                source: influxdb_line_protocol::Error::FieldSetMissing,
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error parsing line 42 (1-based): No fields were provided",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::Write {
+                source: mutable_batch_lp::LineWriteError::DuplicateTag {
+                    name: "host".into(),
+                },
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error writing line 42: \
+            the tag 'host' is specified more than once with conflicting values",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::Write {
+                source: mutable_batch_lp::LineWriteError::ConflictedFieldTypes {
+                    name: "bananas".into(),
+                },
+                line: 42,
+            }),
+            "failed to parse line protocol: \
+            error writing line 42: \
+            the field 'bananas' is specified more than once with conflicting types",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::EmptyPayload),
+            "failed to parse line protocol: empty write payload",
+        ),
+
+        (
+            ParseLineProtocol(mutable_batch_lp::Error::TimestampOverflow),
+            "failed to parse line protocol: timestamp overflows i64",
+        ),
+
+        (
+            ParseDelete({
+                predicate::delete_predicate::Error::InvalidSyntax { value: "[syntax]".into() }
+            }),
+            "failed to parse delete predicate: Invalid predicate syntax: ([syntax])",
+        ),
+
+        (
+            ParseHttpDelete({
+                delete_predicate::Error::TableInvalid { value: "[table name]".into() }
+            }),
+            "failed to parse delete predicate from http request: \
+             Invalid table name in delete '[table name]'"
+        ),
+
+        (
+            DmlHandler(DmlError::NamespaceNotFound("[namespace name]".into())),
+            "dml handler error: namespace [namespace name] does not exist",
+        ),
+
+        (
+            NamespaceResolver({
+                let e = iox_catalog::interface::Error::NameExists { name: "[name]".into() };
+                crate::namespace_resolver::Error::Lookup(e)
+            }),
+            "failed to resolve namespace ID: \
+             failed to resolve namespace ID: \
+             name [name] already exists",
+        ),
+
+        (
+            RequestLimit,
+            "this service is overloaded, please try again later",
+        ),
     }
 }

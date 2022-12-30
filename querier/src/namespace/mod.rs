@@ -1,9 +1,9 @@
-//! Namespace within the whole database.
+//! Namespace within the whole catalog.
 
 use crate::{
     cache::{namespace::CachedNamespace, CatalogCache},
-    chunk::ChunkAdapter,
     ingester::IngesterConnection,
+    parquet::ChunkAdapter,
     query_log::QueryLog,
     table::{PruneMetrics, QuerierTable, QuerierTableArgs},
 };
@@ -58,8 +58,7 @@ impl QuerierNamespace {
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         query_log: Arc<QueryLog>,
-        sharder: Arc<JumpHash<Arc<ShardIndex>>>,
-        max_table_query_bytes: usize,
+        sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
         prune_metrics: Arc<PruneMetrics>,
     ) -> Self {
         let tables: HashMap<_, _> = ns
@@ -67,15 +66,16 @@ impl QuerierNamespace {
             .iter()
             .map(|(table_name, cached_table)| {
                 let table = Arc::new(QuerierTable::new(QuerierTableArgs {
-                    sharder: Arc::clone(&sharder),
+                    sharder: sharder.clone(),
+                    namespace_id: ns.id,
                     namespace_name: Arc::clone(&name),
-                    id: cached_table.id,
+                    namespace_retention_period: ns.retention_period,
+                    table_id: cached_table.id,
                     table_name: Arc::clone(table_name),
                     schema: Arc::clone(&cached_table.schema),
                     ingester_connection: ingester_connection.clone(),
                     chunk_adapter: Arc::clone(&chunk_adapter),
                     exec: Arc::clone(&exec),
-                    max_query_bytes: max_table_query_bytes,
                     prune_metrics: Arc::clone(&prune_metrics),
                 }));
 
@@ -105,7 +105,6 @@ impl QuerierNamespace {
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         sharder: Arc<JumpHash<Arc<ShardIndex>>>,
-        max_table_query_bytes: usize,
     ) -> Self {
         let time_provider = catalog_cache.time_provider();
         let chunk_adapter = Arc::new(ChunkAdapter::new(catalog_cache, metric_registry));
@@ -119,8 +118,7 @@ impl QuerierNamespace {
             exec,
             ingester_connection,
             query_log,
-            sharder,
-            max_table_query_bytes,
+            Some(sharder),
             prune_metrics,
         )
     }
@@ -143,13 +141,15 @@ mod tests {
     use crate::namespace::test_util::querier_namespace;
     use data_types::ColumnType;
     use iox_tests::util::TestCatalog;
-    use schema::{builder::SchemaBuilder, InfluxColumnType, InfluxFieldType, Schema};
+    use schema::{
+        builder::SchemaBuilder, InfluxColumnType, InfluxFieldType, Schema, TIME_COLUMN_NAME,
+    };
 
     #[tokio::test]
     async fn test_sync_tables() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
 
         let qns = querier_namespace(&ns).await;
         assert_eq!(tables(&qns), Vec::<String>::new());
@@ -178,7 +178,7 @@ mod tests {
     async fn test_sync_schemas() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table = ns.create_table("table").await;
 
         let qns = querier_namespace(&ns).await;
@@ -200,14 +200,16 @@ mod tests {
         assert_eq!(actual_schema.as_ref(), &expected_schema,);
 
         table.create_column("col4", ColumnType::Tag).await;
-        table.create_column("col5", ColumnType::Time).await;
+        table
+            .create_column(TIME_COLUMN_NAME, ColumnType::Time)
+            .await;
         let qns = querier_namespace(&ns).await;
         let expected_schema = SchemaBuilder::new()
             .influx_column("col1", InfluxColumnType::Field(InfluxFieldType::Integer))
             .influx_column("col2", InfluxColumnType::Field(InfluxFieldType::Boolean))
             .influx_column("col3", InfluxColumnType::Tag)
             .influx_column("col4", InfluxColumnType::Tag)
-            .influx_column("col5", InfluxColumnType::Timestamp)
+            .influx_column(TIME_COLUMN_NAME, InfluxColumnType::Timestamp)
             .build()
             .unwrap();
         let actual_schema = schema(&qns, "table");

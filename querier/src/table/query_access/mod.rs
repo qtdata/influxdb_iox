@@ -19,7 +19,7 @@ use iox_query::{
 use predicate::Predicate;
 use schema::Schema;
 
-use crate::{chunk::QuerierChunk, ingester::IngesterChunk};
+use crate::{ingester::IngesterChunk, parquet::QuerierParquetChunk};
 
 use self::metrics::PruneMetrics;
 
@@ -44,7 +44,7 @@ impl TableProvider for QuerierTable {
     async fn scan(
         &self,
         ctx: &SessionState,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
@@ -95,13 +95,12 @@ impl TableProvider for QuerierTable {
 
 #[derive(Debug)]
 pub struct QuerierTableChunkPruner {
-    max_bytes: usize,
     metrics: Arc<PruneMetrics>,
 }
 
 impl QuerierTableChunkPruner {
-    pub fn new(max_bytes: usize, metrics: Arc<PruneMetrics>) -> Self {
-        Self { max_bytes, metrics }
+    pub fn new(metrics: Arc<PruneMetrics>) -> Self {
+        Self { metrics }
     }
 }
 
@@ -140,17 +139,6 @@ impl ChunkPruner for QuerierTableChunkPruner {
             }
         };
 
-        let estimated_bytes = chunks
-            .iter()
-            .map(|chunk| chunk_estimate_size(chunk.as_ref()))
-            .sum::<usize>();
-        if estimated_bytes > self.max_bytes {
-            return Err(ProviderError::TooMuchData {
-                actual_bytes: estimated_bytes,
-                limit_bytes: self.max_bytes,
-            });
-        }
-
         Ok(chunks)
     }
 }
@@ -162,6 +150,11 @@ pub(crate) struct MetricPruningObserver {
 impl MetricPruningObserver {
     pub(crate) fn new(metrics: Arc<PruneMetrics>) -> Self {
         Self { metrics }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_unregistered() -> Self {
+        Self::new(Arc::new(PruneMetrics::new_unregistered()))
     }
 
     /// Called when pruning a chunk before fully creating the chunk structure
@@ -209,7 +202,7 @@ fn chunk_estimate_size(chunk: &dyn QueryChunk) -> usize {
 
     if let Some(chunk) = chunk.downcast_ref::<IngesterChunk>() {
         chunk.estimate_size()
-    } else if let Some(chunk) = chunk.downcast_ref::<QuerierChunk>() {
+    } else if let Some(chunk) = chunk.downcast_ref::<QuerierParquetChunk>() {
         chunk.estimate_size()
     } else {
         panic!("Unknown chunk type")
@@ -219,7 +212,7 @@ fn chunk_estimate_size(chunk: &dyn QueryChunk) -> usize {
 fn chunk_rows(chunk: &dyn QueryChunk) -> usize {
     let chunk = chunk.as_any();
 
-    if let Some(chunk) = chunk.downcast_ref::<QuerierChunk>() {
+    if let Some(chunk) = chunk.downcast_ref::<QuerierParquetChunk>() {
         chunk.rows()
     } else if let Some(chunk) = chunk.downcast_ref::<IngesterChunk>() {
         chunk.rows()

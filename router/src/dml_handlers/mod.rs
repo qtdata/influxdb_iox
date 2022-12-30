@@ -68,6 +68,9 @@ pub mod nop;
 mod sharded_write_buffer;
 pub use sharded_write_buffer::*;
 
+mod retention_validator;
+pub use retention_validator::*;
+
 mod partitioner;
 pub use partitioner::*;
 
@@ -79,6 +82,9 @@ pub use chain::*;
 
 mod fan_out;
 pub use fan_out::*;
+
+mod rpc_write;
+pub use rpc_write::*;
 
 mod write_summary;
 pub use self::write_summary::*;

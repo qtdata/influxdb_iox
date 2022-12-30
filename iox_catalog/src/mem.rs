@@ -3,13 +3,13 @@
 
 use crate::{
     interface::{
-        sealed::TransactionFinalize, Catalog, ColumnRepo, ColumnTypeMismatchSnafu,
-        ColumnUpsertRequest, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-        ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result, ShardRepo, TableRepo,
-        TombstoneRepo, TopicMetadataRepo, Transaction,
+        sealed::TransactionFinalize, CasFailure, Catalog, ColumnRepo, ColumnTypeMismatchSnafu,
+        Error, NamespaceRepo, ParquetFileRepo, PartitionRepo, ProcessedTombstoneRepo,
+        QueryPoolRepo, RepoCollection, Result, ShardRepo, TableRepo, TombstoneRepo,
+        TopicMetadataRepo, Transaction,
     },
     metrics::MetricDecorator,
-    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES, DEFAULT_RETENTION_PERIOD,
+    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES,
 };
 use async_trait::async_trait;
 use data_types::{
@@ -285,7 +285,7 @@ impl NamespaceRepo for MemTxn {
     async fn create(
         &mut self,
         name: &str,
-        retention_duration: &str,
+        retention_period_ns: Option<i64>,
         topic_id: TopicId,
         query_pool_id: QueryPoolId,
     ) -> Result<Namespace> {
@@ -302,10 +302,9 @@ impl NamespaceRepo for MemTxn {
             name: name.to_string(),
             topic_id,
             query_pool_id,
-            retention_duration: Some(retention_duration.to_string()),
             max_tables: DEFAULT_MAX_TABLES,
             max_columns_per_table: DEFAULT_MAX_COLUMNS_PER_TABLE,
-            retention_period_ns: DEFAULT_RETENTION_PERIOD,
+            retention_period_ns,
         };
         stage.namespaces.push(namespace);
         Ok(stage.namespaces.last().unwrap().clone())
@@ -358,19 +357,12 @@ impl NamespaceRepo for MemTxn {
     async fn update_retention_period(
         &mut self,
         name: &str,
-        retention_hours: i64,
+        retention_period_ns: Option<i64>,
     ) -> Result<Namespace> {
-        let rentenion_period_ns = retention_hours * 60 * 60 * 1_000_000_000;
-        let retention = if rentenion_period_ns == 0 {
-            None
-        } else {
-            Some(rentenion_period_ns)
-        };
-
         let stage = self.stage();
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
             Some(n) => {
-                n.retention_period_ns = retention;
+                n.retention_period_ns = retention_period_ns;
                 Ok(n.clone())
             }
             None => Err(Error::NamespaceNotFoundByName {
@@ -552,7 +544,7 @@ impl ColumnRepo for MemTxn {
     async fn create_or_get_many_unchecked(
         &mut self,
         table_id: TableId,
-        columns: &[ColumnUpsertRequest<'_>],
+        columns: HashMap<&str, ColumnType>,
     ) -> Result<Vec<Column>> {
         // Explicitly NOT using `create_or_get` in this function: the Postgres catalog doesn't
         // check column limits when inserting many columns because it's complicated and expensive,
@@ -562,19 +554,19 @@ impl ColumnRepo for MemTxn {
 
         let out: Vec<_> = columns
             .iter()
-            .map(|column| {
+            .map(|(&column_name, &column_type)| {
                 match stage
                     .columns
                     .iter()
-                    .find(|t| t.name == column.name && t.table_id == table_id)
+                    .find(|t| t.name == column_name && t.table_id == table_id)
                 {
                     Some(c) => {
                         ensure!(
-                            column.column_type == c.column_type,
+                            column_type == c.column_type,
                             ColumnTypeMismatchSnafu {
-                                name: column.name,
+                                name: column_name,
                                 existing: c.column_type,
-                                new: column.column_type
+                                new: column_type
                             }
                         );
                         Ok(c.clone())
@@ -583,8 +575,8 @@ impl ColumnRepo for MemTxn {
                         let new_column = Column {
                             id: ColumnId::new(stage.columns.len() as i64 + 1),
                             table_id,
-                            name: column.name.to_string(),
-                            column_type: column.column_type,
+                            name: column_name.to_string(),
+                            column_type,
                         };
                         stage.columns.push(new_column);
                         Ok(stage.columns.last().unwrap().clone())
@@ -826,18 +818,23 @@ impl PartitionRepo for MemTxn {
         Ok(partitions)
     }
 
-    async fn update_sort_key(
+    async fn cas_sort_key(
         &mut self,
         partition_id: PartitionId,
-        sort_key: &[&str],
-    ) -> Result<Partition> {
+        old_sort_key: Option<Vec<String>>,
+        new_sort_key: &[&str],
+    ) -> Result<Partition, CasFailure<Vec<String>>> {
         let stage = self.stage();
+        let old_sort_key = old_sort_key.unwrap_or_default();
         match stage.partitions.iter_mut().find(|p| p.id == partition_id) {
-            Some(p) => {
-                p.sort_key = sort_key.iter().map(|s| s.to_string()).collect();
+            Some(p) if p.sort_key == old_sort_key => {
+                p.sort_key = new_sort_key.iter().map(|s| s.to_string()).collect();
                 Ok(p.clone())
             }
-            None => Err(Error::PartitionNotFound { id: partition_id }),
+            Some(p) => return Err(CasFailure::ValueMismatch(p.sort_key.clone())),
+            None => Err(CasFailure::QueryError(Error::PartitionNotFound {
+                id: partition_id,
+            })),
         }
     }
 
@@ -847,6 +844,7 @@ impl PartitionRepo for MemTxn {
         reason: &str,
         num_files: usize,
         limit_num_files: usize,
+        limit_num_files_first_in_partition: usize,
         estimated_bytes: u64,
         limit_bytes: u64,
     ) -> Result<()> {
@@ -864,6 +862,7 @@ impl PartitionRepo for MemTxn {
                 s.skipped_at = skipped_at;
                 s.num_files = num_files as i64;
                 s.limit_num_files = limit_num_files as i64;
+                s.limit_num_files_first_in_partition = limit_num_files_first_in_partition as i64;
                 s.estimated_bytes = estimated_bytes as i64;
                 s.limit_bytes = limit_bytes as i64;
             }
@@ -873,6 +872,7 @@ impl PartitionRepo for MemTxn {
                 skipped_at,
                 num_files: num_files as i64,
                 limit_num_files: limit_num_files as i64,
+                limit_num_files_first_in_partition: limit_num_files_first_in_partition as i64,
                 estimated_bytes: estimated_bytes as i64,
                 limit_bytes: limit_bytes as i64,
             }),
@@ -1124,6 +1124,36 @@ impl ParquetFileRepo for MemTxn {
         Ok(())
     }
 
+    async fn flag_for_delete_by_retention(&mut self) -> Result<Vec<ParquetFileId>> {
+        let now = Timestamp::from(self.time_provider.now());
+        let stage = self.stage();
+
+        Ok(stage
+            .parquet_files
+            .iter_mut()
+            // don't flag if already flagged for deletion
+            .filter(|f| f.to_delete.is_none())
+            .filter_map(|f| {
+                // table retention, if it exists, overrides namespace retention
+                // TODO - include check of table retention period once implemented
+                stage
+                    .namespaces
+                    .iter()
+                    .find(|n| n.id == f.namespace_id)
+                    .and_then(|ns| {
+                        ns.retention_period_ns.and_then(|rp| {
+                            if f.max_time < now - rp {
+                                f.to_delete = Some(now);
+                                Some(f.id)
+                            } else {
+                                None
+                            }
+                        })
+                    })
+            })
+            .collect())
+    }
+
     async fn list_by_shard_greater_than(
         &mut self,
         shard_id: ShardId,
@@ -1236,7 +1266,7 @@ impl ParquetFileRepo for MemTxn {
 
     async fn recent_highest_throughput_partitions(
         &mut self,
-        shard_id: ShardId,
+        shard_id: Option<ShardId>,
         time_in_the_past: Timestamp,
         min_num_files: usize,
         num_partitions: usize,
@@ -1250,7 +1280,13 @@ impl ParquetFileRepo for MemTxn {
             .parquet_files
             .iter()
             .filter(|f| {
-                f.shard_id == shard_id
+                let shard_matches_if_specified = if let Some(shard_id) = shard_id {
+                    f.shard_id == shard_id
+                } else {
+                    true
+                };
+
+                shard_matches_if_specified
                     && f.created_at > recent_time
                     && f.compaction_level == CompactionLevel::Initial
                     && f.to_delete.is_none()
@@ -1297,9 +1333,67 @@ impl ParquetFileRepo for MemTxn {
         Ok(partitions)
     }
 
+    async fn partitions_with_small_l1_file_count(
+        &mut self,
+        shard_id: Option<ShardId>,
+        small_size_threshold_bytes: i64,
+        min_small_file_count: usize,
+        num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>> {
+        let stage = self.stage();
+        let skipped_partitions: Vec<_> = stage
+            .skipped_compactions
+            .iter()
+            .map(|s| s.partition_id)
+            .collect();
+        // get a list of files for the shard that are under the size threshold and don't belong to
+        // a partition that has been skipped by the compactor
+        let relevant_parquet_files = stage
+            .parquet_files
+            .iter()
+            .filter(|f| {
+                let shard_matches_if_specified = if let Some(shard_id) = shard_id {
+                    f.shard_id == shard_id
+                } else {
+                    true
+                };
+
+                shard_matches_if_specified
+                    && f.compaction_level == CompactionLevel::FileNonOverlapped
+                    && f.file_size_bytes < small_size_threshold_bytes
+                    && !skipped_partitions.contains(&f.partition_id)
+            })
+            .collect::<Vec<_>>();
+        // count the number of files per partition & use that to retain only a list of counts that
+        // are above our threshold. the keys then become our partition candidates
+        let mut partition_small_file_count: HashMap<PartitionParam, usize> =
+            HashMap::with_capacity(relevant_parquet_files.len());
+        for pf in relevant_parquet_files {
+            let key = PartitionParam {
+                partition_id: pf.partition_id,
+                shard_id: pf.shard_id,
+                namespace_id: pf.namespace_id,
+                table_id: pf.table_id,
+            };
+            if pf.to_delete.is_none() {
+                let count = partition_small_file_count.entry(key).or_insert(0);
+                *count += 1;
+            }
+        }
+        partition_small_file_count.retain(|_key, c| *c >= min_small_file_count);
+        let mut partitions = partition_small_file_count.iter().collect::<Vec<_>>();
+        // sort and return top N
+        partitions.sort_by(|a, b| b.1.cmp(a.1));
+        Ok(partitions
+            .into_iter()
+            .map(|(k, _)| *k)
+            .take(num_partitions)
+            .collect::<Vec<_>>())
+    }
+
     async fn most_cold_files_partitions(
         &mut self,
-        shard_id: ShardId,
+        shard_id: Option<ShardId>,
         time_in_the_past: Timestamp,
         num_partitions: usize,
     ) -> Result<Vec<PartitionParam>> {
@@ -1308,7 +1402,13 @@ impl ParquetFileRepo for MemTxn {
             .parquet_files
             .iter()
             .filter(|f| {
-                f.shard_id == shard_id
+                let shard_matches_if_specified = if let Some(shard_id) = shard_id {
+                    f.shard_id == shard_id
+                } else {
+                    true
+                };
+
+                shard_matches_if_specified
                     && (f.compaction_level == CompactionLevel::Initial
                         || f.compaction_level == CompactionLevel::FileNonOverlapped)
             })

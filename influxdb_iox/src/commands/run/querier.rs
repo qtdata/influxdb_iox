@@ -1,5 +1,7 @@
 //! Implementation of command line option for running the querier
 
+use crate::process_info::setup_metric_registry;
+
 use super::main;
 use clap_blocks::{
     catalog_dsn::CatalogDsnConfig, object_store::make_object_store, querier::QuerierConfig,
@@ -72,7 +74,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
     let common_state = CommonServerState::from_config(config.run_config.clone())?;
 
     let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
-    let metric_registry: Arc<metric::Registry> = Default::default();
+    let metric_registry = setup_metric_registry();
 
     let catalog = config
         .catalog_dsn
@@ -85,7 +87,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
     let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
         Arc::clone(&time_provider),
-        &*metric_registry,
+        &metric_registry,
     ));
 
     let time_provider = Arc::new(SystemProvider::new());
@@ -94,10 +96,20 @@ pub async fn command(config: Config) -> Result<(), Error> {
     let num_threads = num_query_threads.unwrap_or_else(num_cpus::get);
     info!(%num_threads, "using specified number of threads per thread pool");
 
+    let rpc_write = std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok();
+    if rpc_write {
+        info!("using the RPC write path");
+    } else {
+        info!("using the write buffer path");
+    }
+
     let ingester_addresses = config.querier_config.ingester_addresses()?;
     info!(?ingester_addresses, "using ingester addresses");
 
-    let exec = Arc::new(Executor::new(num_threads));
+    let exec = Arc::new(Executor::new(
+        num_threads,
+        config.querier_config.exec_mem_pool_bytes,
+    ));
 
     let server_type = create_querier_server_type(QuerierServerTypeArgs {
         common_state: &common_state,
@@ -108,6 +120,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
         time_provider,
         ingester_addresses,
         querier_config: config.querier_config,
+        rpc_write,
     })
     .await?;
 

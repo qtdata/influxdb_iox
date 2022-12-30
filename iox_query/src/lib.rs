@@ -18,7 +18,7 @@ use exec::{stringset::StringSet, IOxSessionContext};
 use hashbrown::HashMap;
 use observability_deps::tracing::{debug, trace};
 use parquet_file::storage::ParquetExecInput;
-use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate, PredicateMatch};
+use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate, PredicateMatch};
 use schema::{
     sort::{SortKey, SortKeyBuilder},
     Projection, Schema, TIME_COLUMN_NAME,
@@ -27,6 +27,7 @@ use std::{any::Any, collections::BTreeSet, fmt::Debug, iter::FromIterator, sync:
 
 pub mod exec;
 pub mod frontend;
+pub mod logical_optimizer;
 pub mod plan;
 pub mod provider;
 pub mod pruning;
@@ -89,7 +90,7 @@ pub trait QueryChunkMeta {
 }
 
 /// A `QueryCompletedToken` is returned by `record_query` implementations of
-/// a `QueryDatabase`. It is used to trigger side-effects (such as query timing)
+/// a `QueryNamespace`. It is used to trigger side-effects (such as query timing)
 /// on query completion.
 ///
 pub struct QueryCompletedToken {
@@ -136,27 +137,25 @@ impl Drop for QueryCompletedToken {
 /// This avoids storing potentially large strings
 pub type QueryText = Box<dyn std::fmt::Display + Send + Sync>;
 
-/// A `Database` is the main trait implemented by the IOx subsystems
-/// that store actual data.
+/// `QueryNamespace` is the main trait implemented by the IOx subsystems that store actual data.
 ///
-/// Databases store data organized by partitions and each partition stores
-/// data in Chunks.
+/// Namespaces store data organized by partitions and each partition stores data in Chunks.
 #[async_trait]
-pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
-    /// Returns a set of chunks within the partition with data that may match
-    /// the provided predicate.
+pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
+    /// Returns a set of chunks within the partition with data that may match the provided
+    /// predicate.
     ///
-    /// If possible, chunks which have no rows that can
-    /// possibly match the predicate may be omitted.
+    /// If possible, chunks which have no rows that can possibly match the predicate may be omitted.
     ///
-    /// If projection is None, returned chunks will include all columns of its original data. Otherwise,
-    /// returned chunks will include PK columns (tags and time) and columns specified in the projection. Projecting
-    /// chunks here is optional and a mere optimization. The query subsystem does NOT rely on it.
+    /// If projection is `None`, returned chunks will include all columns of its original data.
+    /// Otherwise, returned chunks will include PK columns (tags and time) and columns specified in
+    /// the projection. Projecting chunks here is optional and a mere optimization. The query
+    /// subsystem does NOT rely on it.
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError>;
 
@@ -168,10 +167,10 @@ pub trait QueryDatabase: QueryDatabaseMeta + Debug + Send + Sync {
         query_text: QueryText,
     ) -> QueryCompletedToken;
 
-    /// Upcast to [`QueryDatabaseMeta`].
+    /// Upcast to [`QueryNamespaceMeta`].
     ///
     /// This is required until <https://github.com/rust-lang/rust/issues/65991> is fixed.
-    fn as_meta(&self) -> &dyn QueryDatabaseMeta;
+    fn as_meta(&self) -> &dyn QueryNamespaceMeta;
 }
 
 /// Raw data of a [`QueryChunk`].
@@ -298,7 +297,7 @@ where
     }
 }
 
-/// Implement ChunkMeta for Arc<dyn QueryChunk>
+/// Implement `ChunkMeta` for `Arc<dyn QueryChunk>`
 impl QueryChunkMeta for Arc<dyn QueryChunk> {
     fn summary(&self) -> Arc<TableSummary> {
         self.as_ref().summary()

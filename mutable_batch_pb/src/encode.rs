@@ -12,30 +12,11 @@ use mutable_batch::MutableBatch;
 use schema::InfluxColumnType;
 
 /// Convert a [`DmlWrite`] to a [`DatabaseBatch`]
-pub fn encode_write(db_name: &str, database_id: i64, write: &DmlWrite) -> DatabaseBatch {
+pub fn encode_write(database_id: i64, write: &DmlWrite) -> DatabaseBatch {
     DatabaseBatch {
-        database_name: db_name.to_string(),
         table_batches: write
             .tables()
-            .map(|(table_name, batch)| {
-                // Temporary code.
-                //
-                // Once only IDs are pushed over the network this extra lookup
-                // can be removed.
-                //
-                // Safety: this code path is invoked only in the producer, and
-                // therefore accessing the table IDs is acceptable. See
-                // DmlWrite for context.
-                let table_id = unsafe {
-                    write.table_id(table_name).unwrap_or_else(|| {
-                        panic!(
-                            "no table ID mapping found for {} table {}",
-                            db_name, table_name
-                        )
-                    })
-                };
-                encode_batch(table_name, table_id.get(), batch)
-            })
+            .map(|(table_id, batch)| encode_batch(table_id.get(), batch))
             .collect(),
         partition_key: write.partition_key().to_string(),
         database_id,
@@ -43,9 +24,8 @@ pub fn encode_write(db_name: &str, database_id: i64, write: &DmlWrite) -> Databa
 }
 
 /// Convert a [`MutableBatch`] to [`TableBatch`]
-pub fn encode_batch(table_name: &str, table_id: i64, batch: &MutableBatch) -> TableBatch {
+pub fn encode_batch(table_id: i64, batch: &MutableBatch) -> TableBatch {
     TableBatch {
-        table_name: table_name.to_string(),
         columns: batch
             .columns()
             .filter_map(|(column_name, column)| {

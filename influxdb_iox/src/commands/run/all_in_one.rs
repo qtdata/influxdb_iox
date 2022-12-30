@@ -1,5 +1,7 @@
 //! Implementation of command line option for running all in one mode
 
+use crate::process_info::setup_metric_registry;
+
 use super::main;
 use clap_blocks::{
     catalog_dsn::CatalogDsnConfig,
@@ -7,6 +9,7 @@ use clap_blocks::{
     ingester::IngesterConfig,
     object_store::{make_object_store, ObjectStoreConfig},
     querier::{IngesterAddresses, QuerierConfig},
+    router::RouterConfig,
     run_config::RunConfig,
     socket_addr::SocketAddr,
     write_buffer::WriteBufferConfig,
@@ -235,6 +238,27 @@ pub struct Config {
     )]
     pub persist_partition_cold_threshold_seconds: u64,
 
+    /// The memory budget assigned to this compactor.
+    ///
+    /// For each partition candidate, we will estimate the memory needed to compact each
+    /// file and only add more files if their needed estimated memory is below this memory
+    /// budget. Since we must compact L1 files that overlapped with L0 files, if their
+    /// total estimated memory does not allow us to compact a part of a partition at all,
+    /// we will not compact it and will log the partition and its related information in a
+    /// table in our catalog for further diagnosis of the issue.
+    ///
+    /// The number of candidates compacted concurrently is also decided using this
+    /// estimation and budget.
+    ///
+    /// Default is 300MB (314572800 = 300*1024*1024)
+    #[clap(
+        long = "compaction-memory-budget-bytes",
+        env = "INFLUXDB_IOX_COMPACTION_MEMORY_BUDGET_BYTES",
+        default_value = "314572800",
+        action
+    )]
+    pub compaction_memory_budget_bytes: u64,
+
     /// The address on which IOx will serve Router HTTP API requests
     #[clap(
         long = "router-http-bind",
@@ -311,18 +335,14 @@ pub struct Config {
     )]
     pub querier_max_concurrent_queries: usize,
 
-    /// Maximum bytes to scan for a table in a query (estimated).
-    ///
-    /// If IOx estimates that it will scan more than this many bytes
-    /// in a query, the query will error. This protects against potentially unbounded
-    /// memory growth leading to OOMs in certain pathological queries.
+    /// Size of memory pool used during query exec, in bytes.
     #[clap(
-        long = "querier-max-table-query-bytes",
-        env = "INFLUXDB_IOX_QUERIER_MAX_TABLE_QUERY_BYTES",
-        default_value = "1073741824",  // 1 GB
+        long = "exec-mem-pool-bytes",
+        env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
+        default_value = "8589934592",  // 8GB
         action
     )]
-    pub querier_max_table_query_bytes: usize,
+    pub exec_mem_pool_bytes: usize,
 }
 
 impl Config {
@@ -339,6 +359,7 @@ impl Config {
             persist_partition_size_threshold_bytes,
             persist_partition_age_threshold_seconds,
             persist_partition_cold_threshold_seconds,
+            compaction_memory_budget_bytes,
             router_http_bind_address,
             router_grpc_bind_address,
             querier_grpc_bind_address,
@@ -347,7 +368,7 @@ impl Config {
             querier_ram_pool_metadata_bytes,
             querier_ram_pool_data_bytes,
             querier_max_concurrent_queries,
-            querier_max_table_query_bytes,
+            exec_mem_pool_bytes,
         } = self;
 
         let database_directory = object_store_config.database_directory.clone();
@@ -410,6 +431,13 @@ impl Config {
             persist_partition_rows_max: 500_000,
         };
 
+        let router_config = RouterConfig {
+            query_pool_name: QUERY_POOL_NAME.to_string(),
+            http_request_limit: 1_000,
+            new_namespace_retention_hours: None, // infinite retention
+            namespace_autocreation_enabled: true,
+        };
+
         // create a CompactorConfig for the all in one server based on
         // settings from other configs. Can't use `#clap(flatten)` as the
         // parameters are redundant with ingester's
@@ -423,20 +451,29 @@ impl Config {
             max_number_partitions_per_shard: 1,
             min_number_recent_ingested_files_per_partition: 1,
             hot_multiple: 4,
-            memory_budget_bytes: 300_000,
+            warm_multiple: 1,
+            memory_budget_bytes: compaction_memory_budget_bytes,
             min_num_rows_allocated_per_record_batch_to_datafusion_plan: 100,
             max_num_compacting_files: 20,
+            max_num_compacting_files_first_in_partition: 40,
             minutes_without_new_writes_to_be_cold: 10,
+            hot_compaction_hours_threshold_1: 4,
+            hot_compaction_hours_threshold_2: 24,
+            max_parallel_partitions: 20,
+            warm_compaction_small_size_threshold_bytes: 15_000,
+            warm_compaction_min_small_file_count: 10,
         };
 
         let querier_config = QuerierConfig {
             num_query_threads: None,       // will be ignored
             shard_to_ingesters_file: None, // will be ignored
             shard_to_ingesters: None,      // will be ignored
+            ingester_addresses: vec![],    // will be ignored
             ram_pool_metadata_bytes: querier_ram_pool_metadata_bytes,
             ram_pool_data_bytes: querier_ram_pool_data_bytes,
             max_concurrent_queries: querier_max_concurrent_queries,
-            max_table_query_bytes: querier_max_table_query_bytes,
+            exec_mem_pool_bytes,
+            ingester_circuit_breaker_threshold: u64::MAX, // never for all-in-one-mode
         };
 
         SpecializedConfig {
@@ -449,6 +486,7 @@ impl Config {
             catalog_dsn,
             write_buffer_config,
             ingester_config,
+            router_config,
             compactor_config,
             querier_config,
         }
@@ -466,6 +504,7 @@ struct SpecializedConfig {
     catalog_dsn: CatalogDsnConfig,
     write_buffer_config: WriteBufferConfig,
     ingester_config: IngesterConfig,
+    router_config: RouterConfig,
     compactor_config: CompactorConfig,
     querier_config: QuerierConfig,
 }
@@ -479,11 +518,12 @@ pub async fn command(config: Config) -> Result<()> {
         catalog_dsn,
         write_buffer_config,
         ingester_config,
+        router_config,
         compactor_config,
         querier_config,
     } = config.specialize();
 
-    let metrics = Arc::new(metric::Registry::default());
+    let metrics = setup_metric_registry();
 
     let catalog = catalog_dsn
         .get_catalog("iox-all-in-one", Arc::clone(&metrics))
@@ -524,6 +564,7 @@ pub async fn command(config: Config) -> Result<()> {
             parquet_store.id(),
             Arc::clone(parquet_store.object_store()),
         )]),
+        mem_pool_size: querier_config.exec_mem_pool_bytes,
     }));
 
     info!("starting router");
@@ -533,8 +574,7 @@ pub async fn command(config: Config) -> Result<()> {
         Arc::clone(&catalog),
         Arc::clone(&object_store),
         &write_buffer_config,
-        QUERY_POOL_NAME,
-        1_000, // max 1,000 concurrent HTTP requests
+        &router_config,
     )
     .await?;
 
@@ -582,6 +622,7 @@ pub async fn command(config: Config) -> Result<()> {
         time_provider,
         ingester_addresses,
         querier_config,
+        rpc_write: false,
     })
     .await?;
 

@@ -18,7 +18,7 @@ async fn default_mode_is_run_all_in_one() {
 
     Command::cargo_bin("influxdb_iox")
         .unwrap()
-        .args(&["-v"])
+        .args(["-v"])
         // Do not attempt to connect to the real DB (object store, etc) if the
         // prod DSN is set - all other tests use TEST_INFLUXDB_IOX_CATALOG_DSN
         // but this one will use the real env if not cleared.
@@ -39,7 +39,7 @@ async fn default_run_mode_is_all_in_one() {
 
     Command::cargo_bin("influxdb_iox")
         .unwrap()
-        .args(&["run", "-v"])
+        .args(["run", "-v"])
         // This test is designed to assert the default running mode is using
         // in-memory state, so ensure that any outside config does not influence
         // this.
@@ -400,7 +400,7 @@ async fn write_and_query() {
                         .arg("-h")
                         .arg(&router_addr)
                         .arg("write")
-                        .arg(&namespace)
+                        .arg(namespace)
                         // raw line protocol ('h2o_temperature' measurement)
                         .arg("../test_fixtures/lineproto/air_and_water.lp")
                         // gzipped line protocol ('m0')
@@ -422,13 +422,15 @@ async fn write_and_query() {
                     wait_for_query_result(
                         state,
                         "SELECT * from h2o_temperature order by time desc limit 10",
+                        None,
                         "| 51.3           | coyote_creek | CA    | 55.1            | 1970-01-01T00:00:01.568756160Z |"
                     ).await;
 
-                    // data from 'read_filter.lp.gz'
+                    // data from 'read_filter.lp.gz', specific query language type
                     wait_for_query_result(
                         state,
                         "SELECT * from m0 order by time desc limit 10;",
+                        Some(QueryLanguage::Sql),
                         "| value1 | value9 | value9 | value49 | value0 | 2021-04-26T13:47:39.727574Z | 1  |"
                     ).await;
 
@@ -436,6 +438,7 @@ async fn write_and_query() {
                     wait_for_query_result(
                         state,
                         "SELECT * from cpu where cpu = 'cpu2' order by time desc limit 10",
+                        None,
                         "cpu2 | MacBook-Pro-8.hsd1.ma.comcast.net | 2022-09-30T12:55:00Z"
                     ).await;
                 }
@@ -469,13 +472,13 @@ async fn query_error_handling() {
                         .arg("-h")
                         .arg(&querier_addr)
                         .arg("query")
-                        .arg(&namespace)
+                        .arg(namespace)
                         .arg("drop table this_table_doesnt_exist")
                         .assert()
                         .failure()
-                        .stderr(predicate::eq(
-                            "Error querying: Error while planning query: This feature is not \
-                            implemented: DropTable\n",
+                        .stderr(predicate::str::contains(
+                            "Error while planning query: This feature is not \
+                            implemented: DropTable",
                         ));
                 }
                 .boxed()
@@ -486,9 +489,84 @@ async fn query_error_handling() {
     .await
 }
 
+/// Test error handling for the query CLI command for InfluxQL queries
+#[tokio::test]
+async fn influxql_error_handling() {
+    test_helpers::maybe_start_logging();
+    let database_url = maybe_skip_integration!();
+
+    let mut cluster = MiniCluster::create_shared(database_url).await;
+
+    StepTest::new(
+        &mut cluster,
+        vec![
+            Step::WriteLineProtocol("this_table_does_exist,tag=A val=\"foo\" 1".into()),
+            Step::Custom(Box::new(|state: &mut StepTestState| {
+                async {
+                    let querier_addr = state.cluster().querier().querier_grpc_base().to_string();
+                    let namespace = state.cluster().namespace();
+
+                    Command::cargo_bin("influxdb_iox")
+                        .unwrap()
+                        .arg("-h")
+                        .arg(&querier_addr)
+                        .arg("query")
+                        .arg("--lang")
+                        .arg("influxql")
+                        .arg(namespace)
+                        .arg("CREATE DATABASE foo")
+                        .assert()
+                        .failure()
+                        .stderr(predicate::str::contains(
+                            "Error while planning query: This feature is not implemented: CREATE DATABASE",
+                        ));
+                }
+                    .boxed()
+            })),
+        ],
+    )
+        .run()
+        .await
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum QueryLanguage {
+    Sql,
+    InfluxQL,
+}
+
+impl ToString for QueryLanguage {
+    fn to_string(&self) -> String {
+        match self {
+            Self::Sql => "sql".to_string(),
+            Self::InfluxQL => "influxql".to_string(),
+        }
+    }
+}
+
+trait AddQueryLanguage {
+    /// Add the query language option to the receiver.
+    fn add_query_lang(&mut self, query_lang: Option<QueryLanguage>) -> &mut Self;
+}
+
+impl AddQueryLanguage for assert_cmd::Command {
+    fn add_query_lang(&mut self, query_lang: Option<QueryLanguage>) -> &mut Self {
+        match query_lang {
+            Some(lang) => self.arg("--lang").arg(lang.to_string()),
+            None => self,
+        }
+    }
+}
+
 /// Runs the specified query in a loop for up to 10 seconds, waiting
 /// for the specified output to appear
-async fn wait_for_query_result(state: &mut StepTestState<'_>, query_sql: &str, expected: &str) {
+async fn wait_for_query_result(
+    state: &mut StepTestState<'_>,
+    query_sql: &str,
+    query_lang: Option<QueryLanguage>,
+    expected: &str,
+) {
     let querier_addr = state.cluster().querier().querier_grpc_base().to_string();
     let namespace = state.cluster().namespace();
 
@@ -503,7 +581,8 @@ async fn wait_for_query_result(state: &mut StepTestState<'_>, query_sql: &str, e
             .arg("-h")
             .arg(&querier_addr)
             .arg("query")
-            .arg(&namespace)
+            .add_query_lang(query_lang)
+            .arg(namespace)
             .arg(query_sql)
             .assert();
 
@@ -607,12 +686,12 @@ async fn namespace_retention() {
                         .arg("retention")
                         .arg("--retention-hours")
                         .arg(retention_period_hours.to_string())
-                        .arg(&namespace)
+                        .arg(namespace)
                         .assert()
                         .success()
                         .stdout(
                             predicate::str::contains(namespace)
-                                .and(predicate::str::contains(&retention_period_ns.to_string())),
+                                .and(predicate::str::contains(retention_period_ns.to_string())),
                         );
                 }
                 .boxed()
@@ -638,7 +717,102 @@ async fn namespace_retention() {
                         .arg("retention")
                         .arg("--retention-hours")
                         .arg(retention_period_hours.to_string())
-                        .arg(&namespace)
+                        .arg(namespace)
+                        .assert()
+                        .success()
+                        .stdout(
+                            predicate::str::contains(namespace)
+                                .and(predicate::str::contains("retentionPeriodNs".to_string()))
+                                .not(),
+                        );
+                }
+                .boxed()
+            })),
+            // create a new namespace and set the retention period to 2 hours
+            Step::Custom(Box::new(|state: &mut StepTestState| {
+                async {
+                    let addr = state.cluster().router().router_grpc_base().to_string();
+                    let namespace = "namespace_2";
+                    let retention_period_hours = 2;
+                    let retention_period_ns =
+                        retention_period_hours as i64 * 60 * 60 * 1_000_000_000;
+
+                    // Validate the output of the namespace retention command
+                    //
+                    //     {
+                    //      "id": "1",
+                    //      "name": "namespace_2",
+                    //      "retentionPeriodNs": "7200000000000"
+                    //    }
+                    Command::cargo_bin("influxdb_iox")
+                        .unwrap()
+                        .arg("-h")
+                        .arg(&addr)
+                        .arg("namespace")
+                        .arg("create")
+                        .arg("--retention-hours")
+                        .arg(retention_period_hours.to_string())
+                        .arg(namespace)
+                        .assert()
+                        .success()
+                        .stdout(
+                            predicate::str::contains(namespace)
+                                .and(predicate::str::contains(retention_period_ns.to_string())),
+                        );
+                }
+                .boxed()
+            })),
+            // create a namespace without retention. 0 represeting null/infinite will be used
+            Step::Custom(Box::new(|state: &mut StepTestState| {
+                async {
+                    let addr = state.cluster().router().router_grpc_base().to_string();
+                    let namespace = "namespace_3";
+
+                    // Validate the output of the namespace retention command
+                    //
+                    //     {
+                    //      "id": "1",
+                    //      "name": "namespace_3",
+                    //    }
+                    Command::cargo_bin("influxdb_iox")
+                        .unwrap()
+                        .arg("-h")
+                        .arg(&addr)
+                        .arg("namespace")
+                        .arg("create")
+                        .arg(namespace)
+                        .assert()
+                        .success()
+                        .stdout(
+                            predicate::str::contains(namespace)
+                                .and(predicate::str::contains("retentionPeriodNs".to_string()))
+                                .not(),
+                        );
+                }
+                .boxed()
+            })),
+            // create a namespace retention 0 represeting null/infinite will be used
+            Step::Custom(Box::new(|state: &mut StepTestState| {
+                async {
+                    let addr = state.cluster().router().router_grpc_base().to_string();
+                    let namespace = "namespace_4";
+                    let retention_period_hours = 0;
+
+                    // Validate the output of the namespace retention command
+                    //
+                    //     {
+                    //      "id": "1",
+                    //      "name": "namespace_4",
+                    //    }
+                    Command::cargo_bin("influxdb_iox")
+                        .unwrap()
+                        .arg("-h")
+                        .arg(&addr)
+                        .arg("namespace")
+                        .arg("create")
+                        .arg("--retention-hours")
+                        .arg(retention_period_hours.to_string())
+                        .arg(namespace)
                         .assert()
                         .success()
                         .stdout(
@@ -689,8 +863,15 @@ async fn query_ingester() {
                         .arg("-h")
                         .arg(&ingester_addr)
                         .arg("query-ingester")
-                        .arg(state.cluster().namespace())
-                        .arg("my_awesome_table2")
+                        .arg(state.cluster().namespace_id().await.get().to_string())
+                        .arg(
+                            state
+                                .cluster()
+                                .table_id("my_awesome_table2")
+                                .await
+                                .get()
+                                .to_string(),
+                        )
                         .assert()
                         .success()
                         .stdout(predicate::str::contains(&expected));
@@ -706,7 +887,7 @@ async fn query_ingester() {
                     // something like "wrong query protocol" or
                     // "invalid message" as the querier requires a
                     // different message format Ticket in the flight protocol
-                    let expected = "Unknown namespace: my_awesome_table2";
+                    let expected = "Unknown namespace: ";
 
                     // Validate that the error message contains a reasonable error
                     Command::cargo_bin("influxdb_iox")
@@ -714,8 +895,15 @@ async fn query_ingester() {
                         .arg("-h")
                         .arg(&querier_addr)
                         .arg("query-ingester")
-                        .arg(state.cluster().namespace())
-                        .arg("my_awesome_table2")
+                        .arg(state.cluster().namespace_id().await.get().to_string())
+                        .arg(
+                            state
+                                .cluster()
+                                .table_id("my_awesome_table2")
+                                .await
+                                .get()
+                                .to_string(),
+                        )
                         .assert()
                         .failure()
                         .stderr(predicate::str::contains(expected));
@@ -741,8 +929,15 @@ async fn query_ingester() {
                         .arg("-h")
                         .arg(&ingester_addr)
                         .arg("query-ingester")
-                        .arg(state.cluster().namespace())
-                        .arg("my_awesome_table2")
+                        .arg(state.cluster().namespace_id().await.get().to_string())
+                        .arg(
+                            state
+                                .cluster()
+                                .table_id("my_awesome_table2")
+                                .await
+                                .get()
+                                .to_string(),
+                        )
                         .arg("--columns")
                         .arg("tag1,val")
                         .assert()

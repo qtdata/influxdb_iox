@@ -11,7 +11,7 @@ use crate::{
         seriesset::{SeriesSetPlan, SeriesSetPlans},
         stringset::{Error as StringSetError, StringSetPlan, StringSetPlanBuilder},
     },
-    QueryChunk, QueryDatabase,
+    QueryChunk, QueryNamespace,
 };
 use arrow::datatypes::DataType;
 use data_types::ChunkId;
@@ -25,7 +25,13 @@ use datafusion_util::AsExpr;
 use futures::{Stream, StreamExt, TryStreamExt};
 use hashbrown::HashSet;
 use observability_deps::tracing::{debug, trace, warn};
-use predicate::{rpc_predicate::InfluxRpcPredicate, Predicate, PredicateMatch};
+use predicate::{
+    rpc_predicate::{
+        InfluxRpcPredicate, FIELD_COLUMN_NAME, GROUP_KEY_SPECIAL_START, GROUP_KEY_SPECIAL_STOP,
+        MEASUREMENT_COLUMN_NAME,
+    },
+    Predicate, PredicateMatch,
+};
 use query_functions::{
     group_by::{Aggregate, WindowDuration},
     make_window_bound_expr,
@@ -104,13 +110,13 @@ pub enum Error {
     DuplicateGroupColumn { column_name: String },
 
     #[snafu(display(
-        "Group column '{}' not found in tag columns: {}",
+        "Group column '{}' not found in tag columns: {:?}",
         column_name,
         all_tag_column_names
     ))]
     GroupColumnNotFound {
         column_name: String,
-        all_tag_column_names: String,
+        all_tag_column_names: Vec<String>,
     },
 
     #[snafu(display("Error creating aggregate expression:  {}", source))]
@@ -160,12 +166,12 @@ impl Error {
             | Self::CastingAggregates { source, .. } => {
                 DataFusionError::Context(format!("{method}: {msg}"), Box::new(source))
             }
-            e @ (Self::CreatingStringSet { .. }
-            | Self::TableRemoved { .. }
+            Self::TableRemoved { .. }
             | Self::InvalidTagColumn { .. }
-            | Self::InternalInvalidTagType { .. }
             | Self::DuplicateGroupColumn { .. }
-            | Self::GroupColumnNotFound { .. }
+            | Self::GroupColumnNotFound { .. } => DataFusionError::Plan(msg),
+            e @ (Self::CreatingStringSet { .. }
+            | Self::InternalInvalidTagType { .. }
             | Self::CreatingAggregates { .. }
             | Self::CreatingScan { .. }
             | Self::InternalUnexpectedNoneAggregate {}
@@ -226,7 +232,7 @@ impl InfluxRpcPlanner {
     ///       . chunks without deleted data but cannot be decided from meta data
     pub async fn table_names(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan> {
         let ctx = self.ctx.child_ctx("table_names planning");
@@ -236,10 +242,10 @@ impl InfluxRpcPlanner {
         let rpc_predicate = rpc_predicate.clear_timestamp_if_max_range();
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
         let tables: Vec<_> =
-            table_chunk_stream(Arc::clone(&database), false, &table_predicates, &ctx)
+            table_chunk_stream(Arc::clone(&namespace), false, &table_predicates, &ctx)
                 .try_filter_map(|(table_name, predicate, chunks)| async move {
                     // Identify which chunks can answer from its metadata and then record its table,
                     // and which chunks needs full plan and group them into their table
@@ -291,7 +297,7 @@ impl InfluxRpcPlanner {
                     builder.append_string(table_name.to_string());
                 }
                 Some((predicate, chunks)) => {
-                    let schema = database
+                    let schema = namespace
                         .table_schema(table_name)
                         .context(TableRemovedSnafu {
                             table_name: table_name.as_ref(),
@@ -315,13 +321,12 @@ impl InfluxRpcPlanner {
         builder.build().context(CreatingStringSetSnafu)
     }
 
-    /// Returns a set of plans that produces the names of "tag"
-    /// columns (as defined in the InfluxDB Data model) names in this
-    /// database that have more than zero rows which pass the
-    /// conditions specified by `predicate`.
+    /// Returns a set of plans that produces the names of "tag" columns (as defined in the InfluxDB
+    /// data model) names in this namespace that have more than zero rows which pass the conditions
+    /// specified by `predicate`.
     pub async fn tag_keys(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan> {
         let ctx = self.ctx.child_ctx("tag_keys planning");
@@ -334,11 +339,11 @@ impl InfluxRpcPlanner {
         //
         // 1. Find all the potential tables in the chunks
         //
-        // 2. For each table/chunk pair, figure out which can be found
-        // from only metadata and which need full plans
+        // 2. For each table/chunk pair, figure out which can be found from only metadata and which
+        //    need full plans
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
 
         let mut table_predicates_need_chunks = vec![];
@@ -348,7 +353,7 @@ impl InfluxRpcPlanner {
                 // special case - return the columns from metadata only.
                 // Note that columns with all rows deleted will still show here
                 builder = builder.append_other(
-                    database
+                    namespace
                         .table_schema(&table_name)
                         .context(TableRemovedSnafu {
                             table_name: table_name.as_ref(),
@@ -364,7 +369,7 @@ impl InfluxRpcPlanner {
         }
 
         let tables: Vec<_> = table_chunk_stream(
-            Arc::clone(&database),
+            Arc::clone(&namespace),
             false,
             &table_predicates_need_chunks,
             &ctx,
@@ -458,7 +463,7 @@ impl InfluxRpcPlanner {
                 // out chunks (and tables) where all columns in that chunk
                 // were already known to have data (based on the contents of known_columns)
 
-                let schema = database
+                let schema = namespace
                     .table_schema(table_name)
                     .context(TableRemovedSnafu {
                         table_name: table_name.as_ref(),
@@ -478,12 +483,11 @@ impl InfluxRpcPlanner {
         builder.build().context(CreatingStringSetSnafu)
     }
 
-    /// Returns a plan which finds the distinct, non-null tag values
-    /// in the specified `tag_name` column of this database which pass
-    /// the conditions specified by `predicate`.
+    /// Returns a plan which finds the distinct, non-null tag values in the specified `tag_name`
+    /// column of this namespace which pass the conditions specified by `predicate`.
     pub async fn tag_values(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         tag_name: &str,
         rpc_predicate: InfluxRpcPredicate,
     ) -> Result<StringSetPlan> {
@@ -499,14 +503,14 @@ impl InfluxRpcPlanner {
         // which need full plans
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
 
-        // filter out tables that do NOT contain `tag_name` early, esp. before performing any chunk scan (which includes
-        // ingester RPC)
+        // filter out tables that do NOT contain `tag_name` early, esp. before performing any chunk
+        // scan (which includes ingester RPC)
         let mut table_predicates_filtered = Vec::with_capacity(table_predicates.len());
         for (table_name, predicate) in table_predicates {
-            let schema = database
+            let schema = namespace
                 .table_schema(&table_name)
                 .context(TableRemovedSnafu {
                     table_name: table_name.as_ref(),
@@ -521,7 +525,7 @@ impl InfluxRpcPlanner {
         }
 
         let tables: Vec<_> = table_chunk_stream(
-            Arc::clone(&database),
+            Arc::clone(&namespace),
             false,
             &table_predicates_filtered,
             &ctx,
@@ -546,8 +550,8 @@ impl InfluxRpcPlanner {
                 let schema = chunk.schema();
 
                 // Skip this table if the tag_name is not a column in this chunk
-                // Note: This may happen even when the table contains the tag_name, because some chunks may not
-                //       contain all columns.
+                // Note: This may happen even when the table contains the tag_name, because some
+                // chunks may not contain all columns.
                 let idx = if let Some(idx) = schema.find_index_of(tag_name) {
                     idx
                 } else {
@@ -571,8 +575,8 @@ impl InfluxRpcPlanner {
                     }
                 );
 
-                // If there are delete predicates, we need to scan (or do full plan) the data to eliminate
-                // deleted data before getting tag values
+                // If there are delete predicates, we need to scan (or do full plan) the data to
+                // eliminate deleted data before getting tag values
                 if chunk.has_delete_predicates() {
                     debug!(
                         %table_name,
@@ -628,7 +632,7 @@ impl InfluxRpcPlanner {
             builder = builder.append_other(known_values.into());
 
             if !chunks_full.is_empty() {
-                let schema = database
+                let schema = namespace
                     .table_schema(table_name)
                     .context(TableRemovedSnafu {
                         table_name: table_name.as_ref(),
@@ -642,7 +646,7 @@ impl InfluxRpcPlanner {
                     .with_predicate(predicate)
                     .build()?;
 
-                let tag_name_is_not_null = Expr::Column(tag_name.into()).is_not_null();
+                let tag_name_is_not_null = tag_name.as_expr().is_not_null();
 
                 // TODO: optimize this to use "DISINCT" or do
                 // something more intelligent that simply fetching all
@@ -670,13 +674,12 @@ impl InfluxRpcPlanner {
         builder.build().context(CreatingStringSetSnafu)
     }
 
-    /// Returns a plan that produces a list of columns and their
-    /// datatypes (as defined in the data written via `write_lines`),
-    /// and which have more than zero rows which pass the conditions
+    /// Returns a plan that produces a list of columns and their datatypes (as defined in the data
+    /// written via `write_lines`), and which have more than zero rows which pass the conditions
     /// specified by `predicate`.
     pub async fn field_columns(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
     ) -> Result<FieldListPlan> {
         let ctx = self.ctx.child_ctx("field_columns planning");
@@ -692,7 +695,7 @@ impl InfluxRpcPlanner {
         // values and stops the plan executing once it has them
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
 
         // optimization: just get the field columns from metadata.
@@ -701,7 +704,7 @@ impl InfluxRpcPlanner {
         let mut table_predicates_need_chunks = Vec::with_capacity(table_predicates.len());
         for (table_name, predicate) in table_predicates {
             if predicate.is_empty() {
-                let schema = database
+                let schema = namespace
                     .table_schema(&table_name)
                     .context(TableRemovedSnafu {
                         table_name: table_name.as_ref(),
@@ -721,7 +724,7 @@ impl InfluxRpcPlanner {
 
         // full scans
         let plans = create_plans(
-            database,
+            namespace,
             &table_predicates_need_chunks,
             ctx,
             |ctx, table_name, predicate, chunks, schema| {
@@ -762,18 +765,18 @@ impl InfluxRpcPlanner {
     /// same) occur together in the plan
     pub async fn read_filter(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
     ) -> Result<SeriesSetPlans> {
         let ctx = self.ctx.child_ctx("planning_read_filter");
         debug!(?rpc_predicate, "planning read_filter");
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
 
         let plans = create_plans(
-            database,
+            namespace,
             &table_predicates,
             ctx,
             |ctx, table_name, predicate, chunks, schema| {
@@ -813,7 +816,7 @@ impl InfluxRpcPlanner {
     ///      (apply filters)
     pub async fn read_group(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
         agg: Aggregate,
         group_columns: &[impl AsRef<str> + Send + Sync],
@@ -822,39 +825,81 @@ impl InfluxRpcPlanner {
         debug!(?rpc_predicate, ?agg, "planning read_group");
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
-
-        let plans = create_plans(
-            database,
-            &table_predicates,
-            ctx,
-            |ctx, table_name, predicate, chunks, schema| match agg {
-                Aggregate::None => Self::read_filter_plan(
-                    ctx.child_ctx("read_filter plan"),
-                    table_name,
-                    Arc::clone(&schema),
-                    predicate,
-                    chunks,
-                ),
-                _ => Self::read_group_plan(
-                    ctx.child_ctx("read_group plan"),
-                    table_name,
-                    schema,
-                    predicate,
-                    agg,
-                    chunks,
-                ),
-            },
-        )
-        .await?;
 
         // Note always group (which will resort the frames)
         // by tag, even if there are 0 columns
         let group_columns = group_columns
             .iter()
             .map(|s| Arc::from(s.as_ref()))
-            .collect();
+            .collect::<Vec<Arc<str>>>();
+        let mut group_columns_set: HashSet<Arc<str>> = HashSet::with_capacity(group_columns.len());
+        for group_col in &group_columns {
+            match group_columns_set.entry(Arc::clone(group_col)) {
+                hashbrown::hash_set::Entry::Occupied(_) => {
+                    return Err(Error::DuplicateGroupColumn {
+                        column_name: group_col.to_string(),
+                    });
+                }
+                hashbrown::hash_set::Entry::Vacant(v) => {
+                    v.insert();
+                }
+            }
+        }
+
+        let plans = create_plans(
+            namespace,
+            &table_predicates,
+            ctx,
+            |ctx, table_name, predicate, chunks, schema| {
+                // check group_columns for unknown columns
+                let known_tags_vec = schema
+                    .tags_iter()
+                    .map(|f| f.name().clone())
+                    .collect::<Vec<_>>();
+                let known_tags_set = known_tags_vec
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<HashSet<_>>();
+                for group_col in &group_columns {
+                    if (group_col.as_ref() == FIELD_COLUMN_NAME)
+                        || (group_col.as_ref() == MEASUREMENT_COLUMN_NAME)
+                        || (group_col.as_ref() == GROUP_KEY_SPECIAL_START)
+                        || (group_col.as_ref() == GROUP_KEY_SPECIAL_STOP)
+                    {
+                        continue;
+                    }
+
+                    ensure!(
+                        known_tags_set.contains(group_col.as_ref()),
+                        GroupColumnNotFoundSnafu {
+                            column_name: group_col.as_ref(),
+                            all_tag_column_names: known_tags_vec.clone(),
+                        }
+                    );
+                }
+
+                match agg {
+                    Aggregate::None => Self::read_filter_plan(
+                        ctx.child_ctx("read_filter plan"),
+                        table_name,
+                        Arc::clone(&schema),
+                        predicate,
+                        chunks,
+                    ),
+                    _ => Self::read_group_plan(
+                        ctx.child_ctx("read_group plan"),
+                        table_name,
+                        schema,
+                        predicate,
+                        agg,
+                        chunks,
+                    ),
+                }
+            },
+        )
+        .await?;
 
         Ok(SeriesSetPlans::new(plans).grouped_by(group_columns))
     }
@@ -863,7 +908,7 @@ impl InfluxRpcPlanner {
     /// that are grouped by window definitions
     pub async fn read_window_aggregate(
         &self,
-        database: Arc<dyn QueryDatabase>,
+        namespace: Arc<dyn QueryNamespace>,
         rpc_predicate: InfluxRpcPredicate,
         agg: Aggregate,
         every: WindowDuration,
@@ -879,11 +924,11 @@ impl InfluxRpcPlanner {
         );
 
         let table_predicates = rpc_predicate
-            .table_predicates(database.as_meta())
+            .table_predicates(namespace.as_meta())
             .context(CreatingPredicatesSnafu)?;
 
         let plans = create_plans(
-            database,
+            namespace,
             &table_predicates,
             ctx,
             |ctx, table_name, predicate, chunks, schema| {
@@ -1098,6 +1143,8 @@ impl InfluxRpcPlanner {
         .with_chunks(chunks)
         .build()?;
 
+        let schema = scan_and_filter.schema();
+
         let tags_and_timestamp: Vec<_> = scan_and_filter
             .schema()
             .tags_iter()
@@ -1114,7 +1161,6 @@ impl InfluxRpcPlanner {
             .context(BuildingPlanSnafu)?;
 
         // Select away anything that isn't in the influx data model
-        let schema = scan_and_filter.schema();
         let tags_fields_and_timestamps: Vec<Expr> = schema
             .tags_iter()
             .map(|field| field.name().as_expr())
@@ -1375,7 +1421,7 @@ impl InfluxRpcPlanner {
 /// This function is indirectly invoked by `field_columns`, `read_filter`, `read_group` and `read_window_aggregate`
 /// through the function `create_plans` where need_fields should be true.
 fn table_chunk_stream<'a>(
-    database: Arc<dyn QueryDatabase>,
+    namespace: Arc<dyn QueryNamespace>,
     need_fields: bool,
     table_predicates: &'a [(Arc<str>, Predicate)],
     ctx: &'a IOxSessionContext,
@@ -1385,9 +1431,9 @@ fn table_chunk_stream<'a>(
             let mut ctx = ctx.child_ctx("table");
             ctx.set_metadata("table", table_name.to_string());
 
-            let database = Arc::clone(&database);
+            let namespace = Arc::clone(&namespace);
 
-            let table_schema = database.table_schema(table_name);
+            let table_schema = namespace.table_schema(table_name);
             let projection = match table_schema {
                 Some(table_schema) => {
                     columns_in_predicates(need_fields, table_schema, table_name, predicate)
@@ -1396,11 +1442,11 @@ fn table_chunk_stream<'a>(
             };
 
             async move {
-                let chunks = database
+                let chunks = namespace
                     .chunks(
                         table_name,
                         predicate,
-                        &projection,
+                        projection.as_ref(),
                         ctx.child_ctx("table chunks"),
                     )
                     .await
@@ -1434,10 +1480,7 @@ fn columns_in_predicates(
     match &predicate.field_columns {
         Some(field_columns) => {
             for field in field_columns {
-                columns.insert(Column {
-                    relation: None,
-                    name: (*field).clone(),
-                });
+                columns.insert(Column::from_name(field));
             }
         }
         None => {
@@ -1507,7 +1550,7 @@ fn columns_in_predicates(
 /// `f(ctx, table_name, table_predicate, chunks, table_schema)` is
 ///  invoked on the chunks for each table to produce a plan for each
 async fn create_plans<F, P>(
-    database: Arc<dyn QueryDatabase>,
+    namespace: Arc<dyn QueryNamespace>,
     table_predicates: &[(Arc<str>, Predicate)],
     ctx: IOxSessionContext,
     f: F,
@@ -1525,7 +1568,7 @@ where
         + Sync,
     P: Send,
 {
-    table_chunk_stream(Arc::clone(&database), true, table_predicates, &ctx)
+    table_chunk_stream(Arc::clone(&namespace), true, table_predicates, &ctx)
         .and_then(|(table_name, predicate, chunks)| async move {
             let chunks = prune_chunks_metadata(chunks, predicate)?;
             Ok((table_name, predicate, chunks))
@@ -1540,11 +1583,11 @@ where
             let mut ctx = ctx.child_ctx("table");
             ctx.set_metadata("table", table_name.to_string());
 
-            let database = Arc::clone(&database);
+            let namespace = Arc::clone(&namespace);
             let f = f.clone();
 
             async move {
-                let schema = database
+                let schema = namespace
                     .table_schema(table_name)
                     .context(TableRemovedSnafu {
                         table_name: table_name.as_ref(),
@@ -1924,10 +1967,13 @@ fn cheap_chunk_first(mut chunks: Vec<Arc<dyn QueryChunk>>) -> Vec<Arc<dyn QueryC
 
 #[cfg(test)]
 mod tests {
-    use datafusion::prelude::{col, lit, lit_timestamp_nano};
+    use datafusion::{
+        common::ScalarValue,
+        prelude::{col, lit},
+    };
     use datafusion_util::lit_dict;
     use futures::{future::BoxFuture, FutureExt};
-    use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate};
+    use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate};
 
     use crate::{
         exec::{ExecutionContextProvider, Executor},
@@ -1950,7 +1996,7 @@ mod tests {
                 .with_one_row_of_data(),
         );
         // index of columns in the above chunk: [bar, foo, i64_field, i64_field_2, time]
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let table = "h2o";
@@ -2033,7 +2079,7 @@ mod tests {
                 .with_one_row_of_data(),
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None);
@@ -2068,7 +2114,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
 
         ////////////////////////////
         // Test 2: no need_fields
@@ -2096,7 +2141,6 @@ mod tests {
         assert_eq!(chunk_schema.field(1).1.name(), "foo");
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -2112,7 +2156,7 @@ mod tests {
                 .with_one_row_of_data(),
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None);
@@ -2144,7 +2188,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
 
         /////////////
         // Test 2: empty predicate without need_fields
@@ -2166,7 +2209,6 @@ mod tests {
         let chunk = &result[0].2[0];
         let chunk_schema = (*chunk.schema()).clone();
         assert_eq!(chunk_schema.len(), 5);
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -2181,7 +2223,7 @@ mod tests {
                 .with_time_column(), // no row added for this chunk on purpose
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None);
@@ -2212,7 +2254,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -2228,7 +2269,7 @@ mod tests {
                 .with_one_row_of_data(),
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None);
@@ -2262,7 +2303,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
 
         /////////////
         // Test 2: predicate on tag `foo` and `field_columns` is not empty
@@ -2295,7 +2335,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -2311,7 +2350,7 @@ mod tests {
                 .with_one_row_of_data(),
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
         let ctx = test_db.new_query_context(None);
@@ -2342,7 +2381,6 @@ mod tests {
         assert_eq!(chunk_schema.field(2).1.name(), "i64_field");
         assert_eq!(chunk_schema.field(3).1.name(), "i64_field_2");
         assert_eq!(chunk_schema.field(4).1.name(), TIME_COLUMN_NAME);
-        executor.join().await;
     }
 
     #[tokio::test]
@@ -2494,16 +2532,20 @@ mod tests {
         // more complicated _measurement predicates are translated
         //
         // https://github.com/influxdata/influxdb_iox/issues/3601
-        // (_measurement = 'foo' or measurement = 'h2o') AND time > 5
+        // (_measurement = 'foo' or measurement = 'h2o') AND foo = 'bar'
         let silly_predicate = Predicate::new().with_expr(
             col("_measurement")
                 .eq(lit("foo"))
                 .or(col("_measurement").eq(lit("h2o")))
-                .and(col("time").gt(lit_timestamp_nano(5))),
+                .and(col("foo").eq(lit("bar"))),
         );
 
-        // verify that the predicate was rewritten to time > 5
-        let expr = col("time").gt(lit_timestamp_nano(5));
+        // verify that the predicate was rewritten to foo = 'bar'
+        let dict = ScalarValue::Dictionary(
+            Box::new(DataType::Int32),
+            Box::new(ScalarValue::Utf8(Some("bar".to_string()))),
+        );
+        let expr = col("foo").eq(lit(dict));
 
         let expected_predicate = Predicate::new().with_expr(expr);
         run_test_with_predicate(&func, silly_predicate, expected_predicate).await;
@@ -2525,7 +2567,7 @@ mod tests {
                 .with_time_column(),
         );
 
-        let executor = Arc::new(Executor::new(1));
+        let executor = Arc::new(Executor::new_testing());
         let test_db = Arc::new(TestDatabase::new(Arc::clone(&executor)));
         test_db.add_chunk("my_partition_key", Arc::clone(&chunk0));
 
@@ -2541,7 +2583,5 @@ mod tests {
             "\nActual: {:?}\nExpected: {:?}",
             actual_predicate, expected_predicate
         );
-
-        executor.join().await;
     }
 }

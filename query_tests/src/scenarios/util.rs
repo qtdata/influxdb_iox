@@ -12,14 +12,13 @@ use generated_types::{
     influxdata::iox::ingester::v1::{IngesterQueryResponseMetadata, PartitionStatus},
     ingester::IngesterQueryRequest,
 };
-use influxdb_iox_client::flight::{low_level::LowLevelMessage, Error as FlightError};
+use influxdb_iox_client::flight::Error as FlightError;
 use ingester::{
-    data::{
-        partition::resolver::CatalogPartitionResolver, DmlApplyAction, IngesterData, Persister,
-    },
+    data::{DmlApplyAction, IngesterData, Persister},
     lifecycle::mock_handle::MockLifecycleHandle,
     querier_handler::{prepare_data_to_querier, FlatIngesterQueryResponse, IngesterQueryResponse},
 };
+use iox_arrow_flight::DecodedPayload;
 use iox_catalog::interface::get_schema_by_name;
 use iox_query::exec::{DedicatedExecutors, ExecutorType};
 use iox_tests::util::{TestCatalog, TestNamespace, TestShard};
@@ -49,7 +48,7 @@ use trace::{
 // Structs, enums, and functions used to exhaust all test scenarios of chunk lifecycle
 // & when delete predicates are applied
 
-// STRUCTs & ENUMs
+/// Describes a Chunk that should be created for a test
 #[derive(Debug, Clone, Default)]
 pub struct ChunkData<'a, 'b> {
     /// Line protocol data of this chunk
@@ -306,14 +305,14 @@ pub async fn all_scenarios_for_one_chunk(
         // Make delete predicates that happen when all chunks in their final stages
         let end_preds: Vec<Pred> = at_end_preds
             .iter()
-            .map(|p| Pred::new(*p, DeleteTime::end_for(chunk_stage)))
+            .map(|p| Pred::new(p, DeleteTime::end_for(chunk_stage)))
             .collect();
 
         for delete_time in delete_times {
             // make delete predicate with time it happens
             let mut preds: Vec<Pred> = chunk_stage_preds
                 .iter()
-                .map(|p| Pred::new(*p, delete_time))
+                .map(|p| Pred::new(p, delete_time))
                 .collect();
             // extend at-end predicates
             preds.extend(end_preds.clone());
@@ -383,8 +382,14 @@ pub async fn make_two_chunk_scenarios(
     ])
     .await
 }
-
 pub async fn make_n_chunks_scenario(chunks: &[ChunkData<'_, '_>]) -> Vec<DbScenario> {
+    make_n_chunks_scenario_with_retention(chunks, None).await
+}
+
+pub async fn make_n_chunks_scenario_with_retention(
+    chunks: &[ChunkData<'_, '_>],
+    retention_period_ns: Option<i64>,
+) -> Vec<DbScenario> {
     let n_stages_unset = chunks
         .iter()
         .filter(|chunk| chunk.chunk_stage.is_none())
@@ -441,7 +446,7 @@ pub async fn make_n_chunks_scenario(chunks: &[ChunkData<'_, '_>]) -> Vec<DbScena
 
         // build scenario
         let mut scenario_name = format!("{} chunks:", chunks.len());
-        let mut mock_ingester = MockIngester::new().await;
+        let mut mock_ingester = MockIngester::new_with_retention(retention_period_ns).await;
 
         for chunk_data in chunks {
             let name = make_chunk(&mut mock_ingester, chunk_data).await;
@@ -653,20 +658,29 @@ static GLOBAL_EXEC: Lazy<Arc<DedicatedExecutors>> =
 impl MockIngester {
     /// Create new empty ingester.
     async fn new() -> Self {
+        Self::new_with_retention(None).await
+    }
+
+    async fn new_with_retention(retention_period_ns: Option<i64>) -> Self {
         let exec = Arc::clone(&GLOBAL_EXEC);
         let catalog = TestCatalog::with_execs(exec, 4);
-        let ns = catalog.create_namespace("test_db").await;
+        let ns = catalog
+            .create_namespace_with_retention("test_db", retention_period_ns)
+            .await;
         let shard = ns.create_shard(1).await;
 
-        let ingester_data = Arc::new(IngesterData::new(
-            catalog.object_store(),
-            catalog.catalog(),
-            [(shard.shard.id, shard.shard.shard_index)],
-            catalog.exec(),
-            Arc::new(CatalogPartitionResolver::new(catalog.catalog())),
-            BackoffConfig::default(),
-            catalog.metric_registry(),
-        ));
+        let ingester_data = Arc::new(
+            IngesterData::new(
+                catalog.object_store(),
+                catalog.catalog(),
+                [(shard.shard.id, shard.shard.shard_index)],
+                catalog.exec(),
+                BackoffConfig::default(),
+                catalog.metric_registry(),
+            )
+            .await
+            .expect("failed to initialise ingester"),
+        );
 
         Self {
             catalog,
@@ -785,19 +799,21 @@ impl MockIngester {
         }
         let (mutable_batches, _stats) = converter.finish().unwrap();
 
-        // set up catalog
-        let tables = {
-            // sort names so that IDs are deterministic
-            let mut table_names: Vec<_> = mutable_batches.keys().cloned().collect();
-            table_names.sort();
+        // sort names so that IDs are deterministic
+        let mut table_names: Vec<_> = mutable_batches.keys().cloned().collect();
+        table_names.sort();
 
-            let mut tables = vec![];
-            for table_name in table_names {
-                let table = self.ns.create_table(&table_name).await;
-                tables.push(table);
-            }
-            tables
-        };
+        // set up catalog, map from catalog id to batch
+        let mut tables = Vec::with_capacity(table_names.len());
+        let mut batches_by_id = hashbrown::HashMap::with_capacity(table_names.len());
+
+        for table_name in table_names {
+            let table = self.ns.create_table(&table_name).await;
+            let table_id = table.table.id;
+            tables.push(table);
+            batches_by_id.insert(table_id, mutable_batches.get(&table_name).unwrap().clone());
+        }
+
         let mut partition_ids = vec![];
         for table in &tables {
             let partition = table
@@ -807,12 +823,7 @@ impl MockIngester {
             partition_ids.push(partition.partition.id);
         }
 
-        let ids = tables
-            .iter()
-            .map(|v| (v.table.name.clone(), v.table.id))
-            .collect();
-
-        for table in tables {
+        for table in &tables {
             let schema = mutable_batches
                 .get(&table.table.name)
                 .unwrap()
@@ -834,10 +845,8 @@ impl MockIngester {
             0,
         );
         let op = DmlOperation::Write(DmlWrite::new(
-            self.ns.namespace.name.clone(),
             self.ns.namespace.id,
-            mutable_batches,
-            ids,
+            batches_by_id,
             PartitionKey::from(partition_key),
             meta,
         ));
@@ -861,7 +870,6 @@ impl MockIngester {
             0,
         );
         DmlOperation::Delete(DmlDelete::new(
-            self.ns.namespace.name.clone(),
             self.ns.namespace.id,
             predicate,
             Some(NonEmptyString::new(delete_table_name).unwrap()),
@@ -956,7 +964,6 @@ impl MockIngester {
             catalog.exec(),
             Some(ingester_connection),
             sharder,
-            usize::MAX,
         ))
     }
 }
@@ -991,7 +998,7 @@ impl IngesterFlightClient for MockIngester {
 /// [`IngesterFlightClientQueryData`] (used by the querier) without doing any real gRPC IO.
 struct QueryDataAdapter {
     messages: Box<
-        dyn Iterator<Item = Result<(LowLevelMessage, IngesterQueryResponseMetadata), FlightError>>
+        dyn Iterator<Item = Result<(DecodedPayload, IngesterQueryResponseMetadata), FlightError>>
             + Send,
     >,
 }
@@ -1017,7 +1024,7 @@ impl QueryDataAdapter {
                             partition_id,
                             status,
                         } => (
-                            LowLevelMessage::None,
+                            DecodedPayload::None,
                             IngesterQueryResponseMetadata {
                                 partition_id: partition_id.get(),
                                 status: Some(PartitionStatus {
@@ -1025,14 +1032,17 @@ impl QueryDataAdapter {
                                         .parquet_max_sequence_number
                                         .map(|x| x.get()),
                                 }),
+                                // These fields are only used in ingester2.
+                                ingester_uuid: String::new(),
+                                completed_persistence_count: 0,
                             },
                         ),
                         FlatIngesterQueryResponse::StartSnapshot { schema } => (
-                            LowLevelMessage::Schema(schema),
+                            DecodedPayload::Schema(schema),
                             IngesterQueryResponseMetadata::default(),
                         ),
                         FlatIngesterQueryResponse::RecordBatch { batch } => (
-                            LowLevelMessage::RecordBatch(batch),
+                            DecodedPayload::RecordBatch(batch),
                             IngesterQueryResponseMetadata::default(),
                         ),
                     };
@@ -1052,9 +1062,9 @@ impl QueryDataAdapter {
 
 #[async_trait]
 impl IngesterFlightClientQueryData for QueryDataAdapter {
-    async fn next(
+    async fn next_message(
         &mut self,
-    ) -> Result<Option<(LowLevelMessage, IngesterQueryResponseMetadata)>, FlightError> {
+    ) -> Result<Option<(DecodedPayload, IngesterQueryResponseMetadata)>, FlightError> {
         self.messages.next().transpose()
     }
 }

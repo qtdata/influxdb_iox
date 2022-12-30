@@ -1,12 +1,16 @@
 //! Library of test scenarios that can be used in query_tests
 
 use super::{
-    util::{all_scenarios_for_one_chunk, make_two_chunk_scenarios, ChunkStage},
+    util::{
+        all_scenarios_for_one_chunk, make_n_chunks_scenario_with_retention,
+        make_two_chunk_scenarios, ChunkStage,
+    },
     DbScenario, DbSetup,
 };
 use crate::scenarios::util::{make_n_chunks_scenario, ChunkData};
 use async_trait::async_trait;
 use iox_query::frontend::sql::SqlQueryPlanner;
+use iox_time::{MockProvider, Time, TimeProvider};
 
 #[derive(Debug)]
 pub struct MeasurementWithMaxTime {}
@@ -534,6 +538,44 @@ impl DbSetup for OneMeasurementFourChunksWithDuplicatesWithIngester {
     }
 }
 
+/// Setup with 20 parquet files, some with duplicated and some without
+/// duplicated tags. The idea here is to verify that merging them
+/// together produces the correct values
+#[derive(Debug)]
+pub struct TwentySortedParquetFiles {}
+#[async_trait]
+impl DbSetup for TwentySortedParquetFiles {
+    async fn make(&self) -> Vec<DbScenario> {
+        let lp_data: Vec<_> = (0..20)
+            .map(|i| {
+                if i % 2 == 0 {
+                    vec![
+                        format!("m,tag=A f=1 {}", 1000 - i), // unique in this chunk
+                        format!("m,tab=B f=2 {}", 1000 - i), // unique in this chunk (not plus i!)
+                    ]
+                } else {
+                    vec![
+                        format!("m,tag=A f=3 2001"), // duplicated across all chunks
+                    ]
+                }
+            })
+            .collect();
+
+        let partition_key = "1970-01-01T00";
+        let chunk_data: Vec<_> = lp_data
+            .iter()
+            .map(|lp_lines| ChunkData {
+                lp_lines: lp_lines.iter().map(|s| s.as_str()).collect(),
+                partition_key,
+                chunk_stage: Some(ChunkStage::Parquet),
+                ..Default::default()
+            })
+            .collect();
+
+        make_n_chunks_scenario(&chunk_data).await
+    }
+}
+
 #[derive(Debug)]
 pub struct OneMeasurementManyFields {}
 #[async_trait]
@@ -597,6 +639,25 @@ impl DbSetup for TwoMeasurementsMultiSeries {
         // Swap around data is not inserted in series order
         lp_lines.swap(0, 2);
         lp_lines.swap(4, 5);
+
+        all_scenarios_for_one_chunk(vec![], vec![], lp_lines, "h2o", partition_key).await
+    }
+}
+
+#[derive(Debug)]
+pub struct TwoMeasurementsMultiTagValue {}
+#[async_trait]
+impl DbSetup for TwoMeasurementsMultiTagValue {
+    async fn make(&self) -> Vec<DbScenario> {
+        let partition_key = "1970-01-01T00";
+
+        let lp_lines = vec![
+            "h2o,state=MA,city=Boston temp=70.4 100",
+            "h2o,state=MA,city=Lowell temp=75.4 100",
+            "h2o,state=CA,city=LA temp=90.0 200",
+            "o2,state=MA,city=Boston temp=50.4,reading=50 100",
+            "o2,state=KS,city=Topeka temp=60.4,reading=60 100",
+        ];
 
         all_scenarios_for_one_chunk(vec![], vec![], lp_lines, "h2o", partition_key).await
     }
@@ -923,6 +984,59 @@ impl DbSetup for MeasurementForDefect2890 {
     }
 }
 
+// Test data for retention policy
+#[derive(Debug)]
+pub struct ThreeChunksWithRetention {}
+#[async_trait]
+impl DbSetup for ThreeChunksWithRetention {
+    async fn make(&self) -> Vec<DbScenario> {
+        // Same time provider as the one used in n_chunks scenarios
+        let time_provider = MockProvider::new(Time::from_timestamp(0, 0).unwrap());
+        let retention_period_1_hour_ns = 3600 * 1_000_000_000;
+        let inside_retention = time_provider.now().timestamp_nanos(); // now
+        let outside_retention = inside_retention - retention_period_1_hour_ns - 10; // over one hour ago
+
+        let partition_key = "test_partition";
+
+        let l1 = format!("cpu,host=a load=1 {}", inside_retention);
+        let l2 = format!("cpu,host=aa load=11 {}", outside_retention);
+        let lp_partially_inside = vec![l1.as_str(), l2.as_str()];
+
+        let l3 = format!("cpu,host=b load=2 {}", inside_retention);
+        let l4 = format!("cpu,host=bb load=21 {}", inside_retention);
+        let lp_fully_inside = vec![l3.as_str(), l4.as_str()];
+
+        let l5 = format!("cpu,host=z load=3 {}", outside_retention);
+        let l6 = format!("cpu,host=zz load=31 {}", outside_retention);
+        let lp_fully_outside = vec![l5.as_str(), l6.as_str()];
+
+        let c_partially_inside = ChunkData {
+            lp_lines: lp_partially_inside,
+            partition_key,
+            chunk_stage: Some(ChunkStage::Parquet),
+            ..Default::default()
+        };
+        let c_fully_inside = ChunkData {
+            lp_lines: lp_fully_inside,
+            partition_key,
+            chunk_stage: Some(ChunkStage::Parquet),
+            ..Default::default()
+        };
+        let c_fully_outside = ChunkData {
+            lp_lines: lp_fully_outside,
+            partition_key,
+            chunk_stage: Some(ChunkStage::Parquet),
+            ..Default::default()
+        };
+
+        make_n_chunks_scenario_with_retention(
+            &[c_partially_inside, c_fully_inside, c_fully_outside],
+            Some(retention_period_1_hour_ns),
+        )
+        .await
+    }
+}
+
 #[derive(Debug)]
 pub struct TwoChunksMissingColumns {}
 #[async_trait]
@@ -964,5 +1078,84 @@ impl DbSetup for PeriodsInNames {
         ];
 
         all_scenarios_for_one_chunk(vec![], vec![], lp, "measurement.one", partition_key).await
+    }
+}
+
+/// This re-creates <https://github.com/influxdata/influxdb_iox/issues/6066>.
+///
+/// Namely it sets up two chunks to which certain filters MUST NOT be applied prior to deduplication.
+fn two_chunks_dedup_weirdness() -> Vec<ChunkData<'static, 'static>> {
+    let partition_key = "1970-01-01T00";
+
+    let lp_lines1 = vec!["table,tag=A foo=1,bar=1 0"];
+
+    let lp_lines2 = vec!["table,tag=A bar=2 0", "table,tag=B foo=1 0"];
+
+    vec![
+        ChunkData {
+            lp_lines: lp_lines1,
+            partition_key,
+            ..Default::default()
+        },
+        ChunkData {
+            lp_lines: lp_lines2,
+            partition_key,
+            ..Default::default()
+        },
+    ]
+}
+
+#[derive(Debug)]
+pub struct TwoChunksDedupWeirdnessParquet {}
+
+#[async_trait]
+impl DbSetup for TwoChunksDedupWeirdnessParquet {
+    async fn make(&self) -> Vec<DbScenario> {
+        let chunk_data: Vec<_> = two_chunks_dedup_weirdness()
+            .into_iter()
+            .map(|cd| ChunkData {
+                chunk_stage: Some(ChunkStage::Parquet),
+                ..cd
+            })
+            .collect();
+
+        make_n_chunks_scenario(&chunk_data).await
+    }
+}
+
+#[derive(Debug)]
+pub struct TwoChunksDedupWeirdnessParquetIngester {}
+
+#[async_trait]
+impl DbSetup for TwoChunksDedupWeirdnessParquetIngester {
+    async fn make(&self) -> Vec<DbScenario> {
+        let chunk_data = two_chunks_dedup_weirdness();
+        assert_eq!(chunk_data.len(), 2);
+
+        make_n_chunks_scenario(&[
+            ChunkData {
+                chunk_stage: Some(ChunkStage::Parquet),
+                ..chunk_data[0].clone()
+            },
+            ChunkData {
+                chunk_stage: Some(ChunkStage::Ingester),
+                ..chunk_data[1].clone()
+            },
+        ])
+        .await
+    }
+}
+
+/// This recreates the test case for
+/// <https://github.com/influxdata/idpe/issues/16238>.
+pub struct StringFieldWithNumericValue {}
+#[async_trait]
+impl DbSetup for StringFieldWithNumericValue {
+    async fn make(&self) -> Vec<DbScenario> {
+        let partition_key = "2021-01-01T00";
+
+        let lp = vec!["m,tag0=foo fld=\"200\" 1000", "m,tag0=foo fld=\"404\" 1050"];
+
+        all_scenarios_for_one_chunk(vec![], vec![], lp, "m", partition_key).await
     }
 }

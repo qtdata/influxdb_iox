@@ -1,4 +1,5 @@
 pub mod common;
+pub mod influxql;
 pub mod influxrpc;
 pub mod reorg;
 pub mod sql;
@@ -19,7 +20,7 @@ mod test {
     use crate::{
         exec::{split::StreamSplitExec, Executor, ExecutorType, IOxSessionContext},
         frontend::reorg::ReorgPlanner,
-        provider::{DeduplicateExec, IOxReadFilterNode},
+        provider::{DeduplicateExec, RecordBatchesExec},
         test::TestChunk,
         QueryChunk, QueryChunkMeta, ScanPlanBuilder,
     };
@@ -72,7 +73,7 @@ mod test {
         let logical_plan = scan_plan.plan_builder.build().unwrap();
 
         // Build physical plan
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&logical_plan)
@@ -122,7 +123,7 @@ mod test {
         let logical_plan = scan_plan.plan_builder.build().unwrap();
 
         // Build physical plan
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&logical_plan)
@@ -188,7 +189,7 @@ mod test {
         let logical_plan = scan_plan.plan_builder.build().unwrap();
 
         // Build physical plan
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let physical_plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&logical_plan)
@@ -232,7 +233,7 @@ mod test {
             .split_plan(Arc::from("t"), schema, chunks, sort_key, vec![1000])
             .expect("created compact plan");
 
-        let executor = Executor::new(1);
+        let executor = Executor::new_testing();
         let plan = executor
             .new_context(ExecutorType::Reorg)
             .create_physical_plan(&split_plan)
@@ -255,7 +256,7 @@ mod test {
 
         // now validate metrics are good
         let extracted = extract_metrics(plan.as_ref(), |plan| {
-            plan.as_any().downcast_ref::<IOxReadFilterNode>().is_some()
+            plan.as_any().downcast_ref::<RecordBatchesExec>().is_some()
         })
         .unwrap();
 
@@ -276,8 +277,6 @@ mod test {
         .unwrap();
 
         assert_extracted_metrics!(extracted, 8);
-
-        executor.join().await;
     }
 
     // Extracted baseline metrics for the specified operator
@@ -313,7 +312,7 @@ mod test {
             if !(self.pred)(plan) {
                 return Ok(true);
             }
-            let metrics = plan.metrics().unwrap().aggregate_by_partition();
+            let metrics = plan.metrics().unwrap().aggregate_by_name();
             let mut elapsed_compute: Option<metrics::Time> = None;
             let mut output_rows: Option<metrics::Count> = None;
             let mut start_timestamp: Option<metrics::Timestamp> = None;

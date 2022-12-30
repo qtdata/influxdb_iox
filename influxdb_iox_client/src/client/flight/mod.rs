@@ -1,10 +1,20 @@
-use ::generated_types::influxdata::iox::querier::v1::{AppMetadata, ReadInfo};
+//! Client for InfluxDB IOx Flight API
+
+use std::{pin::Pin, task::Poll};
+
+use ::generated_types::influxdata::iox::querier::v1::{read_info::QueryType, ReadInfo};
+use futures_util::{Stream, StreamExt};
+use prost::Message;
 use thiserror::Error;
 
 use arrow::{
     ipc::{self},
     record_batch::RecordBatch,
 };
+
+use rand::Rng;
+
+use iox_arrow_flight::{FlightClient, FlightError, FlightRecordBatchStream};
 
 use crate::connection::Connection;
 
@@ -16,13 +26,7 @@ pub mod generated_types {
     };
 }
 
-pub mod low_level;
-pub use low_level::{Client as LowLevelClient, PerformQuery as LowLevelPerformQuery};
-
-use self::low_level::LowLevelMessage;
-
-/// Error responses when querying an IOx database using the Arrow Flight gRPC
-/// API.
+/// Error responses when querying an IOx namespace using the IOx Flight API.
 #[derive(Debug, Error)]
 pub enum Error {
     /// There were no FlightData messages returned when we expected to get one
@@ -34,6 +38,10 @@ pub enum Error {
     #[error(transparent)]
     ArrowError(#[from] arrow::error::ArrowError),
 
+    /// An error involving an Arrow operation occurred.
+    #[error(transparent)]
+    ArrowFlightError(#[from] iox_arrow_flight::FlightError),
+
     /// The data contained invalid Flatbuffers.
     #[error("Invalid Flatbuffer: `{0}`")]
     InvalidFlatbuffer(String),
@@ -44,14 +52,9 @@ pub enum Error {
     #[error("Message with header of type dictionary batch could not return a dictionary batch")]
     CouldNotGetDictionaryBatch,
 
-    /// An unknown server error occurred. Contains the `tonic::Status` returned
-    /// from the server.
-    #[error("{}", .0.message())]
-    GrpcError(#[from] tonic::Status),
-
     /// Arrow Flight handshake failed.
-    #[error("Handshake failed")]
-    HandshakeFailed,
+    #[error("Handshake failed: {0}")]
+    HandshakeFailed(String),
 
     /// Serializing the protobuf structs into bytes failed.
     #[error(transparent)]
@@ -70,11 +73,33 @@ pub enum Error {
     UnexpectedSchemaChange,
 }
 
-/// An IOx Arrow Flight gRPC API client.
+impl Error {
+    /// Extracts the underlying tonic status, if any
+    pub fn tonic_status(&self) -> Option<&tonic::Status> {
+        if let Self::ArrowFlightError(FlightError::Tonic(status)) = self {
+            Some(status)
+        } else {
+            None
+        }
+    }
+}
+
+impl From<tonic::Status> for Error {
+    fn from(status: tonic::Status) -> Self {
+        Self::ArrowFlightError(status.into())
+    }
+}
+
+/// InfluxDB IOx Flight API client.
+///
+/// This client can send SQL or InfluxQL queries to an IOx server
+/// via IOx's native [Apache Arrow Flight](https://arrow.apache.org/blog/2019/10/13/introducing-arrow-flight/)
+/// API (based on gRPC) and returns query results as streams of [`RecordBatch`].
 ///
 /// # Protocol
-/// This client is only suitable to yield a stream of record batches with the same schema. No metadata handling is
-/// supported. For a more advanced usage use the [low level interface](low_level).
+///
+/// For SQL queries, this client yields a stream of [`RecordBatch`]es
+/// with the same schema.
 ///
 /// # Example
 ///
@@ -86,8 +111,10 @@ pub enum Error {
 ///     flight::{
 ///         Client,
 ///         generated_types::ReadInfo,
+///         generated_types::read_info,
 ///     },
 /// };
+/// use futures_util::TryStreamExt;
 ///
 /// let connection = Builder::default()
 ///     .build("http://127.0.0.1:8082")
@@ -96,90 +123,162 @@ pub enum Error {
 ///
 /// let mut client = Client::new(connection);
 ///
-/// let mut query_results = client
-///     .perform_query(ReadInfo {
-///         namespace_name: "my_database".to_string(),
-///         sql_query: "select * from cpu_load".to_string(),
-///     })
+/// // results is a stream of RecordBatches
+/// let query_results = client
+///     .sql("my_namespace".into(), "select * from cpu_load".into())
 ///     .await
 ///     .expect("query request should work");
 ///
-/// let mut batches = vec![];
-///
-/// while let Some(data) = query_results.next().await.expect("valid batches") {
-///     batches.push(data);
-/// }
+/// // Can use standard TryStreamExt combinators like try_collect
+/// let batches: Vec<_> = query_results
+///     .try_collect()
+///     .await
+///     .expect("valid bathes");
 /// # }
 /// ```
 #[derive(Debug)]
 pub struct Client {
-    inner: LowLevelClient<ReadInfo>,
+    inner: FlightClient,
 }
 
 impl Client {
-    /// Creates a new client with the provided connection
+    /// Creates a new client with the provided [`Connection`]. Panics
+    /// if the metadata in connection is invalid for the underlying
+    /// tonic library.
     pub fn new(connection: Connection) -> Self {
-        Self {
-            inner: LowLevelClient::new(connection, None),
+        // Extract headers to include with each request
+        let (channel, headers) = connection.into_grpc_connection().into_parts();
+
+        let mut inner = FlightClient::new(channel);
+
+        // Copy any headers from IOx Connection
+        for (name, value) in headers.iter() {
+            let name = tonic::metadata::MetadataKey::<_>::from_bytes(name.as_str().as_bytes())
+                .expect("Invalid metadata name");
+
+            let value: tonic::metadata::MetadataValue<_> =
+                value.as_bytes().try_into().expect("Invalid metadata value");
+            inner.metadata_mut().insert(name, value);
         }
+
+        Self { inner }
     }
 
-    /// Query the given database with the given SQL query, and return a
-    /// [`PerformQuery`] instance that streams Arrow `RecordBatch` results.
-    pub async fn perform_query(&mut self, request: ReadInfo) -> Result<PerformQuery, Error> {
-        PerformQuery::new(self, request).await
+    /// Return the inner arrow flight client
+    pub fn into_inner(self) -> FlightClient {
+        self.inner
     }
+
+    /// Query the given namespace with the given SQL query, returning
+    /// a struct that can stream Arrow [`RecordBatch`] results.
+    pub async fn sql(
+        &mut self,
+        namespace_name: String,
+        sql_query: String,
+    ) -> Result<IOxRecordBatchStream, Error> {
+        let request = ReadInfo {
+            namespace_name,
+            sql_query,
+            query_type: QueryType::Sql.into(),
+        };
+
+        self.do_get_with_read_info(request).await
+    }
+
+    /// Query the given namespace with the given InfluxQL query, returning
+    /// a struct that can stream Arrow [`RecordBatch`] results.
+    pub async fn influxql(
+        &mut self,
+        namespace_name: String,
+        influxql_query: String,
+    ) -> Result<IOxRecordBatchStream, Error> {
+        let request = ReadInfo {
+            namespace_name,
+            sql_query: influxql_query,
+            query_type: QueryType::InfluxQl.into(),
+        };
+
+        self.do_get_with_read_info(request).await
+    }
+
+    /// Perform a lower level client read with the `ReadInfo`
+    async fn do_get_with_read_info(
+        &mut self,
+        read_info: ReadInfo,
+    ) -> Result<IOxRecordBatchStream, Error> {
+        // encode readinfo as bytes and send it
+        self.inner
+            .do_get(read_info.encode_to_vec())
+            .await
+            .map(IOxRecordBatchStream::new)
+            .map_err(Error::ArrowFlightError)
+    }
+
+    /// Perform a handshake with the server, returning Ok on success
+    /// and Err if the server fails the handshake.
+    ///
+    /// It is best practice to ensure a successful handshake with IOx
+    /// prior to issuing queries.
 
     /// Perform a handshake with the server, as defined by the Arrow Flight API.
     pub async fn handshake(&mut self) -> Result<(), Error> {
-        self.inner.handshake().await
+        // handshake is an echo server. Send some random bytes and
+        // expect the same back.
+        let payload = rand::thread_rng().gen::<[u8; 16]>().to_vec();
+
+        let response = self
+            .inner
+            .handshake(payload.clone())
+            .await
+            .map_err(|e| e.to_string())
+            .map_err(Error::HandshakeFailed)?;
+
+        if payload.eq(&response) {
+            Ok(())
+        } else {
+            Err(Error::HandshakeFailed("reponse mismatch".into()))
+        }
     }
 }
 
-/// A struct that manages the stream of Arrow `RecordBatch` results from an
-/// Arrow Flight query. Created by calling the `perform_query` method on a
-/// Flight [`Client`].
 #[derive(Debug)]
-pub struct PerformQuery {
-    inner: LowLevelPerformQuery<AppMetadata>,
-    got_schema: bool,
+/// Translates errors from FlightErrors to IOx client errors,
+/// providing access to the underyling [`FlightRecordBatchStream`]
+pub struct IOxRecordBatchStream {
+    inner: FlightRecordBatchStream,
 }
 
-impl PerformQuery {
-    pub(crate) async fn new(flight: &mut Client, request: ReadInfo) -> Result<Self, Error> {
-        let inner = flight.inner.perform_query(request).await?;
-
-        Ok(Self {
-            inner,
-            got_schema: false,
-        })
+impl IOxRecordBatchStream {
+    /// create a new IOxRecordBatchStream
+    pub fn new(inner: FlightRecordBatchStream) -> Self {
+        Self { inner }
     }
 
-    /// Returns the next `RecordBatch` available for this query, or `None` if
-    /// there are no further results available.
-    pub async fn next(&mut self) -> Result<Option<RecordBatch>, Error> {
-        loop {
-            match self.inner.next().await? {
-                None => return Ok(None),
-                Some((LowLevelMessage::Schema(_), _)) => {
-                    if self.got_schema {
-                        return Err(Error::UnexpectedSchemaChange);
-                    }
-                    self.got_schema = true;
-                }
-                Some((LowLevelMessage::RecordBatch(batch), _)) => return Ok(Some(batch)),
-                Some((LowLevelMessage::None, _)) => (),
-            }
-        }
+    /// Return a reference to the inner stream
+    pub fn inner(&self) -> &FlightRecordBatchStream {
+        &self.inner
     }
 
-    /// Collect and return all `RecordBatch`es into a `Vec`
-    pub async fn collect(&mut self) -> Result<Vec<RecordBatch>, Error> {
-        let mut batches = Vec::new();
-        while let Some(data) = self.next().await? {
-            batches.push(data);
-        }
+    /// Return a mutable reference to the inner stream
+    pub fn inner_mut(&mut self) -> &mut FlightRecordBatchStream {
+        &mut self.inner
+    }
 
-        Ok(batches)
+    /// Consume self and return the wrapped [`FlightRecordBatchStream`]
+    pub fn into_inner(self) -> FlightRecordBatchStream {
+        self.inner
+    }
+}
+
+impl Stream for IOxRecordBatchStream {
+    type Item = Result<RecordBatch, Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Option<Result<RecordBatch, Error>>> {
+        self.inner
+            .poll_next_unpin(cx)
+            .map_err(Error::ArrowFlightError)
     }
 }

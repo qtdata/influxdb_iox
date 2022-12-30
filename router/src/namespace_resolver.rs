@@ -1,10 +1,10 @@
-//! An trait to abstract resolving a[`DatabaseName`] to [`NamespaceId`], and a
+//! An trait to abstract resolving a[`NamespaceName`] to [`NamespaceId`], and a
 //! collection of composable implementations.
 
 use std::{ops::DerefMut, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{DatabaseName, NamespaceId};
+use data_types::{NamespaceId, NamespaceName};
 use iox_catalog::interface::{get_schema_by_name, Catalog};
 use observability_deps::tracing::*;
 use thiserror::Error;
@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::namespace_cache::NamespaceCache;
 
 pub mod mock;
-mod ns_autocreation;
+pub(crate) mod ns_autocreation;
 pub use ns_autocreation::*;
 
 /// Error states encountered during [`NamespaceId`] lookup.
@@ -27,13 +27,13 @@ pub enum Error {
     Create(#[from] NamespaceCreationError),
 }
 
-/// An abstract resolver of [`DatabaseName`] to [`NamespaceId`].
+/// An abstract resolver of [`NamespaceName`] to [`NamespaceId`].
 #[async_trait]
 pub trait NamespaceResolver: std::fmt::Debug + Send + Sync {
-    /// Return the [`NamespaceId`] for the given [`DatabaseName`].
+    /// Return the [`NamespaceId`] for the given [`NamespaceName`].
     async fn get_namespace_id(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
     ) -> Result<NamespaceId, Error>;
 }
 
@@ -61,7 +61,7 @@ where
 {
     async fn get_namespace_id(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
     ) -> Result<NamespaceId, Error> {
         // Load the namespace schema from the cache, falling back to pulling it
         // from the global catalog (if it exists).
@@ -110,7 +110,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_hit() {
-        let ns = DatabaseName::try_from("bananas").unwrap();
+        let ns = NamespaceName::try_from("bananas").unwrap();
 
         // Prep the cache before the test to cause a hit
         let cache = Arc::new(MemoryNamespaceCache::default());
@@ -122,6 +122,7 @@ mod tests {
                 query_pool_id: QueryPoolId::new(3),
                 tables: Default::default(),
                 max_columns_per_table: 4,
+                retention_period_ns: None,
             },
         );
 
@@ -154,7 +155,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_miss() {
-        let ns = DatabaseName::try_from("bananas").unwrap();
+        let ns = NamespaceName::try_from("bananas").unwrap();
 
         let cache = Arc::new(MemoryNamespaceCache::default());
         let metrics = Arc::new(metric::Registry::new());
@@ -167,12 +168,7 @@ mod tests {
             let query_pool = repos.query_pools().create_or_get("platanos").await.unwrap();
             repos
                 .namespaces()
-                .create(
-                    &ns,
-                    iox_catalog::INFINITE_RETENTION_POLICY,
-                    topic.id,
-                    query_pool.id,
-                )
+                .create(&ns, None, topic.id, query_pool.id)
                 .await
                 .expect("failed to setup catalog state");
         }
@@ -190,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_miss_does_not_exist() {
-        let ns = DatabaseName::try_from("bananas").unwrap();
+        let ns = NamespaceName::try_from("bananas").unwrap();
 
         let cache = Arc::new(MemoryNamespaceCache::default());
         let metrics = Arc::new(metric::Registry::new());

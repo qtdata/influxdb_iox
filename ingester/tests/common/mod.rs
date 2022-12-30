@@ -1,8 +1,8 @@
 use std::{collections::HashMap, num::NonZeroU32, sync::Arc, time::Duration};
 
 use data_types::{
-    Namespace, NamespaceSchema, PartitionKey, QueryPoolId, Sequence, SequenceNumber, ShardId,
-    ShardIndex, TopicId,
+    Namespace, NamespaceId, NamespaceSchema, PartitionKey, QueryPoolId, Sequence, SequenceNumber,
+    ShardId, ShardIndex, TableId, TopicId,
 };
 use dml::{DmlMeta, DmlWrite};
 use futures::{stream::FuturesUnordered, StreamExt};
@@ -53,9 +53,9 @@ pub struct TestContext {
     topic_id: TopicId,
     shard_id: ShardId,
 
-    // A map of namespaces to schemas, also serving as the set of known
+    // A map of namespace IDs to schemas, also serving as the set of known
     // namespaces.
-    namespaces: HashMap<String, NamespaceSchema>,
+    namespaces: HashMap<NamespaceId, NamespaceSchema>,
 
     catalog: Arc<dyn Catalog>,
     object_store: Arc<DynObjectStore>,
@@ -105,7 +105,7 @@ impl TestContext {
             Arc::clone(&catalog),
             Arc::clone(&object_store),
             write_buffer_read,
-            Arc::new(Executor::new(1)),
+            Arc::new(Executor::new_testing()),
             Arc::clone(&metrics),
             true,
             1,
@@ -160,7 +160,7 @@ impl TestContext {
             Arc::clone(&self.catalog),
             Arc::clone(&self.object_store),
             write_buffer_read,
-            Arc::new(Executor::new(1)),
+            Arc::new(Executor::new_testing()),
             Arc::clone(&self.metrics),
             true,
             1,
@@ -175,30 +175,30 @@ impl TestContext {
     ///
     /// Must not be called twice with the same `name`.
     #[track_caller]
-    pub async fn ensure_namespace(&mut self, name: &str) -> Namespace {
+    pub async fn ensure_namespace(
+        &mut self,
+        name: &str,
+        retention_period_ns: Option<i64>,
+    ) -> Namespace {
         let ns = self
             .catalog
             .repositories()
             .await
             .namespaces()
-            .create(
-                name,
-                iox_catalog::INFINITE_RETENTION_POLICY,
-                self.topic_id,
-                self.query_id,
-            )
+            .create(name, None, self.topic_id, self.query_id)
             .await
             .expect("failed to create test namespace");
 
         assert!(
             self.namespaces
                 .insert(
-                    name.to_owned(),
+                    ns.id,
                     NamespaceSchema::new(
                         ns.id,
                         self.topic_id,
                         self.query_id,
                         iox_catalog::DEFAULT_MAX_COLUMNS_PER_TABLE,
+                        retention_period_ns,
                     ),
                 )
                 .is_none(),
@@ -208,49 +208,6 @@ impl TestContext {
         debug!(?ns, "test namespace created");
 
         ns
-    }
-
-    /// Enqueue the specified `op` into the write buffer for the ingester to
-    /// consume.
-    ///
-    /// This call takes care of validating the schema of `op` and populating the
-    /// catalog with any new schema elements.
-    ///
-    /// # Panics
-    ///
-    /// This method panics if the namespace for `op` does not exist, or the
-    /// schema is invalid or conflicts with the existing namespace schema.
-    #[track_caller]
-    pub async fn enqueue_write(&mut self, op: DmlWrite) -> SequenceNumber {
-        let schema = self
-            .namespaces
-            .get_mut(op.namespace())
-            .expect("namespace does not exist");
-
-        // Pull the sequence number out of the op to return it back to the user
-        // for simplicity.
-        let offset = op
-            .meta()
-            .sequence()
-            .expect("write must be sequenced")
-            .sequence_number;
-
-        // Perform schema validation, populating the catalog.
-        let mut repo = self.catalog.repositories().await;
-        if let Some(new) = validate_or_insert_schema(op.tables(), schema, repo.as_mut())
-            .await
-            .expect("failed schema validation for enqueuing write")
-        {
-            // Retain the updated schema.
-            debug!(?schema, "updated test context schema");
-            *schema = new;
-        }
-
-        // Push the write into the write buffer.
-        self.write_buffer_state.push_write(op);
-
-        debug!(?offset, "enqueued write in write buffer");
-        offset
     }
 
     /// A helper wrapper over [`Self::enqueue_write()`] for line-protocol.
@@ -264,40 +221,59 @@ impl TestContext {
     ) -> SequenceNumber {
         // Resolve the namespace ID needed to construct the DML op
         let namespace_id = self
-            .namespaces
-            .get(namespace)
+            .catalog
+            .repositories()
+            .await
+            .namespaces()
+            .get_by_name(namespace)
+            .await
+            .expect("should be able to get namespace by name")
             .expect("namespace does not exist")
             .id;
 
-        // Build the TableId -> TableName map, upserting the tables in the
+        let schema = self
+            .namespaces
+            .get_mut(&namespace_id)
+            .expect("namespace does not exist");
+
+        let batches = lines_to_batches(lp, 0).unwrap();
+
+        validate_or_insert_schema(
+            batches
+                .iter()
+                .map(|(table_name, batch)| (table_name.as_str(), batch)),
+            schema,
+            self.catalog.repositories().await.as_mut(),
+        )
+        .await
+        .expect("failed schema validation for enqueuing write");
+
+        // Build the TableId -> Batch map, upserting the tables into the catalog in the
         // process.
-        let ids = lines_to_batches(lp, 0)
-            .unwrap()
-            .keys()
-            .map(|v| {
+        let batches_by_ids = batches
+            .into_iter()
+            .map(|(table_name, batch)| {
                 let catalog = Arc::clone(&self.catalog);
                 async move {
                     let id = catalog
                         .repositories()
                         .await
                         .tables()
-                        .create_or_get(v, namespace_id)
+                        .create_or_get(&table_name, namespace_id)
                         .await
                         .expect("table should create OK")
                         .id;
 
-                    (v.clone(), id)
+                    (id, batch)
                 }
             })
             .collect::<FuturesUnordered<_>>()
             .collect::<hashbrown::HashMap<_, _>>()
             .await;
 
-        self.enqueue_write(DmlWrite::new(
-            namespace,
+        let op = DmlWrite::new(
             namespace_id,
-            lines_to_batches(lp, 0).unwrap(),
-            ids,
+            batches_by_ids,
             partition_key,
             DmlMeta::sequenced(
                 Sequence::new(TEST_SHARD_INDEX, SequenceNumber::new(sequence_number)),
@@ -305,8 +281,45 @@ impl TestContext {
                 None,
                 50,
             ),
-        ))
-        .await
+        );
+
+        // Pull the sequence number out of the op to return it back to the user
+        // for simplicity.
+        let offset = op
+            .meta()
+            .sequence()
+            .expect("write must be sequenced")
+            .sequence_number;
+
+        // Push the write into the write buffer.
+        self.write_buffer_state.push_write(op);
+
+        debug!(?offset, "enqueued write in write buffer");
+        offset
+    }
+
+    /// Return the [`TableId`] in the catalog for `name`, or panic.
+    pub async fn table_id(&self, namespace: &str, name: &str) -> TableId {
+        let namespace_id = self
+            .catalog
+            .repositories()
+            .await
+            .namespaces()
+            .get_by_name(namespace)
+            .await
+            .expect("should be able to get namespace by name")
+            .expect("namespace does not exist")
+            .id;
+
+        self.catalog
+            .repositories()
+            .await
+            .tables()
+            .get_by_namespace_and_name(namespace_id, name)
+            .await
+            .expect("query failed")
+            .expect("no table entry for the specified namespace/table name pair")
+            .id
     }
 
     /// Utilise the progress API to query for the current state of the test

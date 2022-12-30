@@ -29,6 +29,9 @@ pub struct TestConfig {
     /// Object store directory, if needed.
     object_store_dir: Option<Arc<TempDir>>,
 
+    /// WAL directory, if needed.
+    wal_dir: Option<Arc<TempDir>>,
+
     /// Which ports this server should use
     addrs: Arc<BindAddresses>,
 }
@@ -49,6 +52,7 @@ impl TestConfig {
             catalog_schema_name: catalog_schema_name.into(),
             write_buffer_dir: None,
             object_store_dir: None,
+            wal_dir: None,
             addrs: Arc::new(BindAddresses::default()),
         }
     }
@@ -59,6 +63,27 @@ impl TestConfig {
         Self::new(ServerType::Router, dsn, random_catalog_schema_name())
             .with_new_write_buffer()
             .with_new_object_store()
+    }
+
+    /// Create a minimal router2 configuration sharing configuration with the ingester2 config
+    pub fn new_router2(ingester_config: &TestConfig) -> Self {
+        assert_eq!(ingester_config.server_type(), ServerType::Ingester2);
+
+        Self::new(
+            ServerType::Router2,
+            ingester_config.dsn().to_owned(),
+            ingester_config.catalog_schema_name(),
+        )
+        .with_existing_object_store(ingester_config)
+        .with_env("INFLUXDB_IOX_RPC_MODE", "2")
+        .with_env(
+            "INFLUXDB_IOX_INGESTER_ADDRESSES",
+            ingester_config
+                .addrs()
+                .ingester_grpc_api()
+                .bind_addr()
+                .as_ref(),
+        )
     }
 
     /// Create a minimal ingester configuration, using the dsn and
@@ -72,6 +97,15 @@ impl TestConfig {
         .with_existing_write_buffer(other)
         .with_existing_object_store(other)
         .with_default_ingester_options()
+    }
+
+    /// Create a minimal ingester2 configuration, using the dsn configuration specified
+    pub fn new_ingester2(dsn: impl Into<String>) -> Self {
+        let dsn = Some(dsn.into());
+        Self::new(ServerType::Ingester2, dsn, random_catalog_schema_name())
+            .with_new_object_store()
+            .with_new_wal()
+            .with_default_ingester_options()
     }
 
     /// Create a minimal querier configuration from the specified
@@ -246,7 +280,7 @@ impl TestConfig {
                 "INFLUXDB_IOX_WRITE_BUFFER_AUTO_CREATE_TOPICS",
                 n_shards.to_string(),
             )
-            .with_env("INFLUXDB_IOX_WRITE_BUFFER_ADDR", &write_buffer_string)
+            .with_env("INFLUXDB_IOX_WRITE_BUFFER_ADDR", write_buffer_string)
     }
 
     /// Configures this TestConfig to use the same write buffer as other
@@ -267,14 +301,23 @@ impl TestConfig {
         self
     }
 
-    /// Configures a new objct store
+    /// Configures a new WAL
+    pub fn with_new_wal(mut self) -> Self {
+        let tmpdir = TempDir::new().expect("cannot create tmp dir");
+
+        let wal_string = tmpdir.path().display().to_string();
+        self.wal_dir = Some(Arc::new(tmpdir));
+        self.with_env("INFLUXDB_IOX_WAL_DIRECTORY", wal_string)
+    }
+
+    /// Configures a new object store
     pub fn with_new_object_store(mut self) -> Self {
-        let tmpdir = TempDir::new().expect("can not create tmp dir");
+        let tmpdir = TempDir::new().expect("cannot create tmp dir");
 
         let object_store_string = tmpdir.path().display().to_string();
         self.object_store_dir = Some(Arc::new(tmpdir));
         self.with_env("INFLUXDB_IOX_OBJECT_STORE", "file")
-            .with_env("INFLUXDB_IOX_DB_DIR", &object_store_string)
+            .with_env("INFLUXDB_IOX_DB_DIR", object_store_string)
     }
 
     /// Configures this TestConfig to use the same object store as other
@@ -290,9 +333,17 @@ impl TestConfig {
         self.with_env("INFLUXDB_IOX_FLIGHT_DO_GET_PANIC", times.to_string())
     }
 
+    /// Configures querier->ingester connection circuit breaker threshold (number of consecutive errors)
+    pub fn with_querier_ingester_circuit_breaker_threshold(self, errors: u64) -> Self {
+        self.with_env(
+            "INFLUXDB_IOX_INGESTER_CIRCUIT_BREAKER_THRESHOLD",
+            errors.to_string(),
+        )
+    }
+
     /// Configure maximum per-table query bytes for the querier.
-    pub fn with_querier_max_table_query_bytes(self, bytes: usize) -> Self {
-        self.with_env("INFLUXDB_IOX_MAX_TABLE_QUERY_BYTES", bytes.to_string())
+    pub fn with_querier_mem_pool_bytes(self, bytes: usize) -> Self {
+        self.with_env("INFLUXDB_IOX_EXEC_MEM_POOL_BYTES", bytes.to_string())
     }
 
     /// Changes the log to JSON for easier parsing.

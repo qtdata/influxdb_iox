@@ -8,7 +8,7 @@ use tracker::{
     AsyncSemaphoreMetrics, InstrumentedAsyncOwnedSemaphorePermit, InstrumentedAsyncSemaphore,
 };
 
-use crate::QueryDatabaseProvider;
+use crate::QueryNamespaceProvider;
 
 #[derive(Debug)]
 pub struct TestDatabaseStore {
@@ -31,7 +31,7 @@ impl TestDatabaseStore {
         ));
         Self {
             databases: Mutex::new(BTreeMap::new()),
-            executor: Arc::new(Executor::new(1)),
+            executor: Arc::new(Executor::new_testing()),
             metric_registry,
             query_semaphore: Arc::new(semaphore_metrics.new_semaphore(semaphore_size)),
         }
@@ -57,7 +57,7 @@ impl Default for TestDatabaseStore {
 }
 
 #[async_trait]
-impl QueryDatabaseProvider for TestDatabaseStore {
+impl QueryNamespaceProvider for TestDatabaseStore {
     type Db = TestDatabase;
 
     /// Retrieve the database specified name

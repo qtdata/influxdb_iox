@@ -1,15 +1,15 @@
 //! Database for the querier that contains all namespaces.
 
 use crate::{
-    cache::CatalogCache, chunk::ChunkAdapter, ingester::IngesterConnection,
-    namespace::QuerierNamespace, query_log::QueryLog, table::PruneMetrics,
+    cache::CatalogCache, ingester::IngesterConnection, namespace::QuerierNamespace,
+    parquet::ChunkAdapter, query_log::QueryLog, table::PruneMetrics,
 };
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
 use data_types::{Namespace, ShardIndex};
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
-use service_common::QueryDatabaseProvider;
+use service_common::QueryNamespaceProvider;
 use sharder::JumpHash;
 use snafu::Snafu;
 use std::{collections::BTreeSet, sync::Arc};
@@ -65,21 +65,19 @@ pub struct QuerierDatabase {
     ///
     /// This should be a 1-to-1 relation to the number of active queries.
     ///
-    /// If the same database is requested twice for different queries, it is counted twice.
+    /// If the same namespace is requested twice for different queries, it is counted twice.
     query_execution_semaphore: Arc<InstrumentedAsyncSemaphore>,
 
     /// Sharder to determine which ingesters to query for a particular table and namespace.
-    sharder: Arc<JumpHash<Arc<ShardIndex>>>,
-
-    /// Max combined chunk size for all chunks returned to the query subsystem by a single table.
-    max_table_query_bytes: usize,
+    /// Only relevant when using the write buffer; will be None if using RPC write ingesters.
+    sharder: Option<Arc<JumpHash<Arc<ShardIndex>>>>,
 
     /// Chunk prune metrics.
     prune_metrics: Arc<PruneMetrics>,
 }
 
 #[async_trait]
-impl QueryDatabaseProvider for QuerierDatabase {
+impl QueryNamespaceProvider for QuerierDatabase {
     type Db = QuerierNamespace;
 
     async fn db(&self, name: &str, span: Option<Span>) -> Option<Arc<Self::Db>> {
@@ -109,7 +107,7 @@ impl QuerierDatabase {
         exec: Arc<Executor>,
         ingester_connection: Option<Arc<dyn IngesterConnection>>,
         max_concurrent_queries: usize,
-        max_table_query_bytes: usize,
+        rpc_write: bool,
     ) -> Result<Self, Error> {
         assert!(
             max_concurrent_queries <= Self::MAX_CONCURRENT_QUERIES_MAX,
@@ -132,9 +130,13 @@ impl QuerierDatabase {
         let query_execution_semaphore =
             Arc::new(semaphore_metrics.new_semaphore(max_concurrent_queries));
 
-        let sharder = Arc::new(
-            create_sharder(catalog_cache.catalog().as_ref(), backoff_config.clone()).await?,
-        );
+        let sharder = if rpc_write {
+            None
+        } else {
+            Some(Arc::new(
+                create_sharder(catalog_cache.catalog().as_ref(), backoff_config.clone()).await?,
+            ))
+        };
 
         let prune_metrics = Arc::new(PruneMetrics::new(&metric_registry));
 
@@ -148,7 +150,6 @@ impl QuerierDatabase {
             query_log,
             query_execution_semaphore,
             sharder,
-            max_table_query_bytes,
             prune_metrics,
         })
     }
@@ -177,8 +178,7 @@ impl QuerierDatabase {
             Arc::clone(&self.exec),
             self.ingester_connection.clone(),
             Arc::clone(&self.query_log),
-            Arc::clone(&self.sharder),
-            self.max_table_query_bytes,
+            self.sharder.clone(),
             Arc::clone(&self.prune_metrics),
         )))
     }
@@ -262,7 +262,7 @@ mod tests {
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX.saturating_add(1),
-            usize::MAX,
+            false,
         )
         .await
         .unwrap();
@@ -287,7 +287,7 @@ mod tests {
                 catalog.exec(),
                 Some(create_ingester_connection_for_testing()),
                 QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-                usize::MAX,
+                false,
             )
             .await,
             Error::NoShards
@@ -313,12 +313,12 @@ mod tests {
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-            usize::MAX,
+            false,
         )
         .await
         .unwrap();
 
-        catalog.create_namespace("ns1").await;
+        catalog.create_namespace_1hr_retention("ns1").await;
 
         assert!(db.namespace("ns1", None).await.is_some());
         assert!(db.namespace("ns2", None).await.is_none());
@@ -343,13 +343,13 @@ mod tests {
             catalog.exec(),
             Some(create_ingester_connection_for_testing()),
             QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-            usize::MAX,
+            false,
         )
         .await
         .unwrap();
 
-        catalog.create_namespace("ns1").await;
-        catalog.create_namespace("ns2").await;
+        catalog.create_namespace_1hr_retention("ns1").await;
+        catalog.create_namespace_1hr_retention("ns2").await;
 
         let mut namespaces = db.namespaces().await;
         namespaces.sort_by_key(|ns| ns.name.clone());

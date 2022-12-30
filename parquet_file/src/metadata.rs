@@ -115,7 +115,9 @@ use schema::{
 };
 use snafu::{ensure, OptionExt, ResultExt, Snafu};
 use std::{convert::TryInto, fmt::Debug, mem, sync::Arc};
-use thrift::protocol::{TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol};
+use thrift::protocol::{
+    TCompactInputProtocol, TCompactOutputProtocol, TOutputProtocol, TSerializable,
+};
 use uuid::Uuid;
 
 /// Current version for serialized metadata.
@@ -299,7 +301,7 @@ pub struct IoxMetadata {
 impl IoxMetadata {
     /// Convert to base64 encoded protobuf format
     pub fn to_base64(&self) -> std::result::Result<String, prost::EncodeError> {
-        Ok(base64::encode(&self.to_protobuf()?))
+        Ok(base64::encode(self.to_protobuf()?))
     }
 
     /// Read from base64 encoded protobuf format
@@ -464,7 +466,7 @@ impl IoxMetadata {
             .read_schema()
             .expect("failed to read encoded schema");
         let stats = decoded
-            .read_statistics(&*schema)
+            .read_statistics(&schema)
             .expect("invalid statistics");
         let columns: Vec<_> = stats.iter().map(|v| column_id_map(&v.name)).collect();
         let time_summary = stats
@@ -1000,7 +1002,7 @@ mod tests {
 
         let iox_metadata = IoxMetadata {
             object_store_id,
-            creation_timestamp: Time::from_timestamp(3234, 0),
+            creation_timestamp: Time::from_timestamp(3234, 0).unwrap(),
             namespace_id: NamespaceId::new(2),
             namespace_name: Arc::from("hi"),
             shard_id: ShardId::new(1),
@@ -1098,7 +1100,7 @@ mod tests {
 
         // Try and access the IOx metadata that was embedded above (with the
         // SchemaBuilder)
-        let col_summary = decoded.read_statistics(&*schema).unwrap();
+        let col_summary = decoded.read_statistics(&schema).unwrap();
         assert!(!col_summary.is_empty());
     }
 

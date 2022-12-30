@@ -21,6 +21,7 @@ use datafusion::{
     self,
     execution::{
         context::SessionState,
+        disk_manager::DiskManagerConfig,
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
     logical_expr::{expr_rewriter::normalize_col, Extension},
@@ -44,6 +45,9 @@ pub struct ExecutorConfig {
 
     /// Object stores
     pub object_stores: HashMap<StorageId, Arc<DynObjectStore>>,
+
+    /// Memory pool size in bytes.
+    pub mem_pool_size: usize,
 }
 
 #[derive(Debug)]
@@ -71,6 +75,14 @@ impl DedicatedExecutors {
         }
     }
 
+    pub fn new_testing() -> Self {
+        Self {
+            query_exec: DedicatedExecutor::new_testing(),
+            reorg_exec: DedicatedExecutor::new_testing(),
+            num_threads: 1,
+        }
+    }
+
     pub fn num_threads(&self) -> usize {
         self.num_threads
     }
@@ -78,9 +90,6 @@ impl DedicatedExecutors {
 
 /// Handles executing DataFusion plans, and marshalling the results into rust
 /// native structures.
-///
-/// TODO: Have a resource manager that would limit how many plans are
-/// running, based on a policy
 #[derive(Debug)]
 pub struct Executor {
     /// Executors
@@ -106,16 +115,31 @@ pub enum ExecutorType {
 impl Executor {
     /// Creates a new executor with a two dedicated thread pools, each
     /// with num_threads
-    pub fn new(num_threads: usize) -> Self {
+    pub fn new(num_threads: usize, mem_pool_size: usize) -> Self {
         Self::new_with_config(ExecutorConfig {
             num_threads,
             target_query_partitions: num_threads,
             object_stores: HashMap::default(),
+            mem_pool_size,
         })
     }
 
+    /// Create new executor based on a specific config.
     pub fn new_with_config(config: ExecutorConfig) -> Self {
         let executors = Arc::new(DedicatedExecutors::new(config.num_threads));
+        Self::new_with_config_and_executors(config, executors)
+    }
+
+    /// Get testing executor that runs a on single thread and a low memory bound
+    /// to preserve resources.
+    pub fn new_testing() -> Self {
+        let config = ExecutorConfig {
+            num_threads: 1,
+            target_query_partitions: 1,
+            object_stores: HashMap::default(),
+            mem_pool_size: 1024 * 1024 * 1024, // 1GB
+        };
+        let executors = Arc::new(DedicatedExecutors::new_testing());
         Self::new_with_config_and_executors(config, executors)
     }
 
@@ -131,7 +155,9 @@ impl Executor {
     ) -> Self {
         assert_eq!(config.num_threads, executors.num_threads);
 
-        let runtime_config = RuntimeConfig::new();
+        let runtime_config = RuntimeConfig::new()
+            .with_disk_manager(DiskManagerConfig::Disabled)
+            .with_memory_limit(config.mem_pool_size, 1.0);
 
         for (id, store) in &config.object_stores {
             runtime_config
@@ -166,7 +192,7 @@ impl Executor {
         let inner = SessionContext::with_state(state.clone());
         let exec = self.executor(executor_type).clone();
         let recorder = SpanRecorder::new(state.span_ctx().child_span("Query Execution"));
-        IOxSessionContext::new(inner, Some(exec), recorder)
+        IOxSessionContext::new(inner, exec, recorder)
     }
 
     /// Create a new execution context, suitable for executing a new query or system task
@@ -336,12 +362,10 @@ mod tests {
         let expected_strings = to_set(&["Foo", "Bar"]);
         let plan = StringSetPlan::Known(Arc::clone(&expected_strings));
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let result_strings = ctx.to_string_set(plan).await.unwrap();
         assert_eq!(result_strings, expected_strings);
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -351,13 +375,11 @@ mod tests {
         let scan = make_plan(schema, vec![]);
         let plan: StringSetPlan = vec![scan].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, StringSetRef::new(StringSet::new()));
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -369,13 +391,11 @@ mod tests {
         let scan = make_plan(batch.schema(), vec![batch]);
         let plan: StringSetPlan = vec![scan].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -391,13 +411,11 @@ mod tests {
         let scan = make_plan(schema, vec![batch1, batch2]);
         let plan: StringSetPlan = vec![scan].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -417,13 +435,11 @@ mod tests {
 
         let plan: StringSetPlan = vec![scan1, scan2].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await.unwrap();
 
         assert_eq!(results, to_set(&["foo", "bar", "baz"]));
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -438,7 +454,7 @@ mod tests {
         let scan = make_plan(schema, vec![batch]);
         let plan: StringSetPlan = vec![scan].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await;
 
@@ -453,8 +469,6 @@ mod tests {
             expected_error,
             actual_error,
         );
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -466,7 +480,7 @@ mod tests {
         let scan = make_plan(batch.schema(), vec![batch]);
         let plan: StringSetPlan = vec![scan].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await;
 
@@ -482,8 +496,6 @@ mod tests {
             expected_error,
             actual_error
         );
-
-        exec.join().await;
     }
 
     #[tokio::test]
@@ -500,13 +512,11 @@ mod tests {
         let pivot = make_schema_pivot(scan);
         let plan = vec![pivot].into();
 
-        let exec = Executor::new(1);
+        let exec = Executor::new_testing();
         let ctx = exec.new_context(ExecutorType::Query);
         let results = ctx.to_string_set(plan).await.expect("Executed plan");
 
         assert_eq!(results, to_set(&["f1", "f2"]));
-
-        exec.join().await;
     }
 
     /// return a set for testing

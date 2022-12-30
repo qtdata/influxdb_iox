@@ -113,7 +113,7 @@ impl NamespaceCache {
             testing,
         ));
 
-        let mut backend = PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider));
+        let mut backend = PolicyBackend::hashmap_backed(Arc::clone(&time_provider));
         backend.add_policy(TtlPolicy::new(
             Arc::new(OptionalValueTtlProvider::new(
                 Some(TTL_NON_EXISTING),
@@ -208,18 +208,27 @@ pub struct CachedTable {
     pub id: TableId,
     pub schema: Arc<Schema>,
     pub column_id_map: HashMap<ColumnId, Arc<str>>,
+    pub column_id_map_rev: HashMap<Arc<str>, ColumnId>,
+    pub primary_key_column_ids: Vec<ColumnId>,
 }
 
 impl CachedTable {
     /// RAM-bytes EXCLUDING `self`.
     fn size(&self) -> usize {
         self.schema.estimate_size()
-            + self.column_id_map.capacity() * size_of::<(ColumnId, Arc<str>)>()
+            + (self.column_id_map.capacity() * size_of::<(ColumnId, Arc<str>)>())
             + self
                 .column_id_map
-                .iter()
-                .map(|(_id, name)| name.len())
+                .values()
+                .map(|name| name.len())
                 .sum::<usize>()
+            + (self.column_id_map_rev.capacity() * size_of::<(Arc<str>, ColumnId)>())
+            + self
+                .column_id_map_rev
+                .keys()
+                .map(|name| name.len())
+                .sum::<usize>()
+            + (self.primary_key_column_ids.capacity() * size_of::<ColumnId>())
     }
 }
 
@@ -232,10 +241,32 @@ impl From<TableSchema> for CachedTable {
             .collect();
         column_id_map.shrink_to_fit();
 
+        let id = table.id;
+        let schema: Arc<Schema> = Arc::new(table.try_into().expect("Catalog table schema broken"));
+
+        let mut column_id_map_rev: HashMap<Arc<str>, ColumnId> = column_id_map
+            .iter()
+            .map(|(v, k)| (Arc::clone(k), *v))
+            .collect();
+        column_id_map_rev.shrink_to_fit();
+
+        let mut primary_key_column_ids: Vec<ColumnId> = schema
+            .primary_key()
+            .into_iter()
+            .map(|name| {
+                *column_id_map_rev
+                    .get(name)
+                    .unwrap_or_else(|| panic!("primary key not known?!: {name}"))
+            })
+            .collect();
+        primary_key_column_ids.shrink_to_fit();
+
         Self {
-            id: table.id,
-            schema: Arc::new(table.try_into().expect("Catalog table schema broken")),
+            id,
+            schema,
             column_id_map,
+            column_id_map_rev,
+            primary_key_column_ids,
         }
     }
 }
@@ -243,6 +274,7 @@ impl From<TableSchema> for CachedTable {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CachedNamespace {
     pub id: NamespaceId,
+    pub retention_period: Option<Duration>,
     pub tables: HashMap<Arc<str>, Arc<CachedTable>>,
 }
 
@@ -270,7 +302,14 @@ impl From<NamespaceSchema> for CachedNamespace {
             .collect();
         tables.shrink_to_fit();
 
-        Self { id: ns.id, tables }
+        let retention_period = ns
+            .retention_period_ns
+            .map(|retention| Duration::from_nanos(retention as u64));
+        Self {
+            id: ns.id,
+            retention_period,
+            tables,
+        }
     }
 }
 
@@ -288,8 +327,8 @@ mod tests {
     async fn test_schema() {
         let catalog = TestCatalog::new();
 
-        let ns1 = catalog.create_namespace("ns1").await;
-        let ns2 = catalog.create_namespace("ns2").await;
+        let ns1 = catalog.create_namespace_1hr_retention("ns1").await;
+        let ns2 = catalog.create_namespace_1hr_retention("ns2").await;
         assert_ne!(ns1.namespace.id, ns2.namespace.id);
 
         let table11 = ns1.create_table("table1").await;
@@ -317,8 +356,13 @@ mod tests {
             .get(Arc::from(String::from("ns1")), &[], None)
             .await
             .unwrap();
+        let retention_period = ns1
+            .namespace
+            .retention_period_ns
+            .map(|retention| Duration::from_nanos(retention as u64));
         let expected_ns_1 = CachedNamespace {
             id: ns1.namespace.id,
+            retention_period,
             tables: HashMap::from([
                 (
                     Arc::from("table1"),
@@ -338,6 +382,12 @@ mod tests {
                             (col112.column.id, Arc::from(col112.column.name.clone())),
                             (col113.column.id, Arc::from(col113.column.name.clone())),
                         ]),
+                        column_id_map_rev: HashMap::from([
+                            (Arc::from(col111.column.name.clone()), col111.column.id),
+                            (Arc::from(col112.column.name.clone()), col112.column.id),
+                            (Arc::from(col113.column.name.clone()), col113.column.id),
+                        ]),
+                        primary_key_column_ids: vec![col112.column.id, col113.column.id],
                     }),
                 ),
                 (
@@ -356,6 +406,11 @@ mod tests {
                             (col121.column.id, Arc::from(col121.column.name.clone())),
                             (col122.column.id, Arc::from(col122.column.name.clone())),
                         ]),
+                        column_id_map_rev: HashMap::from([
+                            (Arc::from(col121.column.name.clone()), col121.column.id),
+                            (Arc::from(col122.column.name.clone()), col122.column.id),
+                        ]),
+                        primary_key_column_ids: vec![col122.column.id],
                     }),
                 ),
             ]),
@@ -367,8 +422,13 @@ mod tests {
             .get(Arc::from(String::from("ns2")), &[], None)
             .await
             .unwrap();
+        let retention_period = ns2
+            .namespace
+            .retention_period_ns
+            .map(|retention| Duration::from_nanos(retention as u64));
         let expected_ns_2 = CachedNamespace {
             id: ns2.namespace.id,
+            retention_period,
             tables: HashMap::from([(
                 Arc::from("table1"),
                 Arc::new(CachedTable {
@@ -378,6 +438,11 @@ mod tests {
                         col211.column.id,
                         Arc::from(col211.column.name.clone()),
                     )]),
+                    column_id_map_rev: HashMap::from([(
+                        Arc::from(col211.column.name.clone()),
+                        col211.column.id,
+                    )]),
+                    primary_key_column_ids: vec![col211.column.id],
                 }),
             )]),
         };
@@ -443,7 +508,7 @@ mod tests {
         assert_histogram_metric_count(&catalog.metric_registry, "namespace_get_by_name", 2);
 
         // ========== table unknown ==========
-        let ns1 = catalog.create_namespace("ns1").await;
+        let ns1 = catalog.create_namespace_1hr_retention("ns1").await;
 
         assert!(cache
             .get(Arc::from("ns1"), &[("t1", &HashSet::from([]))], None)

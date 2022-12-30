@@ -16,15 +16,15 @@ use datafusion::{
 use datafusion_util::config::DEFAULT_SCHEMA;
 use iox_query::{
     exec::{ExecutionContextProvider, ExecutorType, IOxSessionContext},
-    QueryChunk, QueryCompletedToken, QueryDatabase, QueryText,
+    QueryChunk, QueryCompletedToken, QueryNamespace, QueryText,
 };
 use observability_deps::tracing::{debug, trace};
-use predicate::{rpc_predicate::QueryDatabaseMeta, Predicate};
+use predicate::{rpc_predicate::QueryNamespaceMeta, Predicate};
 use schema::Schema;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use trace::ctx::SpanContext;
 
-impl QueryDatabaseMeta for QuerierNamespace {
+impl QueryNamespaceMeta for QuerierNamespace {
     fn table_names(&self) -> Vec<String> {
         let mut names: Vec<_> = self.tables.keys().map(|s| s.to_string()).collect();
         names.sort();
@@ -37,12 +37,12 @@ impl QueryDatabaseMeta for QuerierNamespace {
 }
 
 #[async_trait]
-impl QueryDatabase for QuerierNamespace {
+impl QueryNamespace for QuerierNamespace {
     async fn chunks(
         &self,
         table_name: &str,
         predicate: &Predicate,
-        projection: &Option<Vec<usize>>,
+        projection: Option<&Vec<usize>>,
         ctx: IOxSessionContext,
     ) -> Result<Vec<Arc<dyn QueryChunk>>, DataFusionError> {
         debug!(%table_name, %predicate, "Finding chunks for table");
@@ -94,7 +94,7 @@ impl QueryDatabase for QuerierNamespace {
         QueryCompletedToken::new(move |success| query_log.set_completed(entry, success))
     }
 
-    fn as_meta(&self) -> &dyn QueryDatabaseMeta {
+    fn as_meta(&self) -> &dyn QueryNamespaceMeta {
         self
     }
 }
@@ -196,16 +196,15 @@ impl ExecutionContextProvider for QuerierNamespace {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::namespace::test_util::{
-        clear_parquet_cache, querier_namespace, querier_namespace_with_limit,
-    };
+    use crate::namespace::test_util::{clear_parquet_cache, querier_namespace};
     use arrow::record_batch::RecordBatch;
-    use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
+    use arrow_util::assert_batches_sorted_eq;
     use data_types::ColumnType;
     use datafusion::common::DataFusionError;
     use iox_query::frontend::sql::SqlQueryPlanner;
     use iox_tests::util::{TestCatalog, TestParquetFileBuilder};
     use metric::{Observation, RawReporter};
+    use regex::Regex;
     use snafu::{ResultExt, Snafu};
     use trace::{span::SpanStatus, RingBufferTraceCollector};
 
@@ -215,7 +214,8 @@ mod tests {
 
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        // namespace with infinite retention policy
+        let ns = catalog.create_namespace_with_retention("ns", None).await;
 
         let shard1 = ns.create_shard(1).await;
         let shard2 = ns.create_shard(2).await;
@@ -487,15 +487,15 @@ mod tests {
             &querier_namespace,
             "EXPLAIN SELECT * FROM cpu",
             &[
-                "+---------------+-------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                |",
-                "+---------------+-------------------------------------------------------------------------------------+",
-                "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                   |",
-                "|               |   TableScan: cpu projection=[foo, host, load, time]                                 |",
-                "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time] |",
-                "|               |   IOxReadFilterNode: table_name=cpu, chunks=5 predicate=Predicate                   |",
-                "|               |                                                                                     |",
-                "+---------------+-------------------------------------------------------------------------------------+",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                  |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                                                                                                                                                                                                                                                                                                     |",
+                "|               |   TableScan: cpu projection=[foo, host, load, time]                                                                                                                                                                                                                                                                                                                   |",
+                "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time]                                                                                                                                                                                                                                                                                   |",
+                "|               |   ParquetExec: limit=None, partitions={1 group: [[1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/2/2/<uuid>.parquet, 1/1/1/3/<uuid>.parquet]]}, projection=[foo, host, load, time] |",
+                "|               |                                                                                                                                                                                                                                                                                                                                                                       |",
+                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
         )
             .await;
@@ -507,24 +507,24 @@ mod tests {
             &querier_namespace,
             "EXPLAIN SELECT * FROM mem ORDER BY host,time",
             &[
-                "+---------------+----------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                               |",
-                "+---------------+----------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Sort: mem.host ASC NULLS LAST, mem.time ASC NULLS LAST                                             |",
-                "|               |   Projection: mem.host, mem.perc, mem.time                                                         |",
-                "|               |     TableScan: mem projection=[host, perc, time]                                                   |",
-                "| physical_plan | SortExec: [host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]                                            |",
-                "|               |   CoalescePartitionsExec                                                                           |",
-                "|               |     ProjectionExec: expr=[host@0 as host, perc@1 as perc, time@2 as time]                          |",
-                "|               |       UnionExec                                                                                    |",
-                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                |",
-                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8)) |",
-                "|               |             IOxReadFilterNode: table_name=mem, chunks=1 predicate=Predicate                        |",
-                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                |",
-                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8)) |",
-                "|               |             IOxReadFilterNode: table_name=mem, chunks=1 predicate=Predicate                        |",
-                "|               |                                                                                                    |",
-                "+---------------+----------------------------------------------------------------------------------------------------+",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| plan_type     | plan                                                                                                                                               |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
+                "| logical_plan  | Sort: mem.host ASC NULLS LAST, mem.time ASC NULLS LAST                                                                                             |",
+                "|               |   Projection: mem.host, mem.perc, mem.time                                                                                                         |",
+                "|               |     TableScan: mem projection=[host, perc, time]                                                                                                   |",
+                "| physical_plan | SortExec: [host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]                                                                                            |",
+                "|               |   CoalescePartitionsExec                                                                                                                           |",
+                "|               |     ProjectionExec: expr=[host@0 as host, perc@1 as perc, time@2 as time]                                                                          |",
+                "|               |       UnionExec                                                                                                                                    |",
+                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                                                                |",
+                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
+                "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
+                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                                                                |",
+                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
+                "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
+                "|               |                                                                                                                                                    |",
+                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
         )
             .await;
@@ -567,71 +567,24 @@ mod tests {
             &querier_namespace,
             "EXPLAIN SELECT * FROM cpu",
             &[
-                "+---------------+-------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                |",
-                "+---------------+-------------------------------------------------------------------------------------+",
-                "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                   |",
-                "|               |   TableScan: cpu projection=[foo, host, load, time]                                 |",
-                "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time] |",
-                "|               |   UnionExec                                                                         |",
-                "|               |     DeduplicateExec: [host@1 ASC,time@3 ASC]                                        |",
-                "|               |       SortPreservingMergeExec: [host@1 ASC,time@3 ASC]                              |",
-                "|               |         UnionExec                                                                   |",
-                "|               |           IOxReadFilterNode: table_name=cpu, chunks=1 predicate=Predicate           |",
-                "|               |           IOxReadFilterNode: table_name=cpu, chunks=1 predicate=Predicate           |",
-                "|               |     IOxReadFilterNode: table_name=cpu, chunks=4 predicate=Predicate                 |",
-                "|               |                                                                                     |",
-                "+---------------+-------------------------------------------------------------------------------------+",
+    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    "| plan_type     | plan                                                                                                                                                                                                                                                                                                              |",
+    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
+    "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                                                                                                                                                                                                                                                 |",
+    "|               |   TableScan: cpu projection=[foo, host, load, time]                                                                                                                                                                                                                                                               |",
+    "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time]                                                                                                                                                                                                                               |",
+    "|               |   UnionExec                                                                                                                                                                                                                                                                                                       |",
+    "|               |     DeduplicateExec: [host@1 ASC,time@3 ASC]                                                                                                                                                                                                                                                                      |",
+    "|               |       SortPreservingMergeExec: [host@1 ASC,time@3 ASC]                                                                                                                                                                                                                                                            |",
+    "|               |         UnionExec                                                                                                                                                                                                                                                                                                 |",
+    "|               |           ParquetExec: limit=None, partitions={1 group: [[1/1/2/2/<uuid>.parquet]]}, output_ordering=[host@1 ASC, time@3 ASC], projection=[foo, host, load, time]                                                                                                                   |",
+    "|               |           ParquetExec: limit=None, partitions={1 group: [[1/1/2/2/<uuid>.parquet]]}, output_ordering=[host@1 ASC, time@3 ASC], projection=[foo, host, load, time]                                                                                                                   |",
+    "|               |     ParquetExec: limit=None, partitions={1 group: [[1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/3/<uuid>.parquet]]}, projection=[foo, host, load, time] |",
+    "|               |                                                                                                                                                                                                                                                                                                                   |",
+    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
             ],
         )
             .await;
-    }
-
-    #[tokio::test]
-    async fn test_chunk_size_limit() {
-        let catalog = TestCatalog::new();
-
-        let ns = catalog.create_namespace("ns").await;
-        let table = ns.create_table("table").await;
-        let shard = ns.create_shard(1).await;
-        let partition = table.with_shard(&shard).create_partition("k").await;
-
-        table.create_column("time", ColumnType::Time).await;
-        table.create_column("foo", ColumnType::F64).await;
-
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=1 11")
-            .with_max_seq(2)
-            .with_min_time(11)
-            .with_max_time(11);
-        let file1 = partition.create_parquet_file(builder).await;
-
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("table foo=2 22")
-            .with_max_seq(4)
-            .with_min_time(22)
-            .with_max_time(22);
-        let file2 = partition.create_parquet_file(builder).await;
-
-        let total_size =
-            (file1.parquet_file.file_size_bytes + file2.parquet_file.file_size_bytes) as usize;
-
-        // querying right at the total size works (i.e. the limit is INCLUSIVE)
-        let querier_namespace = Arc::new(querier_namespace_with_limit(&ns, total_size).await);
-        run_res(&querier_namespace, "SELECT * FROM \"table\"", None)
-            .await
-            .unwrap();
-
-        // check that limit is enforced
-        let limit = total_size - 1;
-        let querier_namespace = Arc::new(querier_namespace_with_limit(&ns, limit).await);
-        let err = run_res(&querier_namespace, "SELECT * FROM \"table\"", None)
-            .await
-            .unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            format!("Cannot build plan: Resources exhausted: Query would scan at least {total_size} bytes, more than configured maximum {limit} bytes. Try adjusting your compactor settings or increasing the per query memory limit."),
-        );
     }
 
     async fn assert_query(
@@ -658,7 +611,20 @@ mod tests {
         expected_lines: &[&str],
     ) {
         let results = run(querier_namespace, sql, None).await;
-        assert_batches_eq!(expected_lines, &results);
+        let formatted = arrow_util::display::pretty_format_batches(&results).unwrap();
+
+        let regex = Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+            .expect("UUID regex");
+        let actual_lines = formatted
+            .trim()
+            .split('\n')
+            .map(|s| regex.replace_all(s, "<uuid>").to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            expected_lines, actual_lines,
+            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
+            expected_lines, actual_lines
+        );
     }
 
     async fn run(

@@ -7,7 +7,8 @@ use arrow::{
 use data_types::{
     Column, ColumnSet, ColumnType, CompactionLevel, Namespace, NamespaceSchema, ParquetFile,
     ParquetFileParams, Partition, PartitionId, QueryPool, SequenceNumber, Shard, ShardId,
-    ShardIndex, Table, TableId, TableSchema, Timestamp, Tombstone, TombstoneId, TopicMetadata,
+    ShardIndex, Table, TableId, TablePartition, TableSchema, Timestamp, Tombstone, TombstoneId,
+    TopicMetadata,
 };
 use datafusion::physical_plan::metrics::Count;
 use datafusion_util::MemoryStream;
@@ -41,6 +42,9 @@ use uuid::Uuid;
 static GLOBAL_EXEC: Lazy<Arc<DedicatedExecutors>> =
     Lazy::new(|| Arc::new(DedicatedExecutors::new(1)));
 
+/// Common retention period used throughout tests
+pub const TEST_RETENTION_PERIOD_NS: Option<i64> = Some(3_600 * 1_000_000_000);
+
 /// Catalog for tests
 #[derive(Debug)]
 #[allow(missing_docs)]
@@ -64,14 +68,20 @@ impl TestCatalog {
         Self::with_execs(exec, 1)
     }
 
-    /// Initialize with given executors.
+    /// Initialize with partitions
+    pub fn with_target_query_partitions(target_query_partitions: usize) -> Arc<Self> {
+        let exec = Arc::clone(&GLOBAL_EXEC);
+        Self::with_execs(exec, target_query_partitions)
+    }
+
+    /// Initialize with given executors and partitions
     pub fn with_execs(exec: Arc<DedicatedExecutors>, target_query_partitions: usize) -> Arc<Self> {
         let metric_registry = Arc::new(metric::Registry::new());
         let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metric_registry)));
         let object_store = Arc::new(InMemory::new());
         let parquet_store =
             ParquetStorage::new(Arc::clone(&object_store) as _, StorageId::from("iox"));
-        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0)));
+        let time_provider = Arc::new(MockProvider::new(Time::from_timestamp(0, 0).unwrap()));
         let exec = Arc::new(Executor::new_with_config_and_executors(
             ExecutorConfig {
                 num_threads: exec.num_threads(),
@@ -80,6 +90,7 @@ impl TestCatalog {
                     parquet_store.id(),
                     Arc::clone(parquet_store.object_store()),
                 )]),
+                mem_pool_size: 1024 * 1024 * 1024,
             },
             exec,
         ));
@@ -143,15 +154,19 @@ impl TestCatalog {
         )
     }
 
-    /// Create a namespace in the catalog
-    pub async fn create_namespace(self: &Arc<Self>, name: &str) -> Arc<TestNamespace> {
+    /// Create namespace with specified retention
+    pub async fn create_namespace_with_retention(
+        self: &Arc<Self>,
+        name: &str,
+        retention_period_ns: Option<i64>,
+    ) -> Arc<TestNamespace> {
         let mut repos = self.catalog.repositories().await;
 
         let topic = repos.topics().create_or_get("topic").await.unwrap();
         let query_pool = repos.query_pools().create_or_get("pool").await.unwrap();
         let namespace = repos
             .namespaces()
-            .create(name, "1y", topic.id, query_pool.id)
+            .create(name, retention_period_ns, topic.id, query_pool.id)
             .await
             .unwrap();
 
@@ -161,6 +176,15 @@ impl TestCatalog {
             query_pool,
             namespace,
         })
+    }
+
+    /// Create a namespace in the catalog
+    pub async fn create_namespace_1hr_retention(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Arc<TestNamespace> {
+        self.create_namespace_with_retention(name, TEST_RETENTION_PERIOD_NS)
+            .await
     }
 
     /// return tombstones of a given table
@@ -220,6 +244,24 @@ impl TestCatalog {
             .await
             .unwrap();
         level_0.len()
+    }
+
+    /// Count level 1 files
+    pub async fn count_level_1_files(
+        self: &Arc<Self>,
+        table_partition: TablePartition,
+        min_time: Timestamp,
+        max_time: Timestamp,
+    ) -> usize {
+        let level_1 = self
+            .catalog
+            .repositories()
+            .await
+            .parquet_files()
+            .level_1(table_partition, min_time, max_time)
+            .await
+            .unwrap();
+        level_1.len()
     }
 
     /// List all non-deleted files
@@ -453,7 +495,7 @@ impl TestTableBoundShard {
 
         let partition = repos
             .partitions()
-            .update_sort_key(partition.id, sort_key)
+            .cas_sort_key(partition.id, None, sort_key)
             .await
             .unwrap();
 
@@ -511,14 +553,27 @@ pub struct TestPartition {
 impl TestPartition {
     /// Update sort key.
     pub async fn update_sort_key(self: &Arc<Self>, sort_key: SortKey) -> Arc<Self> {
+        let old_sort_key = self
+            .catalog
+            .catalog
+            .repositories()
+            .await
+            .partitions()
+            .get_by_id(self.partition.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .sort_key;
+
         let partition = self
             .catalog
             .catalog
             .repositories()
             .await
             .partitions()
-            .update_sort_key(
+            .cas_sort_key(
                 self.partition.id,
+                Some(old_sort_key),
                 &sort_key.to_columns().collect::<Vec<_>>(),
             )
             .await
@@ -821,6 +876,12 @@ impl TestParquetFileBuilder {
         self.size_override = Some(size_override);
         self
     }
+
+    /// Specify the file size to use for a CompactorParquetFile
+    pub fn with_file_size_bytes(mut self, file_size_bytes: u64) -> Self {
+        self.file_size_bytes = Some(file_size_bytes);
+        self
+    }
 }
 
 async fn update_catalog_sort_key_if_needed(
@@ -849,7 +910,16 @@ async fn update_catalog_sort_key_if_needed(
                     &new_columns,
                 );
                 partitions_catalog
-                    .update_sort_key(partition_id, &new_columns)
+                    .cas_sort_key(
+                        partition_id,
+                        Some(
+                            catalog_sort_key
+                                .to_columns()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>(),
+                        ),
+                        &new_columns,
+                    )
                     .await
                     .unwrap();
             }
@@ -858,7 +928,7 @@ async fn update_catalog_sort_key_if_needed(
             let new_columns = sort_key.to_columns().collect::<Vec<_>>();
             debug!("Updating sort key from None to {:?}", &new_columns);
             partitions_catalog
-                .update_sort_key(partition_id, &new_columns)
+                .cas_sort_key(partition_id, None, &new_columns)
                 .await
                 .unwrap();
         }
@@ -944,7 +1014,7 @@ impl TestTombstone {
 
 /// Return the current time
 pub fn now() -> Time {
-    Time::from_timestamp(0, 0)
+    Time::from_timestamp(0, 0).unwrap()
 }
 
 /// Sort arrow record batch into arrow record batch and sort key.

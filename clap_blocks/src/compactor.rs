@@ -120,6 +120,19 @@ macro_rules! gen_compactor_config {
             )]
             pub hot_multiple: usize,
 
+            /// The multiple of times that compacting warm partitions should run for every one time
+            /// that compacting cold partitions runs. Set to 1 to compact warm partitions and cold
+            /// partitions equally.
+            ///
+            /// Default is 1
+            #[clap(
+                long = "compaction-warm-multiple",
+                env = "INFLUXDB_IOX_COMPACTION_WARM_MULTIPLE",
+                default_value = "1",
+                action
+            )]
+            pub warm_multiple: usize,
+
             /// The memory budget assigned to this compactor.
             ///
             /// For each partition candidate, we will estimate the memory needed to compact each
@@ -167,6 +180,18 @@ macro_rules! gen_compactor_config {
             )]
             pub max_num_compacting_files: usize,
 
+            /// Max number of files to compact for a partition in which the first file and its
+            /// overlaps push the file count limit over `max_num_compacting_files`.
+            /// It's a special case of `max_num_compacting_files` that's higher just for the first
+            /// file in a partition
+            #[clap(
+                long = "compaction-max-num-compacting-files-first-in-partition",
+                env = "INFLUXDB_IOX_COMPACTION_MAX_COMPACTING_FILES_FIRST_IN_PARTITION",
+                default_value = "40",
+                action
+            )]
+            pub max_num_compacting_files_first_in_partition: usize,
+
             /// Number of minutes without a write to a partition before it is considered cold
             /// and thus a candidate for compaction
             #[clap(
@@ -176,6 +201,60 @@ macro_rules! gen_compactor_config {
                 action
             )]
             pub minutes_without_new_writes_to_be_cold: u64,
+
+            /// When querying for partitions with data for hot compaction, how many hours to look
+            /// back for a first pass.
+            #[clap(
+                long = "compaction-hot-partition-hours-threshold-1",
+                env = "INFLUXDB_IOX_COMPACTION_HOT_PARTITION_HOURS_THRESHOLD_1",
+                default_value = "4",
+                action
+            )]
+            pub hot_compaction_hours_threshold_1: u64,
+
+            /// When querying for partitions with data for hot compaction, how many hours to look
+            /// back for a second pass if we found nothing in the first pass.
+            #[clap(
+                long = "compaction-hot-partition-hours-threshold-2",
+                env = "INFLUXDB_IOX_COMPACTION_HOT_PARTITION_HOURS_THRESHOLD_2",
+                default_value = "24",
+                action
+            )]
+            pub hot_compaction_hours_threshold_2: u64,
+
+            /// Max number of partitions that can be compacted in parallel at once
+            /// We use memory budget to estimate how many partitions can be compacted in parallel at once. 
+            /// However, we do not want to have that number too large which will cause the high usage of CPU cores
+            /// and may also lead to inaccuracy of memory estimation. This number is to cap that.
+            #[clap(
+                long = "compaction-max-parallel-partitions",
+                env = "INFLUXDB_IOX_COMPACTION_MAX_PARALLEL_PARTITIONS",
+                default_value = "20",
+                action
+            )]
+            pub max_parallel_partitions: u64,
+
+            /// When querying for partitions suitable for warm compaction, this is the
+            /// upper bound on file size to be counted as "small".
+            /// Default is half of max_desired_file_size_bytes's default (see above).
+            #[clap(
+                long = "compaction-warm-small-size-threshold-bytes",
+                env = "INFLUXDB_IOX_COMPACTION_WARM_SMALL_SIZE_THRESHOLD_BYTES",
+                default_value = "13107200",
+                action
+            )]
+            pub warm_compaction_small_size_threshold_bytes: i64,
+
+            /// When querying for partitions suitable for warm compaction, this is the minimum
+            /// number of "small" files a partition must have in order for it to be selected
+            /// as a candidate for warm compaction.
+            #[clap(
+                long = "compaction-warm-min-small-file-count",
+                env = "INFLUXDB_IOX_COMPACTION_WARM_MIN_SMALL_FILE_COUNT",
+                default_value = "10",
+                action
+            )]
+            pub warm_compaction_min_small_file_count: usize,
         }
     };
 }
@@ -199,11 +278,18 @@ impl CompactorOnceConfig {
             min_number_recent_ingested_files_per_partition: self
                 .min_number_recent_ingested_files_per_partition,
             hot_multiple: self.hot_multiple,
+            warm_multiple: self.warm_multiple,
             memory_budget_bytes: self.memory_budget_bytes,
             min_num_rows_allocated_per_record_batch_to_datafusion_plan: self
                 .min_num_rows_allocated_per_record_batch_to_datafusion_plan,
             max_num_compacting_files: self.max_num_compacting_files,
+            max_num_compacting_files_first_in_partition: self.max_num_compacting_files_first_in_partition,
             minutes_without_new_writes_to_be_cold: self.minutes_without_new_writes_to_be_cold,
+            hot_compaction_hours_threshold_1: self.hot_compaction_hours_threshold_1,
+            hot_compaction_hours_threshold_2: self.hot_compaction_hours_threshold_2,
+            max_parallel_partitions: self.max_parallel_partitions,
+            warm_compaction_small_size_threshold_bytes: self.warm_compaction_small_size_threshold_bytes,
+            warm_compaction_min_small_file_count: self.warm_compaction_min_small_file_count,
         }
     }
 }

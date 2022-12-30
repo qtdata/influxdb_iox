@@ -14,9 +14,13 @@
 )]
 pub mod catalog_dsn;
 pub mod compactor;
+pub mod compactor2;
 pub mod ingester;
+pub mod ingester2;
 pub mod object_store;
 pub mod querier;
+pub mod router;
+pub mod router2;
 pub mod run_config;
 pub mod socket_addr;
 pub mod write_buffer;

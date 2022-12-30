@@ -30,7 +30,7 @@ async fn run_tag_values_test_case<D>(
         let planner = InfluxRpcPlanner::new(ctx.child_ctx("planner"));
 
         let plan = planner
-            .tag_values(db.as_query_database_arc(), tag_name, predicate.clone())
+            .tag_values(db.as_query_namespace_arc(), tag_name, predicate.clone())
             .await
             .expect("built plan successfully");
         let names = ctx
@@ -262,7 +262,7 @@ async fn list_tag_values_measurement_pred_and_or() {
         .with_expr(
             col("_measurement")
                 .eq(lit("o2"))
-                .or(col("temp").gt(lit(70.0))),
+                .or(col("_value").gt(lit(70.0))),
         );
     let predicate = InfluxRpcPredicate::new(None, predicate);
     let expected_tag_keys = vec!["Boston", "LA", "NYC"];
@@ -292,7 +292,7 @@ async fn list_tag_values_field_col_on_tag() {
         let tag_name = "temp";
         let plan_result = planner
             .tag_values(
-                db.as_query_database_arc(),
+                db.as_query_namespace_arc(),
                 tag_name,
                 InfluxRpcPredicate::default(),
             )

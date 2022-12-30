@@ -12,11 +12,11 @@
 )]
 
 mod cache;
-mod chunk;
 mod database;
 mod handler;
 mod ingester;
 mod namespace;
+mod parquet;
 mod poison;
 mod query_log;
 mod server;
@@ -28,9 +28,9 @@ pub use cache::CatalogCache as QuerierCatalogCache;
 pub use database::{Error as QuerierDatabaseError, QuerierDatabase};
 pub use handler::{QuerierHandler, QuerierHandlerImpl};
 pub use ingester::{
-    create_ingester_connection_for_testing, create_ingester_connections_by_shard,
+    create_ingester_connection_for_testing, create_ingester_connections,
     flight_client::{
-        Error as IngesterFlightClientError, FlightClient as IngesterFlightClient,
+        Error as IngesterFlightClientError, IngesterFlightClient,
         QueryData as IngesterFlightClientQueryData,
     },
     Error as IngesterError, IngesterConnection, IngesterConnectionImpl, IngesterPartition,

@@ -15,7 +15,7 @@ use data_types::{SequenceNumber, TableId, Tombstone};
 use iox_catalog::interface::Catalog;
 use iox_time::TimeProvider;
 use snafu::{ResultExt, Snafu};
-use std::{collections::HashMap, mem, sync::Arc};
+use std::{mem, sync::Arc};
 use trace::span::Span;
 
 use super::ram::RamSize;
@@ -125,8 +125,7 @@ impl TombstoneCache {
             testing,
         ));
 
-        let mut backend =
-            PolicyBackend::new(Box::new(HashMap::new()), Arc::clone(&time_provider) as _);
+        let mut backend = PolicyBackend::hashmap_backed(Arc::clone(&time_provider) as _);
         let (policy_constructor, remove_if_handle) =
             RemoveIfPolicy::create_constructor_and_handle(CACHE_ID, metric_registry);
         backend.add_policy(policy_constructor);
@@ -226,7 +225,7 @@ mod tests {
     async fn test_tombstones() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table1 = ns.create_table("table1").await;
         let shard1 = ns.create_shard(1).await;
 
@@ -251,7 +250,7 @@ mod tests {
     async fn test_multiple_tables() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table1 = ns.create_table("table1").await;
         let shard1 = ns.create_shard(1).await;
         let table_and_shard1 = table1.with_shard(&shard1);
@@ -279,7 +278,7 @@ mod tests {
     async fn test_size() {
         let catalog = TestCatalog::new();
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table1 = ns.create_table("table1").await;
         let shard1 = ns.create_shard(1).await;
 
@@ -326,7 +325,7 @@ mod tests {
         let sequence_number_2 = SequenceNumber::new(2);
         let sequence_number_10 = SequenceNumber::new(10);
 
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table1 = ns.create_table("table1").await;
         let shard1 = ns.create_shard(1).await;
 
@@ -395,7 +394,7 @@ mod tests {
     async fn test_expore_empty() {
         let catalog = TestCatalog::new();
         let sequence_number_1 = SequenceNumber::new(1);
-        let ns = catalog.create_namespace("ns").await;
+        let ns = catalog.create_namespace_1hr_retention("ns").await;
         let table1 = ns.create_table("table1").await;
         let shard1 = ns.create_shard(1).await;
 

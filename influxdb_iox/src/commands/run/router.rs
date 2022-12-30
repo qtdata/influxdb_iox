@@ -1,7 +1,10 @@
 //! Implementation of command line option for running router
 
+use crate::process_info::setup_metric_registry;
+
 use super::main;
 use clap_blocks::object_store::make_object_store;
+use clap_blocks::router::RouterConfig;
 use clap_blocks::{
     catalog_dsn::CatalogDsnConfig, run_config::RunConfig, write_buffer::WriteBufferConfig,
 };
@@ -62,37 +65,21 @@ pub struct Config {
     #[clap(flatten)]
     pub(crate) write_buffer_config: WriteBufferConfig,
 
-    /// Query pool name to dispatch writes to.
-    #[clap(
-        long = "query-pool",
-        env = "INFLUXDB_IOX_QUERY_POOL_NAME",
-        default_value = "iox-shared",
-        action
-    )]
-    pub(crate) query_pool_name: String,
-
-    /// The maximum number of simultaneous requests the HTTP server is
-    /// configured to accept.
-    ///
-    /// This number of requests, multiplied by the maximum request body size the
-    /// HTTP server is configured with gives the rough amount of memory a HTTP
-    /// server will use to buffer request bodies in memory.
-    ///
-    /// A default maximum of 200 requests, multiplied by the default 10MiB
-    /// maximum for HTTP request bodies == ~2GiB.
-    #[clap(
-        long = "max-http-requests",
-        env = "INFLUXDB_IOX_MAX_HTTP_REQUESTS",
-        default_value = "200",
-        action
-    )]
-    pub(crate) http_request_limit: usize,
+    #[clap(flatten)]
+    pub(crate) router_config: RouterConfig,
 }
 
 pub async fn command(config: Config) -> Result<()> {
+    if std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok() {
+        panic!(
+            "`INFLUXDB_IOX_RPC_MODE` was specified but `router` was the command run. Either unset
+             `INFLUXDB_IOX_RPC_MODE` or run the `router2` command."
+        );
+    }
+
     let common_state = CommonServerState::from_config(config.run_config.clone())?;
     let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
-    let metrics = Arc::new(metric::Registry::default());
+    let metrics = setup_metric_registry();
 
     let catalog = config
         .catalog_dsn
@@ -105,7 +92,7 @@ pub async fn command(config: Config) -> Result<()> {
     let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
         object_store,
         time_provider,
-        &*metrics,
+        &metrics,
     ));
 
     let server_type = create_router_server_type(
@@ -114,8 +101,7 @@ pub async fn command(config: Config) -> Result<()> {
         catalog,
         object_store,
         &config.write_buffer_config,
-        &config.query_pool_name,
-        config.http_request_limit,
+        &config.router_config,
     )
     .await?;
 

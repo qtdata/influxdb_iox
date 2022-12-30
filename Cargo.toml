@@ -25,6 +25,8 @@ members = [
     "influxdb2_client",
     "influxrpc_parser",
     "ingester",
+    "ingester2",
+    "iox_arrow_flight",
     "iox_catalog",
     "iox_data_generator",
     "garbage_collector",
@@ -34,6 +36,7 @@ members = [
     "ioxd_common",
     "ioxd_compactor",
     "ioxd_ingester",
+    "ioxd_ingester2",
     "ioxd_garbage_collector",
     "ioxd_querier",
     "ioxd_router",
@@ -59,6 +62,7 @@ members = [
     "service_common",
     "service_grpc_influxrpc",
     "service_grpc_flight",
+    "service_grpc_namespace",
     "service_grpc_object_store",
     "service_grpc_catalog",
     "service_grpc_schema",
@@ -72,6 +76,7 @@ members = [
     "trace_http",
     "tracker",
     "trogging",
+    "wal",
     "workspace-hack",
     "write_buffer",
     "write_summary",
@@ -108,11 +113,12 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "26.0.0" }
-arrow-flight = { version = "26.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="dd081d64a2fba8574e63bdd0662c14aec5852b48", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="dd081d64a2fba8574e63bdd0662c14aec5852b48" }
-parquet = { version = "26.0.0" }
+arrow = { version = "29.0.0" }
+arrow-flight = { version = "29.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="891a800ebb170fed018e53846eb569f3e0638857", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="891a800ebb170fed018e53846eb569f3e0638857" }
+hashbrown = { version = "0.13.1" }
+parquet = { version = "29.0.0" }
 
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.
@@ -138,3 +144,8 @@ opt-level = 3
 
 [profile.dev.package.similar]
 opt-level = 3
+
+[patch.crates-io]
+# remove and bump object_store dep version once this revision is released.
+# patch for https://github.com/influxdata/idpe/issues/16611
+object_store = { git = 'https://github.com/apache/arrow-rs.git', rev = "f5c165acc0e6cc4b34e0eaea006aab7e5bd28d66", package = "object_store" }

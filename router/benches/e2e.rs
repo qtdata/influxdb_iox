@@ -23,7 +23,8 @@ use write_buffer::{
 
 // Init a mock write buffer with the given number of shards.
 fn init_write_buffer(n_shards: u32) -> ShardedWriteBuffer<JumpHash<Arc<Shard>>> {
-    let time = iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000));
+    let time =
+        iox_time::MockProvider::new(iox_time::Time::from_timestamp_millis(668563200000).unwrap());
     let write_buffer: Arc<dyn WriteBufferWriting> = Arc::new(
         MockBufferForWriting::new(
             MockBufferSharedState::empty_with_n_shards(
@@ -66,7 +67,7 @@ fn e2e_benchmarks(c: &mut Criterion) {
 
         let write_buffer = init_write_buffer(1);
         let schema_validator =
-            SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &*metrics);
+            SchemaValidator::new(Arc::clone(&catalog), Arc::clone(&ns_cache), &metrics);
         let partitioner = Partitioner::new(PartitionTemplate {
             parts: vec![TemplatePart::TimeFormat("%Y-%m-%d".to_owned())],
         });

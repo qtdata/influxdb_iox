@@ -1,12 +1,10 @@
 //! Client helpers for writing end to end ng tests
 use arrow::record_batch::RecordBatch;
-use futures::{stream::FuturesUnordered, StreamExt};
-use generated_types::influxdata::pbdata::v1::WriteResponse;
+use futures::{stream::FuturesUnordered, StreamExt, TryStreamExt};
 use http::Response;
 use hyper::{Body, Client, Request};
 use influxdb_iox_client::{
     connection::Connection,
-    flight::generated_types::ReadInfo,
     write_info::generated_types::{merge_responses, GetWriteInfoResponse, ShardStatus},
 };
 use observability_deps::tracing::info;
@@ -44,18 +42,6 @@ pub fn get_write_token(response: &Response<Body>) -> String {
     let message = format!("no write token in {:?}", response);
     response
         .headers()
-        .get("X-IOx-Write-Token")
-        .expect(&message)
-        .to_str()
-        .expect("Value not a string")
-        .to_string()
-}
-
-/// Extracts the write token from the specified response (to the gRPC write API)
-pub fn get_write_token_from_grpc(response: &tonic::Response<WriteResponse>) -> String {
-    let message = format!("no write token in {:?}", response);
-    response
-        .metadata()
         .get("X-IOx-Write-Token")
         .expect(&message)
         .to_str()
@@ -202,41 +188,66 @@ pub fn all_persisted(res: &GetWriteInfoResponse) -> bool {
         .all(|info| matches!(info.status(), ShardStatus::Persisted))
 }
 
-/// Runs a query using the flight API on the specified connection.
-///
-/// This is similar ot [`run_query`] but does NOT unwrap the result.
-pub async fn try_run_query(
-    sql: impl Into<String>,
+/// Runs a SQL query using the flight API on the specified connection.
+pub async fn try_run_sql(
+    sql_query: impl Into<String>,
     namespace: impl Into<String>,
     querier_connection: Connection,
 ) -> Result<Vec<RecordBatch>, influxdb_iox_client::flight::Error> {
-    let namespace = namespace.into();
-    let sql = sql.into();
-
     let mut client = influxdb_iox_client::flight::Client::new(querier_connection);
 
-    // This does nothing except test the client handshake implementation.
+    // Test the client handshake implementation
+    // Normally this would be done one per connection, not per query
     client.handshake().await?;
 
-    let mut response = client
-        .perform_query(ReadInfo {
-            namespace_name: namespace,
-            sql_query: sql,
-        })
-        .await?;
-
-    response.collect().await
+    client
+        .sql(namespace.into(), sql_query.into())
+        .await?
+        .try_collect()
+        .await
 }
 
-/// Runs a query using the flight API on the specified connection.
+/// Runs a InfluxQL query using the flight API on the specified connection.
+pub async fn try_run_influxql(
+    influxql_query: impl Into<String>,
+    namespace: impl Into<String>,
+    querier_connection: Connection,
+) -> Result<Vec<RecordBatch>, influxdb_iox_client::flight::Error> {
+    let mut client = influxdb_iox_client::flight::Client::new(querier_connection);
+
+    // Test the client handshake implementation
+    // Normally this would be done one per connection, not per query
+    client.handshake().await?;
+
+    client
+        .influxql(namespace.into(), influxql_query.into())
+        .await?
+        .try_collect()
+        .await
+}
+
+/// Runs a SQL query using the flight API on the specified connection.
 ///
-/// Use [`try_run_query`] if you want to check the error manually.
-pub async fn run_query(
+/// Use [`try_run_sql`] if you want to check the error manually.
+pub async fn run_sql(
     sql: impl Into<String>,
     namespace: impl Into<String>,
     querier_connection: Connection,
 ) -> Vec<RecordBatch> {
-    try_run_query(sql, namespace, querier_connection)
+    try_run_sql(sql, namespace, querier_connection)
         .await
-        .expect("Error executing query")
+        .expect("Error executing sql query")
+}
+
+/// Runs an InfluxQL query using the flight API on the specified connection.
+///
+/// Use [`try_run_influxql`] if you want to check the error manually.
+pub async fn run_influxql(
+    influxql: impl Into<String>,
+    namespace: impl Into<String>,
+    querier_connection: Connection,
+) -> Vec<RecordBatch> {
+    try_run_influxql(influxql, namespace, querier_connection)
+        .await
+        .expect("Error executing influxql query")
 }

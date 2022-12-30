@@ -27,6 +27,8 @@ use import::{
     AggregateTSMSchemaOverride,
 };
 
+use crate::process_info::setup_metric_registry;
+
 // Possible errors from schema commands
 #[derive(Debug, Error)]
 pub enum SchemaCommandError {
@@ -123,7 +125,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Schem
     match config {
         Config::Merge(merge_config) => {
             let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
-            let metrics = Arc::new(metric::Registry::default());
+            let metrics = setup_metric_registry();
 
             let object_store = make_object_store(&merge_config.object_store)
                 .map_err(SchemaCommandError::ObjectStoreParsing)?;
@@ -131,7 +133,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Schem
             let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
                 object_store,
                 time_provider,
-                &*metrics,
+                &metrics,
             ));
 
             let catalog = merge_config
@@ -183,7 +185,6 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Schem
                 &merged_tsm_schema,
                 merge_config.write_buffer_config.topic(),
                 merge_config.query_pool_name.as_deref(),
-                merge_config.retention.as_deref(),
                 Arc::clone(&catalog),
                 connection.clone(),
             )

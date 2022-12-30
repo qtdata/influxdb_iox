@@ -12,6 +12,8 @@ use parquet_file::storage::{ParquetStorage, StorageId};
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::process_info::{setup_metric_registry, USIZE_MAX};
+
 mod generate;
 
 #[derive(Debug, clap::Parser)]
@@ -41,6 +43,15 @@ pub enum Command {
             action
         )]
         query_exec_thread_count: usize,
+
+        /// Size of memory pool used during query exec, in bytes.
+        #[clap(
+            long = "exec-mem-pool-bytes",
+            env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
+            default_value = &USIZE_MAX[..],
+            action
+        )]
+        exec_mem_pool_bytes: usize,
     },
 
     /// Generate Parquet files and catalog entries with different characteristics for the purposes
@@ -66,11 +77,12 @@ pub async fn command(config: Config) -> Result<()> {
             catalog_dsn,
             compactor_config,
             query_exec_thread_count,
+            exec_mem_pool_bytes,
         } => {
             let compactor_config = compactor_config.into_compactor_config();
 
             let time_provider = Arc::new(SystemProvider::new()) as Arc<dyn TimeProvider>;
-            let metric_registry: Arc<metric::Registry> = Default::default();
+            let metric_registry = setup_metric_registry();
             let catalog = catalog_dsn
                 .get_catalog("compactor", Arc::clone(&metric_registry))
                 .await?;
@@ -81,7 +93,7 @@ pub async fn command(config: Config) -> Result<()> {
             let object_store: Arc<DynObjectStore> = Arc::new(ObjectStoreMetrics::new(
                 object_store,
                 Arc::clone(&time_provider),
-                &*metric_registry,
+                &metric_registry,
             ));
             let parquet_store = ParquetStorage::new(object_store, StorageId::from("iox"));
 
@@ -92,6 +104,7 @@ pub async fn command(config: Config) -> Result<()> {
                     parquet_store.id(),
                     Arc::clone(parquet_store.object_store()),
                 )]),
+                mem_pool_size: exec_mem_pool_bytes,
             }));
             let time_provider = Arc::new(SystemProvider::new());
 

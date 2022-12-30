@@ -1,23 +1,31 @@
 use std::{error::Error, fmt::Debug, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{DatabaseName, DeletePredicate, NamespaceId};
+use data_types::{DeletePredicate, NamespaceId, NamespaceName};
 use thiserror::Error;
 use trace::ctx::SpanContext;
 
-use super::{partitioner::PartitionError, SchemaError, ShardError};
+use super::{
+    partitioner::PartitionError, retention_validator::RetentionError, RpcWriteError, SchemaError,
+    ShardError,
+};
 
 /// Errors emitted by a [`DmlHandler`] implementation during DML request
 /// processing.
 #[derive(Debug, Error)]
 pub enum DmlError {
-    /// The database specified by the caller does not exist.
-    #[error("database {0} does not exist")]
-    DatabaseNotFound(String),
+    /// The namespace specified by the caller does not exist.
+    #[error("namespace {0} does not exist")]
+    NamespaceNotFound(String),
 
     /// An error sharding the writes and pushing them to the write buffer.
     #[error(transparent)]
     WriteBuffer(#[from] ShardError),
+
+    /// An error pushing the request to a downstream ingester via a direct RPC
+    /// call.
+    #[error(transparent)]
+    RpcWrite(#[from] RpcWriteError),
 
     /// A schema validation failure.
     #[error(transparent)]
@@ -26,6 +34,10 @@ pub enum DmlError {
     /// An error partitioning the request.
     #[error(transparent)]
     Partition(#[from] PartitionError),
+
+    /// An error validate retention period
+    #[error(transparent)]
+    Retention(#[from] RetentionError),
 
     /// An unknown error occured while processing the DML request.
     #[error("internal dml handler error: {0}")]
@@ -58,7 +70,7 @@ pub trait DmlHandler: Debug + Send + Sync {
     /// Write `batches` to `namespace`.
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
@@ -67,7 +79,7 @@ pub trait DmlHandler: Debug + Send + Sync {
     /// Delete the data specified in `delete`.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,
@@ -87,7 +99,7 @@ where
 
     async fn write(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         input: Self::WriteInput,
         span_ctx: Option<SpanContext>,
@@ -100,7 +112,7 @@ where
     /// Delete the data specified in `delete`.
     async fn delete(
         &self,
-        namespace: &DatabaseName<'static>,
+        namespace: &NamespaceName<'static>,
         namespace_id: NamespaceId,
         table_name: &str,
         predicate: &DeletePredicate,

@@ -5,10 +5,10 @@ use std::{convert::TryFrom, fmt, sync::Arc};
 
 use arrow::{
     array::{
-        ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray,
-        UInt64Array,
+        Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray,
+        TimestampNanosecondArray, UInt64Array,
     },
-    bitmap::Bitmap,
+    compute,
     datatypes::DataType as ArrowDataType,
 };
 use predicate::rpc_predicate::{FIELD_COLUMN_NAME, MEASUREMENT_COLUMN_NAME};
@@ -28,10 +28,17 @@ pub enum Error {
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A name=value pair used to represent a series's tag
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tag {
     pub key: Arc<str>,
     pub value: Arc<str>,
+}
+
+impl Tag {
+    /// Memory usage in bytes, including `self`.
+    pub fn size(&self) -> usize {
+        std::mem::size_of_val(self) + self.key.len() + self.value.len()
+    }
 }
 
 impl fmt::Display for Tag {
@@ -41,7 +48,7 @@ impl fmt::Display for Tag {
 }
 
 /// Represents a single logical TimeSeries
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Series {
     /// key = value pairs that define this series
     /// (including the _measurement and _field that correspond to table name and column name)
@@ -49,6 +56,21 @@ pub struct Series {
 
     /// The raw data for this series
     pub data: Data,
+}
+
+impl Series {
+    /// Memory usage in bytes, including `self`.
+    pub fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + (std::mem::size_of::<Tag>() * self.tags.capacity())
+            + self
+                .tags
+                .iter()
+                .map(|tag| tag.size() - std::mem::size_of_val(tag))
+                .sum::<usize>()
+            + self.data.size()
+            - std::mem::size_of_val(&self.data)
+    }
 }
 
 impl fmt::Display for Series {
@@ -95,6 +117,95 @@ pub enum Data {
         timestamps: Vec<i64>,
         values: Vec<String>,
     },
+}
+
+impl Data {
+    /// Memory usage in bytes, including `self`.
+    pub fn size(&self) -> usize {
+        std::mem::size_of_val(self)
+            + match self {
+                Self::FloatPoints { timestamps, values } => {
+                    primitive_vec_size(timestamps) + primitive_vec_size(values)
+                }
+                Self::IntegerPoints { timestamps, values } => {
+                    primitive_vec_size(timestamps) + primitive_vec_size(values)
+                }
+                Self::UnsignedPoints { timestamps, values } => {
+                    primitive_vec_size(timestamps) + primitive_vec_size(values)
+                }
+                Self::BooleanPoints { timestamps, values } => {
+                    primitive_vec_size(timestamps) + primitive_vec_size(values)
+                }
+                Self::StringPoints { timestamps, values } => {
+                    primitive_vec_size(timestamps) + primitive_vec_size(values)
+                }
+            }
+    }
+}
+
+impl PartialEq for Data {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::FloatPoints {
+                    timestamps: l_timestamps,
+                    values: l_values,
+                },
+                Self::FloatPoints {
+                    timestamps: r_timestamps,
+                    values: r_values,
+                },
+            ) => l_timestamps == r_timestamps && l_values == r_values,
+            (
+                Self::IntegerPoints {
+                    timestamps: l_timestamps,
+                    values: l_values,
+                },
+                Self::IntegerPoints {
+                    timestamps: r_timestamps,
+                    values: r_values,
+                },
+            ) => l_timestamps == r_timestamps && l_values == r_values,
+            (
+                Self::UnsignedPoints {
+                    timestamps: l_timestamps,
+                    values: l_values,
+                },
+                Self::UnsignedPoints {
+                    timestamps: r_timestamps,
+                    values: r_values,
+                },
+            ) => l_timestamps == r_timestamps && l_values == r_values,
+            (
+                Self::BooleanPoints {
+                    timestamps: l_timestamps,
+                    values: l_values,
+                },
+                Self::BooleanPoints {
+                    timestamps: r_timestamps,
+                    values: r_values,
+                },
+            ) => l_timestamps == r_timestamps && l_values == r_values,
+            (
+                Self::StringPoints {
+                    timestamps: l_timestamps,
+                    values: l_values,
+                },
+                Self::StringPoints {
+                    timestamps: r_timestamps,
+                    values: r_values,
+                },
+            ) => l_timestamps == r_timestamps && l_values == r_values,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Data {}
+
+/// Returns size of given vector of primitive types in bytes, EXCLUDING `vec` itself.
+fn primitive_vec_size<T>(vec: &Vec<T>) -> usize {
+    std::mem::size_of::<T>() * vec.capacity()
 }
 
 impl fmt::Display for Data {
@@ -146,92 +257,94 @@ impl TryFrom<SeriesSet> for Vec<Series> {
 impl SeriesSet {
     /// Returns true if the array is entirely null between start_row and
     /// start_row+num_rows
-    fn is_all_null(arr: &ArrayRef, start_row: usize, num_rows: usize) -> bool {
-        let end_row = start_row + num_rows;
-        (start_row..end_row).all(|i| arr.is_null(i))
+    fn is_all_null(arr: &ArrayRef) -> bool {
+        arr.null_count() == arr.len()
     }
 
     pub fn is_timestamp_all_null(&self) -> bool {
-        let start_row = self.start_row;
-        let num_rows = self.num_rows;
-
         self.field_indexes.iter().all(|field_index| {
             let array = self.batch.column(field_index.timestamp_index);
-            Self::is_all_null(array, start_row, num_rows)
+            Self::is_all_null(array)
         })
     }
 
     // Convert and append the values from a single field to a Series
     // appended to `frames`
     fn field_to_series(&self, index: &FieldIndex) -> Result<Option<Series>> {
-        let batch = &self.batch;
+        let batch = self.batch.slice(self.start_row, self.num_rows);
         let schema = batch.schema();
 
         let field = schema.field(index.value_index);
         let array = batch.column(index.value_index);
 
-        let start_row = self.start_row;
-        let num_rows = self.num_rows;
-
         // No values for this field are in the array so it does not
         // contribute to a series.
-        if field.is_nullable() && Self::is_all_null(array, start_row, num_rows) {
+        if field.is_nullable() && Self::is_all_null(array) {
             return Ok(None);
         }
 
         let tags = self.create_frame_tags(schema.field(index.value_index).name());
 
-        // Only take timestamps (and values) from the rows that have non
-        // null values for this field
-        let valid = array.data().null_bitmap();
-
-        let timestamps = batch
-            .column(index.timestamp_index)
-            .as_any()
-            .downcast_ref::<TimestampNanosecondArray>()
-            .unwrap()
-            .extract_values(start_row, num_rows, valid);
+        let mut timestamps = compute::nullif::nullif(
+            batch.column(index.timestamp_index),
+            &compute::is_null(array).expect("is_null"),
+        )
+        .expect("null handling")
+        .as_any()
+        .downcast_ref::<TimestampNanosecondArray>()
+        .unwrap()
+        .extract_values();
+        timestamps.shrink_to_fit();
 
         let data = match array.data_type() {
             ArrowDataType::Utf8 => {
-                let values = array
+                let mut values = array
                     .as_any()
                     .downcast_ref::<StringArray>()
                     .unwrap()
-                    .extract_values(start_row, num_rows, valid);
+                    .extract_values();
+                values.shrink_to_fit();
+
                 Data::StringPoints { timestamps, values }
             }
             ArrowDataType::Float64 => {
-                let values = array
+                let mut values = array
                     .as_any()
                     .downcast_ref::<Float64Array>()
                     .unwrap()
-                    .extract_values(start_row, num_rows, valid);
+                    .extract_values();
+                values.shrink_to_fit();
 
                 Data::FloatPoints { timestamps, values }
             }
             ArrowDataType::Int64 => {
-                let values = array
+                let mut values = array
                     .as_any()
                     .downcast_ref::<Int64Array>()
                     .unwrap()
-                    .extract_values(start_row, num_rows, valid);
+                    .extract_values();
+                values.shrink_to_fit();
+
                 Data::IntegerPoints { timestamps, values }
             }
             ArrowDataType::UInt64 => {
-                let values = array
+                let mut values = array
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .unwrap()
-                    .extract_values(start_row, num_rows, valid);
+                    .extract_values();
+                values.shrink_to_fit();
+
                 Data::UnsignedPoints { timestamps, values }
             }
             ArrowDataType::Boolean => {
-                let values = array
+                let mut values = array
                     .as_any()
                     .downcast_ref::<BooleanArray>()
                     .unwrap()
-                    .extract_values(start_row, num_rows, valid);
+                    .extract_values();
+                values.shrink_to_fit();
+
                 Data::BooleanPoints { timestamps, values }
             }
             _ => {
@@ -278,7 +391,7 @@ impl SeriesSet {
 }
 
 /// Represents a group of `Series`
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Group {
     /// Contains *ALL* tag keys (not just those used for grouping)
     pub tag_keys: Vec<Arc<str>>,
@@ -305,7 +418,7 @@ impl fmt::Display for Group {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Either {
     Series(Series),
     Group(Group),
@@ -345,47 +458,23 @@ fn fmt_strings(f: &mut fmt::Formatter<'_>, strings: &[Arc<str>]) -> fmt::Result 
 }
 
 trait ExtractValues<T> {
-    /// Extracts num_rows of data starting from start_row as a vector,
+    /// Extracts rows as a vector,
     /// for all rows `i` where `valid[i]` is set
-    fn extract_values(&self, start_row: usize, num_rows: usize, valid: Option<&Bitmap>) -> Vec<T>;
+    fn extract_values(&self) -> Vec<T>;
 }
 
 /// Implements extract_values for a particular type of array that
 macro_rules! extract_values_impl {
     ($DATA_TYPE:ty) => {
-        fn extract_values(
-            &self,
-            start_row: usize,
-            num_rows: usize,
-            valid: Option<&Bitmap>,
-        ) -> Vec<$DATA_TYPE> {
-            let end_row = start_row + num_rows;
-            match valid {
-                Some(valid) => (start_row..end_row)
-                    .filter_map(|row| valid.is_set(row).then(|| self.value(row)))
-                    .collect(),
-                None => (start_row..end_row).map(|row| self.value(row)).collect(),
-            }
+        fn extract_values(&self) -> Vec<$DATA_TYPE> {
+            self.iter().flatten().collect()
         }
     };
 }
 
 impl ExtractValues<String> for StringArray {
-    fn extract_values(
-        &self,
-        start_row: usize,
-        num_rows: usize,
-        valid: Option<&Bitmap>,
-    ) -> Vec<String> {
-        let end_row = start_row + num_rows;
-        match valid {
-            Some(valid) => (start_row..end_row)
-                .filter_map(|row| valid.is_set(row).then(|| self.value(row).to_string()))
-                .collect(),
-            None => (start_row..end_row)
-                .map(|row| self.value(row).to_string())
-                .collect(),
-        }
+    fn extract_values(&self) -> Vec<String> {
+        self.iter().flatten().map(str::to_string).collect()
     }
 }
 

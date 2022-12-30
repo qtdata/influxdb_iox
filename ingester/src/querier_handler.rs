@@ -2,19 +2,24 @@
 
 use std::{pin::Pin, sync::Arc};
 
-use arrow::{array::new_null_array, error::ArrowError, record_batch::RecordBatch};
-use arrow_util::optimize::{optimize_record_batch, optimize_schema};
-use data_types::{PartitionId, SequenceNumber};
+use arrow::{error::ArrowError, record_batch::RecordBatch};
+use arrow_util::{
+    optimize::{
+        prepare_batch_for_flight, prepare_schema_for_flight, split_batch_for_grpc_response,
+    },
+    test_util::equalize_batch_schemas,
+};
+use data_types::{NamespaceId, PartitionId, SequenceNumber, TableId};
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion_util::MemoryStream;
 use futures::{Stream, StreamExt, TryStreamExt};
 use generated_types::ingester::IngesterQueryRequest;
-use observability_deps::tracing::debug;
-use schema::{merge::SchemaMerger, Projection};
+use observability_deps::tracing::*;
+use schema::Projection;
 use snafu::{ensure, Snafu};
 use trace::span::{Span, SpanRecorder};
 
-use crate::data::{namespace::NamespaceName, table::TableName, IngesterData};
+use crate::data::IngesterData;
 
 /// Number of table data read locks that shall be acquired in parallel
 const CONCURRENT_TABLE_DATA_LOCKS: usize = 10;
@@ -22,20 +27,17 @@ const CONCURRENT_TABLE_DATA_LOCKS: usize = 10;
 #[derive(Debug, Snafu)]
 #[allow(missing_copy_implementations, missing_docs)]
 pub enum Error {
-    #[snafu(display(
-        "No Namespace Data found for the given namespace name {}",
-        namespace_name,
-    ))]
-    NamespaceNotFound { namespace_name: String },
+    #[snafu(display("No Namespace Data found for the given namespace ID {}", namespace_id,))]
+    NamespaceNotFound { namespace_id: NamespaceId },
 
     #[snafu(display(
-        "No Table Data found for the given namespace name {}, table name {}",
-        namespace_name,
-        table_name
+        "No Table Data found for the given namespace ID {}, table ID {}",
+        namespace_id,
+        table_id
     ))]
     TableNotFound {
-        namespace_name: String,
-        table_name: String,
+        namespace_id: NamespaceId,
+        table_id: TableId,
     },
 
     #[snafu(display("Concurrent query request limit exceeded"))]
@@ -136,7 +138,8 @@ impl IngesterQueryResponse {
                         .snapshots
                         .flat_map(|snapshot_res| match snapshot_res {
                             Ok(snapshot) => {
-                                let schema = Arc::new(optimize_schema(&snapshot.schema()));
+                                let schema =
+                                    Arc::new(prepare_schema_for_flight(&snapshot.schema()));
 
                                 let schema_captured = Arc::clone(&schema);
                                 let head = futures::stream::once(async {
@@ -145,11 +148,23 @@ impl IngesterQueryResponse {
                                     })
                                 });
 
-                                let tail = snapshot.map(move |batch_res| match batch_res {
-                                    Ok(batch) => Ok(FlatIngesterQueryResponse::RecordBatch {
-                                        batch: optimize_record_batch(&batch, Arc::clone(&schema))?,
-                                    }),
-                                    Err(e) => Err(e),
+                                let tail = snapshot.flat_map(move |batch_res| match batch_res {
+                                    Ok(batch) => {
+                                        match prepare_batch_for_flight(&batch, Arc::clone(&schema))
+                                        {
+                                            Ok(batch) => futures::stream::iter(
+                                                split_batch_for_grpc_response(batch),
+                                            )
+                                            .map(|batch| {
+                                                Ok(FlatIngesterQueryResponse::RecordBatch { batch })
+                                            })
+                                            .boxed(),
+                                            Err(e) => {
+                                                futures::stream::once(async { Err(e) }).boxed()
+                                            }
+                                        }
+                                    }
+                                    Err(e) => futures::stream::once(async { Err(e) }).boxed(),
                                 });
 
                                 head.chain(tail).boxed()
@@ -175,7 +190,6 @@ impl IngesterQueryResponse {
     /// do not line up with the snapshot-scoped record batches.
     pub async fn into_record_batches(self) -> Vec<RecordBatch> {
         let mut snapshot_schema = None;
-        let mut schema_merger = SchemaMerger::new();
         let mut batches = vec![];
 
         let mut stream = self.flatten();
@@ -189,33 +203,13 @@ impl IngesterQueryResponse {
                 }
                 FlatIngesterQueryResponse::StartSnapshot { schema } => {
                     snapshot_schema = Some(Arc::clone(&schema));
-
-                    schema_merger = schema_merger
-                        .merge(&schema::Schema::try_from(schema).unwrap())
-                        .unwrap();
                 }
             }
         }
 
         assert!(!batches.is_empty());
 
-        // equalize schemas
-        let common_schema = schema_merger.build().as_arrow();
-        batches
-            .into_iter()
-            .map(|batch| {
-                let batch_schema = batch.schema();
-                let columns = common_schema
-                    .fields()
-                    .iter()
-                    .map(|field| match batch_schema.index_of(field.name()) {
-                        Ok(idx) => Arc::clone(batch.column(idx)),
-                        Err(_) => new_null_array(field.data_type(), batch.num_rows()),
-                    })
-                    .collect();
-                RecordBatch::try_new(Arc::clone(&common_schema), columns).unwrap()
-            })
-            .collect()
+        equalize_batch_schemas(batches).unwrap()
     }
 }
 
@@ -266,11 +260,13 @@ pub async fn prepare_data_to_querier(
     let mut found_namespace = false;
 
     for (shard_id, shard_data) in ingest_data.shards() {
-        debug!(shard_id=%shard_id.get());
-        let namespace_name = NamespaceName::from(&request.namespace);
-        let namespace_data = match shard_data.namespace(&namespace_name) {
+        let namespace_data = match shard_data.namespace(request.namespace_id) {
             Some(namespace_data) => {
-                debug!(namespace=%request.namespace, "found namespace");
+                trace!(
+                    shard_id=%shard_id.get(),
+                    namespace_id=%request.namespace_id,
+                    "found namespace"
+                );
                 found_namespace = true;
                 namespace_data
             }
@@ -279,42 +275,40 @@ pub async fn prepare_data_to_querier(
             }
         };
 
-        let table_name = TableName::from(&request.table);
-        let table_data = match namespace_data.table_data(&table_name) {
-            Some(table_data) => {
-                debug!(table_name=%request.table, "found table");
-                table_data
-            }
-            None => {
-                continue;
-            }
-        };
-
-        table_refs.push(table_data);
+        if let Some(table_data) = namespace_data.table(request.table_id) {
+            trace!(
+                shard_id=%shard_id.get(),
+                namespace_id=%request.namespace_id,
+                table_id=%request.table_id,
+                "found table"
+            );
+            table_refs.push(table_data);
+        }
     }
 
     ensure!(
         found_namespace,
         NamespaceNotFoundSnafu {
-            namespace_name: &request.namespace,
+            namespace_id: request.namespace_id,
         },
     );
 
     ensure!(
         !table_refs.is_empty(),
         TableNotFoundSnafu {
-            namespace_name: &request.namespace,
-            table_name: &request.table
+            namespace_id: request.namespace_id,
+            table_id: request.table_id
         },
     );
 
     // acquire locks and read table data in parallel
     let unpersisted_partitions: Vec<_> = futures::stream::iter(table_refs)
         .map(|table_data| async move {
-            let mut table_data = table_data.write().await;
             table_data
-                .partition_iter_mut()
+                .partitions()
+                .into_iter()
                 .map(|p| {
+                    let mut p = p.lock();
                     (
                         p.partition_id(),
                         p.get_query_data(),
@@ -394,7 +388,7 @@ mod tests {
     use predicate::Predicate;
 
     use super::*;
-    use crate::test_util::{make_ingester_data, TEST_NAMESPACE, TEST_TABLE};
+    use crate::test_util::make_ingester_data;
 
     #[tokio::test]
     async fn test_ingester_query_response_flatten() {
@@ -485,19 +479,24 @@ mod tests {
         test_helpers::maybe_start_logging();
 
         // make 14 scenarios for ingester data
+        let mut table_id = None;
+        let mut ns_id = None;
         let mut scenarios = vec![];
         for two_partitions in [false, true] {
-            let scenario = Arc::new(make_ingester_data(two_partitions).await);
-            scenarios.push(scenario);
+            let (scenario, ns, table) = make_ingester_data(two_partitions).await;
+
+            let old = *table_id.get_or_insert(table);
+            assert_eq!(old, table);
+            let old = *ns_id.get_or_insert(ns);
+            assert_eq!(old, ns);
+
+            scenarios.push(Arc::new(scenario));
         }
+        let table_id = table_id.unwrap();
+        let ns_id = ns_id.unwrap();
 
         // read data from all scenarios without any filters
-        let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
-            vec![],
-            None,
-        ));
+        let request = Arc::new(IngesterQueryRequest::new(ns_id, table_id, vec![], None));
         let expected = vec![
             "+------------+-----+------+--------------------------------+",
             "| city       | day | temp | time                           |",
@@ -523,8 +522,8 @@ mod tests {
 
         // read data from all scenarios and filter out column day
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
+            ns_id,
+            table_id,
             vec![
                 "city".to_string(),
                 "temp".to_string(),
@@ -560,8 +559,8 @@ mod tests {
         let expr = col("city").not_eq(lit("Medford"));
         let pred = Predicate::default().with_expr(expr).with_range(0, 42);
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            TEST_TABLE.to_string(),
+            ns_id,
+            table_id,
             vec!["city".to_string(), "temp".to_string(), "time".to_string()],
             Some(pred),
         ));
@@ -602,8 +601,8 @@ mod tests {
 
         // test "table not found" handling
         let request = Arc::new(IngesterQueryRequest::new(
-            TEST_NAMESPACE.to_string(),
-            "table_does_not_exist".to_string(),
+            ns_id,
+            TableId::new(i64::MAX),
             vec![],
             None,
         ));
@@ -616,8 +615,8 @@ mod tests {
 
         // test "namespace not found" handling
         let request = Arc::new(IngesterQueryRequest::new(
-            "namespace_does_not_exist".to_string(),
-            TEST_TABLE.to_string(),
+            NamespaceId::new(i64::MAX),
+            table_id,
             vec![],
             None,
         ));

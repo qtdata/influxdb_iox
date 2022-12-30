@@ -97,7 +97,7 @@ fn build_node(expr: &Expr, strings_are_regex: bool) -> Result<RPCNode> {
             None,
         ),
         Expr::Cast { expr, data_type } => match data_type {
-            sqlparser::ast::DataType::Custom(ident) => {
+            sqlparser::ast::DataType::Custom(ident, _modifiers) => {
                 if let Some(Ident { value, .. }) = ident.0.get(0) {
                     // See https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#syntax
                     match value.as_str() {
@@ -305,7 +305,7 @@ mod test {
         // remove quoting from literal - whilst we need the quoting to parse
         // the sql statement correctly, the RPCNode for the literal would not
         // have the quoting present.
-        let literal = parts[2].replace('\'', "").replace('"', "");
+        let literal = parts[2].replace(['\'', '"'], "");
         let literal = if is_regex {
             RPCValue::RegexValue(literal)
         } else {
