@@ -253,16 +253,16 @@ impl SortKey {
         }
 
         // Verify if time column in the sort key
-        for key in [&key1, &key2] {
-            match key.columns.get_index_of(TIME_COLUMN_NAME) {
-                None => panic!("Time column is not included in the sort key {:#?}", key),
-                Some(idx) => {
-                    if idx < key.len() - 1 {
-                        panic!("Time column is not last in the sort key {:#?}", key)
-                    }
-                }
-            }
-        }
+        // for key in [&key1, &key2] {
+        //     match key.columns.get_index_of(TIME_COLUMN_NAME) {
+        //         None => panic!("Time column is not included in the sort key {:#?}", key),
+        //         Some(idx) => {
+        //             if idx < key.len() - 1 {
+        //                 panic!("Time column is not last in the sort key {:#?}", key)
+        //             }
+        //         }
+        //     }
+        // }
 
         let (long_key, short_key) = if key1.len() > key2.len() {
             (key1, key2)
