@@ -5,7 +5,7 @@ use std::sync::Arc;
 use data_types::{Namespace as CatalogNamespace, QueryPoolId, TopicId};
 use generated_types::influxdata::iox::namespace::v1::*;
 use iox_catalog::interface::Catalog;
-use observability_deps::tracing::warn;
+use observability_deps::tracing::{debug, info, warn};
 use tonic::{Request, Response, Status};
 
 /// Implementation of the gRPC namespace service
@@ -59,22 +59,44 @@ impl namespace_service_server::NamespaceService for NamespaceService {
 
         let mut repos = self.catalog.repositories().await;
 
-        let req = request.into_inner();
+        let CreateNamespaceRequest {
+            name: namespace_name,
+            retention_period_ns,
+        } = request.into_inner();
+
+        debug!(%namespace_name, ?retention_period_ns, "Creating namespace");
+
         let namespace = repos
             .namespaces()
             .create(
-                &req.name,
-                req.retention_period_ns,
+                &namespace_name,
+                retention_period_ns,
                 self.topic_id.unwrap(),
                 self.query_id.unwrap(),
             )
             .await
             .map_err(|e| {
-                warn!(error=%e, %req.name, "failed to create namespace");
+                warn!(error=%e, %namespace_name, "failed to create namespace");
                 Status::internal(e.to_string())
             })?;
 
+        info!(
+            namespace_name,
+            namespace_id = %namespace.id,
+            "created namespace"
+        );
+
         Ok(Response::new(create_namespace_to_proto(namespace)))
+    }
+
+    async fn delete_namespace(
+        &self,
+        _request: Request<DeleteNamespaceRequest>,
+    ) -> Result<Response<DeleteNamespaceResponse>, Status> {
+        warn!("call to namespace delete - unimplemented");
+        Err(Status::unimplemented(
+            "namespace delete is not yet supported",
+        ))
     }
 
     async fn update_namespace_retention(
@@ -83,15 +105,29 @@ impl namespace_service_server::NamespaceService for NamespaceService {
     ) -> Result<Response<UpdateNamespaceRetentionResponse>, Status> {
         let mut repos = self.catalog.repositories().await;
 
-        let req = request.into_inner();
+        let UpdateNamespaceRetentionRequest {
+            name: namespace_name,
+            retention_period_ns,
+        } = request.into_inner();
+
+        debug!(%namespace_name, ?retention_period_ns, "Updating namespace retention");
+
         let namespace = repos
             .namespaces()
-            .update_retention_period(&req.name, req.retention_period_ns)
+            .update_retention_period(&namespace_name, retention_period_ns)
             .await
             .map_err(|e| {
-                warn!(error=%e, %req.name, "failed to update namespace retention");
+                warn!(error=%e, %namespace_name, "failed to update namespace retention");
                 Status::not_found(e.to_string())
             })?;
+
+        info!(
+            namespace_name,
+            retention_period_ns,
+            namespace_id = %namespace.id,
+            "updated namespace retention"
+        );
+
         Ok(Response::new(UpdateNamespaceRetentionResponse {
             namespace: Some(namespace_to_proto(namespace)),
         }))

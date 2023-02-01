@@ -44,7 +44,7 @@
     missing_docs
 )]
 
-use data_types::ShardIndex;
+use data_types::TRANSITION_SHARD_INDEX;
 
 /// A macro to conditionally prepend `pub` to the inner tokens for benchmarking
 /// purposes, should the `benches` feature be enabled.
@@ -71,11 +71,6 @@ macro_rules! maybe_pub {
     };
 }
 
-/// During the testing of ingester2, the catalog will require a ShardIndex for
-/// various operations. This is a const value for these occasions. Look up the ShardId for this
-/// ShardIndex when needed.
-const TRANSITION_SHARD_INDEX: ShardIndex = ShardIndex::new(1);
-
 /// Ingester initialisation methods & types.
 ///
 /// This module defines the public API boundary of the Ingester crate.
@@ -95,16 +90,19 @@ pub use init::*;
 // through its public API only, and not by poking around at the internals.
 //
 
-mod arcmap;
 maybe_pub!(mod buffer_tree);
-mod deferred_load;
 maybe_pub!(mod dml_sink);
 maybe_pub!(mod persist);
+maybe_pub!(mod partition_iter);
+maybe_pub!(mod wal);
+mod arcmap;
+mod deferred_load;
+mod ingest_state;
+mod ingester_id;
 mod query;
 mod query_adaptor;
 pub(crate) mod server;
 mod timestamp_oracle;
-maybe_pub!(mod wal);
 
 #[cfg(test)]
 mod test_util;

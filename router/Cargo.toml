@@ -7,12 +7,12 @@ license.workspace = true
 
 [dependencies]
 async-trait = "0.1"
-bytes = "1.3"
+bytes = "1.4"
 client_util = { path = "../client_util" }
 data_types = { path = "../data_types" }
 dml = { path = "../dml" }
 flate2 = "1.0"
-futures = "0.3.25"
+futures = "0.3.26"
 generated_types = { path = "../generated_types" }
 hashbrown = { workspace = true }
 hyper = "0.14"
@@ -43,6 +43,8 @@ trace = { path = "../trace/" }
 workspace-hack = { path = "../workspace-hack"}
 write_buffer = { path = "../write_buffer" }
 write_summary = { path = "../write_summary" }
+tower = { version = "0.4.13", features = ["balance"] }
+crossbeam-utils = "0.8.14"
 
 [dev-dependencies]
 assert_matches = "1.5"

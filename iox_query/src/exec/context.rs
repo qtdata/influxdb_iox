@@ -2,6 +2,8 @@
 //! DataFusion
 
 use super::{
+    cross_rt_stream::CrossRtStream,
+    gapfill::{plan_gap_fill, GapFill},
     non_null_checker::NonNullCheckerNode,
     seriesset::{series::Either, SeriesSet},
     split::StreamSplitNode,
@@ -19,7 +21,7 @@ use crate::{
         split::StreamSplitExec,
         stringset::{IntoStringSet, StringSetRef},
     },
-    logical_optimizer::iox_optimizer,
+    logical_optimizer::register_iox_optimizers,
     plan::{
         fieldlist::FieldListPlan,
         seriesset::{SeriesSetPlan, SeriesSetPlans},
@@ -40,7 +42,9 @@ use datafusion::{
         coalesce_partitions::CoalescePartitionsExec,
         displayable,
         planner::{DefaultPhysicalPlanner, ExtensionPlanner},
-        EmptyRecordBatchStream, ExecutionPlan, PhysicalPlanner, SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter,
+        EmptyRecordBatchStream, ExecutionPlan, PhysicalPlanner, RecordBatchStream,
+        SendableRecordBatchStream,
     },
     prelude::*,
 };
@@ -139,6 +143,14 @@ impl ExtensionPlanner for IOxExtensionPlanner {
                 Arc::clone(&physical_inputs[0]),
                 split_exprs,
             )) as Arc<dyn ExecutionPlan>)
+        } else if let Some(gap_fill) = any.downcast_ref::<GapFill>() {
+            let gap_fill_exec = plan_gap_fill(
+                session_state.execution_props(),
+                gap_fill,
+                logical_inputs,
+                physical_inputs,
+            )?;
+            Some(Arc::new(gap_fill_exec) as Arc<dyn ExecutionPlan>)
         } else {
             None
         };
@@ -209,22 +221,26 @@ impl IOxSessionConfig {
 
     /// Create an ExecutionContext suitable for executing DataFusion plans
     pub fn build(self) -> IOxSessionContext {
-        let state = SessionState::with_config_rt(self.session_config, self.runtime)
-            .with_query_planner(Arc::new(IOxQueryPlanner {}));
+        let maybe_span = self.span_ctx.child_span("Query Execution");
+        let recorder = SpanRecorder::new(maybe_span);
 
-        let state = register_selector_aggregates(state);
-        let mut state = register_scalar_functions(state);
-        state.optimizer = iox_optimizer();
+        // attach span to DataFusion session
+        let session_config = self
+            .session_config
+            .with_extension(Arc::new(recorder.span().cloned()));
+
+        let state = SessionState::with_config_rt(session_config, self.runtime)
+            .with_query_planner(Arc::new(IOxQueryPlanner {}));
+        let state = register_iox_optimizers(state);
 
         let inner = SessionContext::with_state(state);
-
+        register_selector_aggregates(&inner);
+        register_scalar_functions(&inner);
         if let Some(default_catalog) = self.default_catalog {
             inner.register_catalog(DEFAULT_CATALOG, default_catalog);
         }
 
-        let maybe_span = self.span_ctx.child_span("Query Execution");
-
-        IOxSessionContext::new(inner, self.exec, SpanRecorder::new(maybe_span))
+        IOxSessionContext::new(inner, self.exec, recorder)
     }
 }
 
@@ -284,15 +300,6 @@ impl IOxSessionContext {
         exec: DedicatedExecutor,
         recorder: SpanRecorder,
     ) -> Self {
-        // attach span to DataFusion session
-        {
-            let mut state = inner.state.write();
-            state.config = state
-                .config
-                .clone()
-                .with_extension(Arc::new(recorder.span().cloned()));
-        }
-
         Self {
             inner,
             exec,
@@ -305,16 +312,30 @@ impl IOxSessionContext {
         &self.inner
     }
 
+    /// Plan a SQL statement. This assumes that any tables referenced
+    /// in the SQL have been registered with this context. Use
+    /// `prepare_sql` to actually execute the query.
+    pub async fn plan_sql(&self, sql: &str) -> Result<LogicalPlan> {
+        let ctx = self.child_ctx("plan_sql");
+        debug!(text=%sql, "planning SQL query");
+        // NOTE can not use ctx.inner.sql() here as it also interprets DDL
+        ctx.inner.state().create_logical_plan(sql).await
+    }
+
     /// Prepare a SQL statement for execution. This assumes that any
     /// tables referenced in the SQL have been registered with this context
     pub async fn prepare_sql(&self, sql: &str) -> Result<Arc<dyn ExecutionPlan>> {
-        let ctx = self.child_ctx("prepare_sql");
-        debug!(text=%sql, "planning SQL query");
-        let logical_plan = ctx.inner.create_logical_plan(sql)?;
-        debug!(plan=%logical_plan.display_graphviz(), "logical plan");
+        let logical_plan = self.plan_sql(sql).await?;
 
-        // Handle unsupported SQL
+        // Make nicer erorrs for unsupported SQL
+        // (By default datafusion returns Internal Error)
         match &logical_plan {
+            LogicalPlan::CreateCatalog(_) => {
+                return Err(Error::NotImplemented("CreateCatalog".to_string()));
+            }
+            LogicalPlan::CreateCatalogSchema(_) => {
+                return Err(Error::NotImplemented("CreateCatalogSchema".to_string()));
+            }
             LogicalPlan::CreateMemoryTable(_) => {
                 return Err(Error::NotImplemented("CreateMemoryTable".to_string()));
             }
@@ -330,6 +351,7 @@ impl IOxSessionContext {
             _ => (),
         }
 
+        let ctx = self.child_ctx("prepare_sql");
         ctx.create_physical_plan(&logical_plan).await
     }
 
@@ -337,7 +359,7 @@ impl IOxSessionContext {
     pub async fn create_physical_plan(&self, plan: &LogicalPlan) -> Result<Arc<dyn ExecutionPlan>> {
         let mut ctx = self.child_ctx("create_physical_plan");
         debug!(text=%plan.display_indent_schema(), "create_physical_plan: initial plan");
-        let physical_plan = ctx.inner.create_physical_plan(plan).await?;
+        let physical_plan = ctx.inner.state().create_physical_plan(plan).await?;
 
         ctx.recorder.event("physical plan");
         debug!(text=%displayable(physical_plan.as_ref()).indent(), "create_physical_plan: plan to run");
@@ -402,12 +424,20 @@ impl IOxSessionContext {
 
         let task_context = Arc::new(TaskContext::from(self.inner()));
 
-        self.run(async move {
-            let stream = physical_plan.execute(partition, task_context)?;
-            let stream = TracedStream::new(stream, span, physical_plan);
-            Ok(Box::pin(stream) as _)
-        })
-        .await
+        let stream = self
+            .run(async move {
+                let stream = physical_plan.execute(partition, task_context)?;
+                Ok(TracedStream::new(stream, span, physical_plan))
+            })
+            .await?;
+        // Wrap the resulting stream into `CrossRtStream`. This is required because polling the DataFusion result stream
+        // actually drives the (potentially CPU-bound) work. We need to make sure that this work stays within the
+        // dedicated executor because otherwise this may block the top-level tokio/tonic runtime which may lead to
+        // requests timetouts (either for new requests, metrics or even for HTTP2 pings on the active connection).
+        let schema = stream.schema();
+        let stream = CrossRtStream::new_with_arrow_error_stream(stream, self.exec.clone());
+        let stream = RecordBatchStreamAdapter::new(schema, stream);
+        Ok(Box::pin(stream))
     }
 
     /// Executes the SeriesSetPlans on the query executor, in
@@ -435,24 +465,31 @@ impl IOxSessionContext {
         let data = futures::stream::iter(plans)
             .then(move |plan| {
                 let ctx = ctx.child_ctx("for plan");
-                Self::run_inner(exec.clone(), async move {
-                    let SeriesSetPlan {
-                        table_name,
-                        plan,
-                        tag_columns,
-                        field_columns,
-                    } = plan;
+                let exec = exec.clone();
 
-                    let tag_columns = Arc::new(tag_columns);
+                async move {
+                    let stream = Self::run_inner(exec.clone(), async move {
+                        let SeriesSetPlan {
+                            table_name,
+                            plan,
+                            tag_columns,
+                            field_columns,
+                        } = plan;
 
-                    let physical_plan = ctx.create_physical_plan(&plan).await?;
+                        let tag_columns = Arc::new(tag_columns);
 
-                    let it = ctx.execute_stream(physical_plan).await?;
+                        let physical_plan = ctx.create_physical_plan(&plan).await?;
 
-                    SeriesSetConverter::default()
-                        .convert(table_name, tag_columns, field_columns, it)
-                        .await
-                })
+                        let it = ctx.execute_stream(physical_plan).await?;
+
+                        SeriesSetConverter::default()
+                            .convert(table_name, tag_columns, field_columns, it)
+                            .await
+                    })
+                    .await?;
+
+                    Ok::<_, Error>(CrossRtStream::new_with_df_error_stream(stream, exec))
+                }
             })
             .try_flatten()
             .try_filter_map(|series_set: SeriesSet| async move {
@@ -557,11 +594,6 @@ impl IOxSessionContext {
         }
     }
 
-    /// Run the plan and return a record batch reader for reading the results
-    pub async fn run_logical_plan(&self, plan: LogicalPlan) -> Result<Vec<RecordBatch>> {
-        self.run_logical_plans(vec![plan]).await
-    }
-
     /// plans and runs the plans in parallel and collects the results
     /// run each plan in parallel and collect the results
     async fn run_logical_plans(&self, plans: Vec<LogicalPlan>) -> Result<Vec<RecordBatch>> {
@@ -596,7 +628,7 @@ impl IOxSessionContext {
         Self::run_inner(self.exec.clone(), fut).await
     }
 
-    pub async fn run_inner<Fut, T>(exec: DedicatedExecutor, fut: Fut) -> Result<T>
+    async fn run_inner<Fut, T>(exec: DedicatedExecutor, fut: Fut) -> Result<T>
     where
         Fut: std::future::Future<Output = Result<T>> + Send + 'static,
         T: Send + 'static,
@@ -604,7 +636,7 @@ impl IOxSessionContext {
         exec.spawn(fut).await.unwrap_or_else(|e| {
             Err(Error::Context(
                 "Join Error".to_string(),
-                Box::new(Error::External(Box::new(e))),
+                Box::new(Error::External(e.into())),
             ))
         })
     }
@@ -650,13 +682,13 @@ pub trait SessionContextIOxExt {
 
 impl SessionContextIOxExt for SessionState {
     fn child_span(&self, name: &'static str) -> Option<Span> {
-        self.config
+        self.config()
             .get_extension::<Option<Span>>()
             .and_then(|span| span.as_ref().as_ref().map(|span| span.child(name)))
     }
 
     fn span_ctx(&self) -> Option<SpanContext> {
-        self.config
+        self.config()
             .get_extension::<Option<Span>>()
             .and_then(|span| span.as_ref().as_ref().map(|span| span.ctx.clone()))
     }

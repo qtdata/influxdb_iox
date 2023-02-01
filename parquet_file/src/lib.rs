@@ -20,9 +20,12 @@ pub mod metadata;
 pub mod serialize;
 pub mod storage;
 
-use data_types::{NamespaceId, ParquetFile, PartitionId, ShardId, TableId};
+use data_types::{NamespaceId, ParquetFile, ParquetFileParams, PartitionId, ShardId, TableId};
 use object_store::path::Path;
 use uuid::Uuid;
+
+// Ingester2 creates partitions in this shard.
+const TRANSITION_SHARD_ID: ShardId = ShardId::new(1234);
 
 /// Location of a Parquet file within a namespace's object store.
 /// The exact format is an implementation detail and is subject to change.
@@ -62,14 +65,35 @@ impl ParquetFilePath {
             partition_id,
             object_store_id,
         } = self;
+        if shard_id == &TRANSITION_SHARD_ID {
+            Path::from_iter([
+                namespace_id.to_string().as_str(),
+                table_id.to_string().as_str(),
+                partition_id.to_string().as_str(),
+                &format!("{}.parquet", object_store_id),
+            ])
+        } else {
+            Path::from_iter([
+                namespace_id.to_string().as_str(),
+                table_id.to_string().as_str(),
+                shard_id.to_string().as_str(),
+                partition_id.to_string().as_str(),
+                &format!("{}.parquet", object_store_id),
+            ])
+        }
+    }
 
-        Path::from_iter([
-            namespace_id.to_string().as_str(),
-            table_id.to_string().as_str(),
-            shard_id.to_string().as_str(),
-            partition_id.to_string().as_str(),
-            &format!("{}.parquet", object_store_id),
-        ])
+    /// Get object store ID.
+    pub fn objest_store_id(&self) -> Uuid {
+        self.object_store_id
+    }
+
+    /// Set new object store ID.
+    pub fn with_object_store_id(self, object_store_id: Uuid) -> Self {
+        Self {
+            object_store_id,
+            ..self
+        }
     }
 }
 
@@ -103,6 +127,18 @@ impl From<&ParquetFile> for ParquetFilePath {
     }
 }
 
+impl From<&ParquetFileParams> for ParquetFilePath {
+    fn from(f: &ParquetFileParams) -> Self {
+        Self {
+            namespace_id: f.namespace_id,
+            table_id: f.table_id,
+            shard_id: f.shard_id,
+            partition_id: f.partition_id,
+            object_store_id: f.object_store_id,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,6 +156,22 @@ mod tests {
         assert_eq!(
             path.to_string(),
             "1/2/3/4/00000000-0000-0000-0000-000000000000.parquet".to_string(),
+        );
+    }
+
+    #[test]
+    fn parquet_file_without_shard_id() {
+        let pfp = ParquetFilePath::new(
+            NamespaceId::new(1),
+            TableId::new(2),
+            TRANSITION_SHARD_ID,
+            PartitionId::new(4),
+            Uuid::nil(),
+        );
+        let path = pfp.object_store_path();
+        assert_eq!(
+            path.to_string(),
+            "1/2/4/00000000-0000-0000-0000-000000000000.parquet".to_string(),
         );
     }
 }

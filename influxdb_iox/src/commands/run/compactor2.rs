@@ -6,7 +6,6 @@ use object_store::DynObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
 use observability_deps::tracing::*;
 use parquet_file::storage::{ParquetStorage, StorageId};
-use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -16,9 +15,9 @@ use clap_blocks::{
 };
 use ioxd_common::server_type::{CommonServerState, CommonServerStateError};
 use ioxd_common::Service;
-use ioxd_compactor::create_compactor2_server_type;
+use ioxd_compactor2::create_compactor2_server_type;
 
-use crate::process_info::{setup_metric_registry, USIZE_MAX};
+use crate::process_info::setup_metric_registry;
 
 use super::main;
 
@@ -67,24 +66,6 @@ pub struct Config {
 
     #[clap(flatten)]
     pub(crate) compactor_config: Compactor2Config,
-
-    /// Number of threads to use for the compactor query execution, compaction and persistence.
-    #[clap(
-        long = "query-exec-thread-count",
-        env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
-        default_value = "4",
-        action
-    )]
-    pub query_exec_thread_count: usize,
-
-    /// Size of memory pool used during query exec, in bytes.
-    #[clap(
-        long = "exec-mem-pool-bytes",
-        env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
-        default_value = &USIZE_MAX[..],
-        action
-    )]
-    pub exec_mem_pool_bytes: usize,
 }
 
 pub async fn command(config: Config) -> Result<(), Error> {
@@ -114,16 +95,20 @@ pub async fn command(config: Config) -> Result<(), Error> {
         &metric_registry,
     ));
 
-    let parquet_store = ParquetStorage::new(object_store, StorageId::from("iox"));
+    let parquet_store_real = ParquetStorage::new(object_store, StorageId::from("iox"));
+    let parquet_store_scratchpad = ParquetStorage::new(
+        Arc::new(object_store::memory::InMemory::new()),
+        StorageId::from("iox_scratchpad"),
+    );
 
     let exec = Arc::new(Executor::new_with_config(ExecutorConfig {
-        num_threads: config.query_exec_thread_count,
-        target_query_partitions: config.query_exec_thread_count,
-        object_stores: HashMap::from([(
-            parquet_store.id(),
-            Arc::clone(parquet_store.object_store()),
-        )]),
-        mem_pool_size: config.exec_mem_pool_bytes,
+        num_threads: config.compactor_config.query_exec_thread_count,
+        target_query_partitions: config.compactor_config.query_exec_thread_count,
+        object_stores: [&parquet_store_real, &parquet_store_scratchpad]
+            .into_iter()
+            .map(|store| (store.id(), Arc::clone(store.object_store())))
+            .collect(),
+        mem_pool_size: config.compactor_config.exec_mem_pool_bytes,
     }));
     let time_provider = Arc::new(SystemProvider::new());
 
@@ -131,12 +116,13 @@ pub async fn command(config: Config) -> Result<(), Error> {
         &common_state,
         Arc::clone(&metric_registry),
         catalog,
-        parquet_store,
+        parquet_store_real,
+        parquet_store_scratchpad,
         exec,
         time_provider,
         config.compactor_config,
     )
-    .await?;
+    .await;
 
     info!("starting compactor");
 

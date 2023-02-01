@@ -85,7 +85,7 @@ pub enum Error {
     /// name into a [`NamespaceId`].
     ///
     /// [`NamespaceId`]: data_types::NamespaceId
-    #[error("failed to resolve namespace ID: {0}")]
+    #[error(transparent)]
     NamespaceResolver(#[from] crate::namespace_resolver::Error),
 
     /// The router is currently servicing the maximum permitted number of
@@ -153,6 +153,9 @@ impl From<&DmlError> for StatusCode {
             DmlError::RpcWrite(RpcWriteError::Upstream(_)) => StatusCode::INTERNAL_SERVER_ERROR,
             DmlError::RpcWrite(RpcWriteError::DeletesUnsupported) => StatusCode::NOT_IMPLEMENTED,
             DmlError::RpcWrite(RpcWriteError::Timeout(_)) => StatusCode::GATEWAY_TIMEOUT,
+            DmlError::RpcWrite(
+                RpcWriteError::NoUpstreams | RpcWriteError::UpstreamNotConnected(_),
+            ) => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 }
@@ -558,7 +561,7 @@ mod tests {
     use super::*;
     use crate::{
         dml_handlers::mock::{MockDmlHandler, MockDmlHandlerCall},
-        namespace_resolver::mock::MockNamespaceResolver,
+        namespace_resolver::{mock::MockNamespaceResolver, NamespaceCreationError},
     };
     use assert_matches::assert_matches;
     use data_types::{NamespaceId, NamespaceNameError};
@@ -1510,8 +1513,14 @@ mod tests {
                 crate::namespace_resolver::Error::Lookup(e)
             }),
             "failed to resolve namespace ID: \
-             failed to resolve namespace ID: \
              name [name] already exists",
+        ),
+
+        (
+            NamespaceResolver(
+                crate::namespace_resolver::Error::Create(NamespaceCreationError::Reject("bananas".to_string()))
+            ),
+            "rejecting write due to non-existing namespace: bananas",
         ),
 
         (

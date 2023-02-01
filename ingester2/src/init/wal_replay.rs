@@ -9,8 +9,8 @@ use wal::{SequencedWalOp, Wal};
 
 use crate::{
     dml_sink::{DmlError, DmlSink},
+    partition_iter::PartitionIter,
     persist::{drain_buffer::persist_partitions, queue::PersistQueue},
-    wal::rotate_task::PartitionIter,
     TRANSITION_SHARD_INDEX,
 };
 
@@ -130,7 +130,7 @@ where
         );
 
         // Persist all the data that was replayed from the WAL segment.
-        persist_partitions(sink.partition_iter(), persist.clone()).await;
+        persist_partitions(sink.partition_iter(), &persist).await;
 
         // Drop the newly persisted data - it should not be replayed.
         wal.delete(file.id())

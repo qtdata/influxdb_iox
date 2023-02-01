@@ -7,6 +7,13 @@ use iox_catalog::interface::Catalog;
 use ioxd_common::{
     add_service,
     http::error::{HttpApiError, HttpApiErrorSource},
+    reexport::{
+        generated_types::influxdata::iox::{
+            catalog::v1::catalog_service_server, namespace::v1::namespace_service_server,
+            object_store::v1::object_store_service_server, schema::v1::schema_service_server,
+        },
+        tonic::transport::Endpoint,
+    },
     rpc::RpcBuilderInput,
     serve_builder,
     server_type::{CommonServerState, RpcError, ServerType},
@@ -18,7 +25,7 @@ use object_store::DynObjectStore;
 use observability_deps::tracing::info;
 use router::{
     dml_handlers::{
-        write_service_client, DmlHandler, DmlHandlerChainExt, FanOutAdaptor,
+        lazy_connector::LazyConnector, DmlHandler, DmlHandlerChainExt, FanOutAdaptor,
         InstrumentationDecorator, Partitioner, RetentionValidator, RpcWrite, SchemaValidator,
         ShardedWriteBuffer, WriteSummaryAdapter,
     },
@@ -35,7 +42,7 @@ use router::{
     },
     shard::Shard,
 };
-use sharder::{JumpHash, RoundRobin, Sharder};
+use sharder::{JumpHash, Sharder};
 use std::{
     collections::BTreeSet,
     fmt::{Debug, Display},
@@ -142,7 +149,8 @@ where
         self.shutdown.cancelled().await;
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self, frontend: CancellationToken) {
+        frontend.cancel();
         self.shutdown.cancel();
     }
 }
@@ -205,9 +213,26 @@ where
     /// [`RpcWriteGrpcDelegate`]: router::server::grpc::RpcWriteGrpcDelegate
     async fn server_grpc(self: Arc<Self>, builder_input: RpcBuilderInput) -> Result<(), RpcError> {
         let builder = setup_builder!(builder_input, self);
-        add_service!(builder, self.server.grpc().schema_service());
-        add_service!(builder, self.server.grpc().catalog_service());
-        add_service!(builder, self.server.grpc().object_store_service());
+        add_service!(
+            builder,
+            schema_service_server::SchemaServiceServer::new(self.server.grpc().schema_service())
+        );
+        add_service!(
+            builder,
+            catalog_service_server::CatalogServiceServer::new(self.server.grpc().catalog_service())
+        );
+        add_service!(
+            builder,
+            object_store_service_server::ObjectStoreServiceServer::new(
+                self.server.grpc().object_store_service()
+            )
+        );
+        add_service!(
+            builder,
+            namespace_service_server::NamespaceServiceServer::new(
+                self.server.grpc().namespace_service()
+            )
+        );
         serve_builder!(builder);
 
         Ok(())
@@ -217,7 +242,8 @@ where
         self.shutdown.cancelled().await;
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self, frontend: CancellationToken) {
+        frontend.cancel();
         self.shutdown.cancel();
     }
 }
@@ -258,15 +284,18 @@ pub async fn create_router2_server_type(
 
     // Hack to handle multiple ingester addresses separated by commas in potentially many uses of
     // the CLI arg
-    let ingester_addresses = router_config.ingester_addresses.join(",");
-    let ingester_addresses_list: Vec<_> = ingester_addresses.split(',').collect();
-    let mut ingester_clients = Vec::with_capacity(ingester_addresses_list.len());
-    for ingester_addr in ingester_addresses_list {
-        ingester_clients.push(write_service_client(ingester_addr).await);
-    }
+    let ingester_connections = router_config.ingester_addresses.join(",");
+    let ingester_connections = ingester_connections.split(',').map(|addr| {
+        let endpoint = Endpoint::from_shared(format!("http://{addr}"))
+            .expect("invalid ingester connection address");
+        (
+            LazyConnector::new(endpoint, router_config.rpc_write_timeout_seconds),
+            addr,
+        )
+    });
 
     // Initialise the DML handler that sends writes to the ingester using the RPC write path.
-    let rpc_writer = RpcWrite::new(RoundRobin::new(ingester_clients));
+    let rpc_writer = RpcWrite::new(ingester_connections, &metrics);
     let rpc_writer = InstrumentationDecorator::new("rpc_writer", &metrics, rpc_writer);
     // 1. END
 
@@ -311,7 +340,9 @@ pub async fn create_router2_server_type(
     // Add a write partitioner into the handler stack that splits by the date
     // portion of the write's timestamp.
     let partitioner = Partitioner::new(PartitionTemplate {
-        parts: vec![TemplatePart::TimeFormat("%Y-%m-%d".to_owned())],
+        parts: vec![TemplatePart::TimeFormat(
+            router_config.partition_key_pattern.clone(),
+        )],
     });
     let partitioner = InstrumentationDecorator::new("partitioner", &metrics, partitioner);
 
@@ -416,7 +447,7 @@ pub async fn create_router2_server_type(
     // 5. START: Initialize the gRPC API delegate that creates the services relevant to the RPC
     //    write router path and use it to create the relevant `RpcWriteRouterServer` and
     //    `RpcWriteRouterServerType`.
-    let grpc = RpcWriteGrpcDelegate::new(catalog, object_store);
+    let grpc = RpcWriteGrpcDelegate::new(catalog, object_store, topic_id, query_id);
 
     let router_server =
         RpcWriteRouterServer::new(http, grpc, metrics, common_state.trace_collector());

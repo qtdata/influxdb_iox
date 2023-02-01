@@ -2,20 +2,28 @@ crate::maybe_pub!(
     pub use super::wal_replay::*;
 );
 
+mod graceful_shutdown;
 mod wal_replay;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use backoff::BackoffConfig;
+use futures::{future::Shared, Future, FutureExt};
 use generated_types::influxdata::iox::{
     catalog::v1::catalog_service_server::{CatalogService, CatalogServiceServer},
-    ingester::v1::write_service_server::{WriteService, WriteServiceServer},
+    ingester::v1::{
+        persist_service_server::{PersistService, PersistServiceServer},
+        write_service_server::{WriteService, WriteServiceServer},
+    },
 };
 use iox_catalog::interface::Catalog;
 use iox_query::exec::Executor;
+use observability_deps::tracing::*;
 use parquet_file::storage::ParquetStorage;
 use thiserror::Error;
+use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 use wal::Wal;
 
 use crate::{
@@ -25,12 +33,21 @@ use crate::{
         table::name_resolver::{TableNameProvider, TableNameResolver},
         BufferTree,
     },
-    persist::{handle::PersistHandle, hot_partitions::HotPartitionPersister},
+    dml_sink::{instrumentation::DmlSinkInstrumentation, tracing::DmlSinkTracing},
+    ingest_state::IngestState,
+    ingester_id::IngesterId,
+    persist::{
+        completion_observer::NopObserver, handle::PersistHandle,
+        hot_partitions::HotPartitionPersister,
+    },
+    query::{instrumentation::QueryExecInstrumentation, tracing::QueryExecTracing},
     server::grpc::GrpcDelegate,
     timestamp_oracle::TimestampOracle,
     wal::{rotate_task::periodic_rotation, wal_sink::WalSink},
     TRANSITION_SHARD_INDEX,
 };
+
+use self::graceful_shutdown::graceful_shutdown_handler;
 
 /// Acquire opaque handles to the Ingester RPC service implementations.
 ///
@@ -46,6 +63,8 @@ pub trait IngesterRpcInterface: Send + Sync + std::fmt::Debug {
     type CatalogHandler: CatalogService;
     /// The type of the [`WriteService`] implementation.
     type WriteHandler: WriteService;
+    /// The type of the [`PersistService`] implementation.
+    type PersistHandler: PersistService;
     /// The type of the [`FlightService`] implementation.
     type FlightHandler: FlightService;
 
@@ -56,6 +75,10 @@ pub trait IngesterRpcInterface: Send + Sync + std::fmt::Debug {
     /// Acquire an opaque handle to the Ingester's [`WriteService`] RPC
     /// handler implementation.
     fn write_service(&self) -> WriteServiceServer<Self::WriteHandler>;
+
+    /// Acquire an opaque handle to the Ingester's [`PersistService`] RPC
+    /// handler implementation.
+    fn persist_service(&self) -> PersistServiceServer<Self::PersistHandler>;
 
     /// Acquire an opaque handle to the Ingester's Arrow Flight
     /// [`FlightService`] RPC handler implementation, allowing at most
@@ -76,18 +99,34 @@ pub struct IngesterGuard<T> {
     ///
     /// Aborted on drop.
     rotation_task: tokio::task::JoinHandle<()>,
+
+    /// The task handle executing the graceful shutdown once triggered.
+    graceful_shutdown_handler: tokio::task::JoinHandle<()>,
+    shutdown_complete: Shared<oneshot::Receiver<()>>,
 }
 
-impl<T> IngesterGuard<T> {
+impl<T> IngesterGuard<T>
+where
+    T: Send + Sync,
+{
     /// Obtain a handle to the gRPC handlers.
     pub fn rpc(&self) -> &T {
         &self.rpc
+    }
+
+    /// Block and wait until the ingester has gracefully stopped.
+    pub async fn join(&self) {
+        self.shutdown_complete
+            .clone()
+            .await
+            .expect("graceful shutdown task panicked")
     }
 }
 
 impl<T> Drop for IngesterGuard<T> {
     fn drop(&mut self) {
         self.rotation_task.abort();
+        self.graceful_shutdown_handler.abort();
     }
 }
 
@@ -147,8 +186,21 @@ pub enum InitError {
 /// value should be tuned to be slightly less than the interval between persist
 /// operations, but not so long that it causes catalog load spikes at persist
 /// time (which can be observed by the catalog instrumentation metrics).
+///
+/// ## Graceful Shutdown
+///
+/// When `shutdown` completes, the ingester blocks ingest (returning an error to
+/// all new write requests) while still executing query requests. The ingester
+/// then persists all data currently buffered.
+///
+/// Callers can wait for this buffer persist to complete by awaiting
+/// [`IngesterGuard::join()`], which will resolve once all data has been flushed
+/// to object storage.
+///
+/// The ingester will continue answering queries until the gRPC server is
+/// stopped by the caller (managed outside of this crate).
 #[allow(clippy::too_many_arguments)]
-pub async fn new(
+pub async fn new<F>(
     catalog: Arc<dyn Catalog>,
     metrics: Arc<metric::Registry>,
     persist_background_fetch_time: Duration,
@@ -159,7 +211,11 @@ pub async fn new(
     persist_queue_depth: usize,
     persist_hot_partition_cost: usize,
     object_store: ParquetStorage,
-) -> Result<IngesterGuard<impl IngesterRpcInterface>, InitError> {
+    shutdown: F,
+) -> Result<IngesterGuard<impl IngesterRpcInterface>, InitError>
+where
+    F: Future<Output = CancellationToken> + Send + 'static,
+{
     // Create the transition shard.
     let mut txn = catalog
         .start_transaction()
@@ -176,6 +232,9 @@ pub async fn new(
         .await
         .expect("create transition shard");
     txn.commit().await.expect("commit transition shard");
+
+    // Initialise a random ID for this ingester instance.
+    let ingester_id = IngesterId::new();
 
     // Initialise the deferred namespace name resolver.
     let namespace_name_provider: Arc<dyn NamespaceNameProvider> =
@@ -217,14 +276,21 @@ pub async fn new(
     );
     let partition_provider: Arc<dyn PartitionProvider> = Arc::new(partition_provider);
 
+    // Initialise the ingest pause signal, used to propagate error conditions
+    // between subsystems such that they cause an error to be returned in the
+    // write path.
+    let ingest_state = Arc::new(IngestState::default());
+
     // Spawn the persist workers to compact partition data, convert it into
     // Parquet files, and upload them to object storage.
-    let (persist_handle, persist_state) = PersistHandle::new(
+    let persist_handle = PersistHandle::new(
         persist_workers,
         persist_queue_depth,
+        Arc::clone(&ingest_state),
         persist_executor,
         object_store,
         Arc::clone(&catalog),
+        NopObserver::default(),
         &metrics,
     );
     let persist_handle = Arc::new(persist_handle);
@@ -259,14 +325,38 @@ pub async fn new(
         .map_err(|e| InitError::WalReplay(e.into()))?;
 
     // Build the chain of DmlSink that forms the write path.
-    let write_path = WalSink::new(Arc::clone(&buffer), Arc::clone(&wal));
+    let write_path = DmlSinkInstrumentation::new(
+        "write_apply",
+        DmlSinkTracing::new(
+            DmlSinkTracing::new(
+                WalSink::new(
+                    DmlSinkInstrumentation::new(
+                        "buffer",
+                        DmlSinkTracing::new(Arc::clone(&buffer), "buffer"),
+                        &metrics,
+                    ),
+                    Arc::clone(&wal),
+                ),
+                "wal",
+            ),
+            "write_apply",
+        ),
+        &metrics,
+    );
+
+    // And the chain of QueryExec that forms the read path.
+    let read_path = QueryExecInstrumentation::new(
+        "buffer",
+        QueryExecTracing::new(Arc::clone(&buffer), "buffer"),
+        &metrics,
+    );
 
     // Spawn a background thread to periodically rotate the WAL segment file.
-    let handle = tokio::spawn(periodic_rotation(
-        wal,
+    let rotation_task = tokio::spawn(periodic_rotation(
+        Arc::clone(&wal),
         wal_rotation_period,
         Arc::clone(&buffer),
-        persist_handle,
+        Arc::clone(&persist_handle),
     ));
 
     // Restore the highest sequence number from the WAL files, and default to 0
@@ -281,15 +371,30 @@ pub async fn new(
             .unwrap_or(0),
     ));
 
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let shutdown_task = tokio::spawn(graceful_shutdown_handler(
+        shutdown,
+        shutdown_tx,
+        Arc::clone(&ingest_state),
+        Arc::clone(&buffer),
+        Arc::clone(&persist_handle),
+        wal,
+    ));
+
     Ok(IngesterGuard {
         rpc: GrpcDelegate::new(
             Arc::new(write_path),
-            buffer,
+            Arc::new(read_path),
             timestamp,
-            persist_state,
+            ingest_state,
+            ingester_id,
             catalog,
             metrics,
+            buffer,
+            persist_handle,
         ),
-        rotation_task: handle,
+        rotation_task,
+        graceful_shutdown_handler: shutdown_task,
+        shutdown_complete: shutdown_rx.shared(),
     })
 }

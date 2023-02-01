@@ -31,8 +31,8 @@ impl QueryNamespaceMeta for QuerierNamespace {
         names
     }
 
-    fn table_schema(&self, table_name: &str) -> Option<Arc<Schema>> {
-        self.tables.get(table_name).map(|t| Arc::clone(t.schema()))
+    fn table_schema(&self, table_name: &str) -> Option<Schema> {
+        self.tables.get(table_name).map(|t| t.schema().clone())
     }
 }
 
@@ -163,6 +163,7 @@ struct UserSchemaProvider {
     tables: Arc<HashMap<Arc<str>, Arc<QuerierTable>>>,
 }
 
+#[async_trait]
 impl SchemaProvider for UserSchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self as &dyn Any
@@ -174,7 +175,7 @@ impl SchemaProvider for UserSchemaProvider {
         names
     }
 
-    fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         self.tables.get(name).map(|t| Arc::clone(t) as _)
     }
 
@@ -517,10 +518,10 @@ mod tests {
                 "|               |   CoalescePartitionsExec                                                                                                                           |",
                 "|               |     ProjectionExec: expr=[host@0 as host, perc@1 as perc, time@2 as time]                                                                          |",
                 "|               |       UnionExec                                                                                                                                    |",
-                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                                                                |",
+                "|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                |",
                 "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
                 "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
-                "|               |         CoalesceBatchesExec: target_batch_size=4096                                                                                                |",
+                "|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                |",
                 "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
                 "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
                 "|               |                                                                                                                                                    |",

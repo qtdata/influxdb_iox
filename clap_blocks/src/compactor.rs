@@ -202,6 +202,17 @@ macro_rules! gen_compactor_config {
             )]
             pub minutes_without_new_writes_to_be_cold: u64,
 
+            /// When select cold partition candidates, partitions with new created files (any level) after 
+            /// this threshold will be considered a candidate. However, only partitions without new writes
+            /// after this minutes_without_new_writes_to_be_cold will get compacted
+            #[clap(
+                long = "compaction-cold-partition_candidate-hours-threshold",
+                env = "INFLUXDB_IOX_COMPACTION_COLD_PARTITION_CANDIDATES_HOURS_THRESHOLD",
+                default_value = "24",
+                action
+            )]
+            pub cold_partition_candidates_hours_threshold: u64,
+
             /// When querying for partitions with data for hot compaction, how many hours to look
             /// back for a first pass.
             #[clap(
@@ -233,6 +244,17 @@ macro_rules! gen_compactor_config {
                 action
             )]
             pub max_parallel_partitions: u64,
+
+            /// When select warm partition candidates, partitions with new created files (any level) after 
+            /// this threshold will be considered a candidate. However, only partitions with many contiguous small
+            /// L1 files will get warm compacted
+            #[clap(
+                long = "compaction-warm-partition_candidate-hours-threshold",
+                env = "INFLUXDB_IOX_COMPACTION_WARM_PARTITION_CANDIDATES_HOURS_THRESHOLD",
+                default_value = "24",
+                action
+            )]
+            pub warm_partition_candidates_hours_threshold: u64,
 
             /// When querying for partitions suitable for warm compaction, this is the
             /// upper bound on file size to be counted as "small".
@@ -285,9 +307,11 @@ impl CompactorOnceConfig {
             max_num_compacting_files: self.max_num_compacting_files,
             max_num_compacting_files_first_in_partition: self.max_num_compacting_files_first_in_partition,
             minutes_without_new_writes_to_be_cold: self.minutes_without_new_writes_to_be_cold,
+            cold_partition_candidates_hours_threshold: self.cold_partition_candidates_hours_threshold,
             hot_compaction_hours_threshold_1: self.hot_compaction_hours_threshold_1,
             hot_compaction_hours_threshold_2: self.hot_compaction_hours_threshold_2,
             max_parallel_partitions: self.max_parallel_partitions,
+            warm_partition_candidates_hours_threshold: self.warm_partition_candidates_hours_threshold,
             warm_compaction_small_size_threshold_bytes: self.warm_compaction_small_size_threshold_bytes,
             warm_compaction_min_small_file_count: self.warm_compaction_min_small_file_count,
         }

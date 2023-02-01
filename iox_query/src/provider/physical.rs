@@ -119,7 +119,7 @@ fn combine_sort_key(
 /// pushdown ([`RecordBatchesExec`] has NO builtin filter function). Delete predicates are NOT applied at all. The
 /// caller is responsible for wrapping the output node into appropriate filter nodes.
 pub fn chunks_to_physical_nodes(
-    iox_schema: Arc<Schema>,
+    iox_schema: &Schema,
     output_sort_key: Option<&SortKey>,
     chunks: Vec<Arc<dyn QueryChunk>>,
     predicate: Predicate,
@@ -197,8 +197,8 @@ pub fn chunks_to_physical_nodes(
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            config_options: context.session_config().config_options(),
             output_ordering,
+            infinite_source: false,
         };
         let meta_size_hint = None;
         let parquet_exec = ParquetExec::new(base_config, predicate.filter_expr(), meta_size_hint);

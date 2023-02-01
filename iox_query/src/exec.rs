@@ -4,6 +4,7 @@
 pub(crate) mod context;
 pub mod field;
 pub mod fieldlist;
+pub(crate) mod gapfill;
 mod non_null_checker;
 mod query_tracing;
 mod schema_pivot;
@@ -14,6 +15,7 @@ use executor::DedicatedExecutor;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
 use trace::span::{SpanExt, SpanRecorder};
+mod cross_rt_stream;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -65,8 +67,8 @@ pub struct DedicatedExecutors {
 
 impl DedicatedExecutors {
     pub fn new(num_threads: usize) -> Self {
-        let query_exec = DedicatedExecutor::new("IOx Query Executor Thread", num_threads);
-        let reorg_exec = DedicatedExecutor::new("IOx Reorg Executor Thread", num_threads);
+        let query_exec = DedicatedExecutor::new("IOx Query", num_threads);
+        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads);
 
         Self {
             query_exec,
@@ -203,7 +205,7 @@ impl Executor {
     }
 
     /// Return the execution pool  of the specified type
-    fn executor(&self, executor_type: ExecutorType) -> &DedicatedExecutor {
+    pub fn executor(&self, executor_type: ExecutorType) -> &DedicatedExecutor {
         match executor_type {
             ExecutorType::Query => &self.executors.query_exec,
             ExecutorType::Reorg => &self.executors.reorg_exec,

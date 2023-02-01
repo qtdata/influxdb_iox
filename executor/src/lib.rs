@@ -16,13 +16,20 @@
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use pin_project::{pin_project, pinned_drop};
-use std::{pin::Pin, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tokio::sync::oneshot::{error::RecvError, Receiver};
 use tokio_util::sync::CancellationToken;
 
 use futures::{
     future::{BoxFuture, Shared},
-    Future, FutureExt, TryFutureExt,
+    ready, Future, FutureExt, TryFutureExt,
 };
 
 use observability_deps::tracing::warn;
@@ -51,7 +58,7 @@ impl Task {
 }
 
 /// The type of error that is returned from tasks in this module
-pub type Error = tokio::sync::oneshot::error::RecvError;
+pub type Error = String;
 
 /// Job within the executor.
 ///
@@ -62,7 +69,7 @@ pub struct Job<T> {
     cancel: CancellationToken,
     detached: bool,
     #[pin]
-    rx: Receiver<T>,
+    rx: Receiver<Result<T, String>>,
 }
 
 impl<T> Job<T> {
@@ -83,7 +90,12 @@ impl<T> Future for Job<T> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
         let this = self.project();
-        this.rx.poll(cx)
+        match ready!(this.rx.poll(cx)) {
+            Ok(res) => std::task::Poll::Ready(res),
+            Err(_) => std::task::Poll::Ready(Err(String::from(
+                "Worker thread gone, executor was likely shut down",
+            ))),
+        }
     }
 }
 
@@ -101,6 +113,9 @@ impl<T> PinnedDrop for Job<T> {
 #[derive(Clone)]
 pub struct DedicatedExecutor {
     state: Arc<Mutex<State>>,
+
+    /// Number of threads
+    num_threads: usize,
 
     /// Used for testing.
     ///
@@ -183,42 +198,52 @@ impl DedicatedExecutor {
 
     fn new_inner(thread_name: &str, num_threads: usize, testing: bool) -> Self {
         let thread_name = thread_name.to_string();
+        let thread_counter = Arc::new(AtomicUsize::new(1));
 
         let (tx_tasks, rx_tasks) = std::sync::mpsc::channel::<Task>();
         let (tx_shutdown, rx_shutdown) = tokio::sync::oneshot::channel();
 
-        let thread = std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .thread_name(&thread_name)
-                .worker_threads(num_threads)
-                .on_thread_start(move || set_current_thread_priority(WORKER_PRIORITY))
-                .build()
-                .expect("Creating tokio runtime");
+        let thread = std::thread::Builder::new()
+            .name(format!("{thread_name} driver"))
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .enable_all()
+                    .thread_name_fn(move || {
+                        format!(
+                            "{} {}",
+                            thread_name,
+                            thread_counter.fetch_add(1, Ordering::SeqCst)
+                        )
+                    })
+                    .worker_threads(num_threads)
+                    .on_thread_start(move || set_current_thread_priority(WORKER_PRIORITY))
+                    .build()
+                    .expect("Creating tokio runtime");
 
-            runtime.block_on(async move {
-                // Dropping the tokio runtime only waits for tasks to yield not to complete
-                //
-                // We therefore use a RwLock to wait for tasks to complete
-                let join = Arc::new(tokio::sync::RwLock::new(()));
+                runtime.block_on(async move {
+                    // Dropping the tokio runtime only waits for tasks to yield not to complete
+                    //
+                    // We therefore use a RwLock to wait for tasks to complete
+                    let join = Arc::new(tokio::sync::RwLock::new(()));
 
-                while let Ok(task) = rx_tasks.recv() {
-                    let join = Arc::clone(&join);
-                    let handle = join.read_owned().await;
+                    while let Ok(task) = rx_tasks.recv() {
+                        let join = Arc::clone(&join);
+                        let handle = join.read_owned().await;
 
-                    tokio::task::spawn(async move {
-                        task.run().await;
-                        std::mem::drop(handle);
-                    });
-                }
+                        tokio::task::spawn(async move {
+                            task.run().await;
+                            std::mem::drop(handle);
+                        });
+                    }
 
-                // Wait for all tasks to finish
-                let _guard = join.write().await;
+                    // Wait for all tasks to finish
+                    let _guard = join.write().await;
 
-                // signal shutdown, but it's OK if the other side is gone
-                tx_shutdown.send(()).ok();
+                    // signal shutdown, but it's OK if the other side is gone
+                    tx_shutdown.send(()).ok();
+                })
             })
-        });
+            .expect("executor setup");
 
         let state = State {
             requests: Some(tx_tasks),
@@ -229,6 +254,7 @@ impl DedicatedExecutor {
 
         Self {
             state: Arc::new(Mutex::new(state)),
+            num_threads,
             testing,
         }
     }
@@ -238,6 +264,11 @@ impl DedicatedExecutor {
     /// Internal state may be shared with other tests.
     pub fn new_testing() -> Self {
         TESTING_EXECUTOR.clone()
+    }
+
+    /// Number of threads that back this executor.
+    pub fn num_threads(&self) -> usize {
+        self.num_threads
     }
 
     /// Runs the specified Future (and any tasks it spawns) on the
@@ -253,7 +284,16 @@ impl DedicatedExecutor {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
         let fut = Box::pin(async move {
-            let task_output = task.await;
+            let task_output = AssertUnwindSafe(task).catch_unwind().await.map_err(|e| {
+                if let Some(s) = e.downcast_ref::<String>() {
+                    s.clone()
+                } else if let Some(s) = e.downcast_ref::<&str>() {
+                    s.to_string()
+                } else {
+                    "unknown internal error".to_string()
+                }
+            });
+
             if tx.send(task_output).is_err() {
                 warn!("Spawned task output ignored: receiver dropped")
             }
@@ -347,6 +387,7 @@ fn set_current_thread_priority(prio: i32) {
 mod tests {
     use super::*;
     use std::{
+        panic::panic_any,
         sync::{Arc, Barrier},
         time::Duration,
     };
@@ -466,10 +507,15 @@ mod tests {
         let dedicated_task = exec.spawn(async move {
             // spawn separate tasks
             let t1 = tokio::task::spawn(async {
-                assert_eq!(
-                    std::thread::current().name(),
-                    Some("Test DedicatedExecutor")
+                let thread = std::thread::current();
+                let tname = thread.name().expect("thread is named");
+
+                assert!(
+                    tname.starts_with("Test DedicatedExecutor"),
+                    "Invalid thread name: {}",
+                    tname,
                 );
+
                 25usize
             });
             t1.await.unwrap()
@@ -482,7 +528,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn panic_on_executor() {
+    async fn panic_on_executor_str() {
         let exec = DedicatedExecutor::new("Test DedicatedExecutor", 1);
         let dedicated_task = exec.spawn(async move {
             if true {
@@ -493,7 +539,47 @@ mod tests {
         });
 
         // should not be able to get the result
-        dedicated_task.await.unwrap_err();
+        let err = dedicated_task.await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "At the disco, on the dedicated task scheduler",
+        );
+
+        exec.join().await;
+    }
+
+    #[tokio::test]
+    async fn panic_on_executor_string() {
+        let exec = DedicatedExecutor::new("Test DedicatedExecutor", 1);
+        let dedicated_task = exec.spawn(async move {
+            if true {
+                panic!("{} {}", 1, 2);
+            } else {
+                42
+            }
+        });
+
+        // should not be able to get the result
+        let err = dedicated_task.await.unwrap_err();
+        assert_eq!(err.to_string(), "1 2",);
+
+        exec.join().await;
+    }
+
+    #[tokio::test]
+    async fn panic_on_executor_other() {
+        let exec = DedicatedExecutor::new("Test DedicatedExecutor", 1);
+        let dedicated_task = exec.spawn(async move {
+            if true {
+                panic_any(1)
+            } else {
+                42
+            }
+        });
+
+        // should not be able to get the result
+        let err = dedicated_task.await.unwrap_err();
+        assert_eq!(err.to_string(), "unknown internal error",);
 
         exec.join().await;
     }
@@ -528,7 +614,11 @@ mod tests {
         let dedicated_task = exec.spawn(async { 11 });
 
         // task should complete, but return an error
-        dedicated_task.await.unwrap_err();
+        let err = dedicated_task.await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Worker thread gone, executor was likely shut down"
+        );
 
         exec.join().await;
     }
@@ -544,7 +634,11 @@ mod tests {
         let dedicated_task = exec.spawn(async { 11 });
 
         // task should complete, but return an error
-        dedicated_task.await.unwrap_err();
+        let err = dedicated_task.await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Worker thread gone, executor was likely shut down"
+        );
 
         exec.join().await;
     }

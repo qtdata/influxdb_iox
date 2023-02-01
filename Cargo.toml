@@ -7,11 +7,14 @@ members = [
     "clap_blocks",
     "client_util",
     "compactor",
+    "compactor2",
     "data_types",
     "datafusion_util",
     "dml",
     "executor",
+    "flightsql",
     "generated_types",
+    "garbage_collector",
     "grpc-binary-logger-proto",
     "grpc-binary-logger-test-proto",
     "grpc-binary-logger",
@@ -26,15 +29,14 @@ members = [
     "influxrpc_parser",
     "ingester",
     "ingester2",
-    "iox_arrow_flight",
     "iox_catalog",
     "iox_data_generator",
-    "garbage_collector",
     "iox_query",
     "iox_tests",
     "iox_time",
     "ioxd_common",
     "ioxd_compactor",
+    "ioxd_compactor2",
     "ioxd_ingester",
     "ioxd_ingester2",
     "ioxd_garbage_collector",
@@ -113,12 +115,12 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "29.0.0" }
-arrow-flight = { version = "29.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="891a800ebb170fed018e53846eb569f3e0638857", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="891a800ebb170fed018e53846eb569f3e0638857" }
-hashbrown = { version = "0.13.1" }
-parquet = { version = "29.0.0" }
+arrow = { version = "31.0.0" }
+arrow-flight = { version = "31.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="9c8bdfed1a51fd17e28dc1d7eb494844551a204b", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="9c8bdfed1a51fd17e28dc1d7eb494844551a204b" }
+hashbrown = { version = "0.13.2" }
+parquet = { version = "31.0.0" }
 
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.
@@ -144,8 +146,3 @@ opt-level = 3
 
 [profile.dev.package.similar]
 opt-level = 3
-
-[patch.crates-io]
-# remove and bump object_store dep version once this revision is released.
-# patch for https://github.com/influxdata/idpe/issues/16611
-object_store = { git = 'https://github.com/apache/arrow-rs.git', rev = "f5c165acc0e6cc4b34e0eaea006aab7e5bd28d66", package = "object_store" }

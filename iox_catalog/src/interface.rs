@@ -141,6 +141,9 @@ pub enum Error {
 
     #[snafu(display("could not delete skipped compactions: {source}"))]
     CouldNotDeleteSkippedCompactions { source: sqlx::Error },
+
+    #[snafu(display("could not delete namespace: {source}"))]
+    CouldNotDeleteNamespace { source: sqlx::Error },
 }
 
 /// A specialized `Error` for Catalog errors
@@ -324,6 +327,9 @@ pub trait NamespaceRepo: Send + Sync {
     /// Gets the namespace by its unique name.
     async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>>;
 
+    /// Delete a namespace by name
+    async fn delete(&mut self, name: &str) -> Result<()>;
+
     /// Update the limit on the number of tables that can exist per namespace.
     async fn update_table_limit(&mut self, name: &str, new_max: i32) -> Result<Namespace>;
 
@@ -485,6 +491,12 @@ pub trait PartitionRepo: Send + Sync {
         limit_bytes: u64,
     ) -> Result<()>;
 
+    /// Get the record of a partition being skipped.
+    async fn get_in_skipped_compaction(
+        &mut self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>>;
+
     /// List the records of compacting a partition being skipped. This is mostly useful for testing.
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>>;
 
@@ -506,6 +518,18 @@ pub trait PartitionRepo: Send + Sync {
 
     /// Return the N most recently created partitions for the specified shards.
     async fn most_recent_n(&mut self, n: usize, shards: &[ShardId]) -> Result<Vec<Partition>>;
+
+    /// Select partition for cold/warm/hot compaction
+    /// These are partitions with files created recently (aka created after the specified time_in_the_past)
+    /// These files include all levels of compaction files
+    async fn partitions_with_recent_created_files(
+        &mut self,
+        time_in_the_past: Timestamp,
+        max_num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>>;
+
+    /// Select partitions to compact
+    async fn partitions_to_compact(&mut self, recent_time: Timestamp) -> Result<Vec<PartitionId>>;
 }
 
 /// Functions for working with tombstones in the catalog
@@ -619,6 +643,7 @@ pub trait ParquetFileRepo: Send + Sync {
         max_time: Timestamp,
     ) -> Result<Vec<ParquetFile>>;
 
+    // Remove this function: https://github.com/influxdata/influxdb_iox/issues/6518
     /// List the most recent highest throughput partition for a given shard, if specified
     async fn recent_highest_throughput_partitions(
         &mut self,
@@ -628,6 +653,7 @@ pub trait ParquetFileRepo: Send + Sync {
         num_partitions: usize,
     ) -> Result<Vec<PartitionParam>>;
 
+    // Remove this function: https://github.com/influxdata/influxdb_iox/issues/6518
     /// List the partitions for a given shard that have at least the given count of L1 files no
     /// bigger than the provided size threshold. Limits the number of partitions returned to
     /// num_partitions, for performance.
@@ -639,6 +665,7 @@ pub trait ParquetFileRepo: Send + Sync {
         num_partitions: usize,
     ) -> Result<Vec<PartitionParam>>;
 
+    // Remove this function: https://github.com/influxdata/influxdb_iox/issues/6518
     /// List partitions with the most level 0 + level 1 files created earlier than
     /// `older_than_num_hours` hours ago for a given shard (if specified). In other words, "cold"
     /// partitions that need compaction.
@@ -928,6 +955,7 @@ pub(crate) mod test_helpers {
 
     pub(crate) async fn test_catalog(catalog: Arc<dyn Catalog>) {
         test_setup(Arc::clone(&catalog)).await;
+        test_partitions_with_recent_created_files(Arc::clone(&catalog)).await;
         test_most_cold_files_partitions(Arc::clone(&catalog)).await;
         test_topic(Arc::clone(&catalog)).await;
         test_query_pool(Arc::clone(&catalog)).await;
@@ -939,6 +967,7 @@ pub(crate) mod test_helpers {
         test_tombstone(Arc::clone(&catalog)).await;
         test_tombstones_by_parquet_file(Arc::clone(&catalog)).await;
         test_parquet_file(Arc::clone(&catalog)).await;
+        test_parquet_file_delete_broken(Arc::clone(&catalog)).await;
         test_parquet_file_compaction_level_0(Arc::clone(&catalog)).await;
         test_parquet_file_compaction_level_1(Arc::clone(&catalog)).await;
         test_recent_highest_throughput_partitions(Arc::clone(&catalog)).await;
@@ -949,6 +978,7 @@ pub(crate) mod test_helpers {
         test_txn_isolation(Arc::clone(&catalog)).await;
         test_txn_drop(Arc::clone(&catalog)).await;
         test_list_schemas(Arc::clone(&catalog)).await;
+        test_delete_namespace(Arc::clone(&catalog)).await;
 
         let metrics = catalog.metrics();
         assert_metric_hit(&metrics, "topic_create_or_get");
@@ -1128,6 +1158,28 @@ pub(crate) mod test_helpers {
             .update_retention_period(namespace4_name, None)
             .await
             .expect("namespace should be updateable");
+
+        // remove namespace to avoid it from affecting later tests
+        repos
+            .namespaces()
+            .delete("test_namespace")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("test_namespace2")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("test_namespace3")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("test_namespace4")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_table(catalog: Arc<dyn Catalog>) {
@@ -1256,6 +1308,17 @@ pub(crate) mod test_helpers {
                 namespace_id: _
             }
         ));
+
+        repos
+            .namespaces()
+            .delete("namespace_table_test")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("two")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_column(catalog: Arc<dyn Catalog>) {
@@ -1404,6 +1467,12 @@ pub(crate) mod test_helpers {
         let mut table3_column_names: Vec<_> = table3_columns.iter().map(|c| &c.name).collect();
         table3_column_names.sort();
         assert_eq!(table3_column_names, vec!["apples", "oranges"]);
+
+        repos
+            .namespaces()
+            .delete("namespace_column_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_shards(catalog: Arc<dyn Catalog>) {
@@ -1695,6 +1764,15 @@ pub(crate) mod test_helpers {
         assert_eq!(skipped_compactions[0].limit_num_files, 2);
         assert_eq!(skipped_compactions[0].estimated_bytes, 10);
         assert_eq!(skipped_compactions[0].limit_bytes, 20);
+        //
+        let skipped_partition_record = repos
+            .partitions()
+            .get_in_skipped_compaction(other_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped_partition_record.partition_id, other_partition.id);
+        assert_eq!(skipped_partition_record.reason, "I am le tired");
 
         // Only save the last reason that any particular partition was skipped (really if the
         // partition appears in the skipped compactions, it shouldn't become a compaction candidate
@@ -1712,7 +1790,17 @@ pub(crate) mod test_helpers {
         assert_eq!(skipped_compactions[0].limit_num_files, 12);
         assert_eq!(skipped_compactions[0].estimated_bytes, 110);
         assert_eq!(skipped_compactions[0].limit_bytes, 120);
+        //
+        let skipped_partition_record = repos
+            .partitions()
+            .get_in_skipped_compaction(other_partition.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skipped_partition_record.partition_id, other_partition.id);
+        assert_eq!(skipped_partition_record.reason, "I'm on fire");
 
+        // Delete the skipped compaction
         let deleted_skipped_compaction = repos
             .partitions()
             .delete_skipped_compactions(other_partition.id)
@@ -1726,6 +1814,13 @@ pub(crate) mod test_helpers {
         assert_eq!(deleted_skipped_compaction.limit_num_files, 12);
         assert_eq!(deleted_skipped_compaction.estimated_bytes, 110);
         assert_eq!(deleted_skipped_compaction.limit_bytes, 120);
+        //
+        let skipped_partition_record = repos
+            .partitions()
+            .get_in_skipped_compaction(other_partition.id)
+            .await
+            .unwrap();
+        assert!(skipped_partition_record.is_none());
 
         let not_deleted_skipped_compaction = repos
             .partitions()
@@ -1790,6 +1885,17 @@ pub(crate) mod test_helpers {
             .await
             .expect("should list most recent");
         assert_eq!(recent, recent2);
+
+        repos
+            .namespaces()
+            .delete("namespace_partition_test2")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("namespace_partition_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_tombstone(catalog: Arc<dyn Catalog>) {
@@ -1953,6 +2059,17 @@ pub(crate) mod test_helpers {
         assert_eq!(ts, t4.clone()); // still there
         let ts = repos.tombstones().get_by_id(t5.id).await.unwrap().unwrap();
         assert_eq!(ts, t5.clone()); // still there
+
+        repos
+            .namespaces()
+            .delete("namespace_tombstone_test2")
+            .await
+            .expect("delete namespace should succeed");
+        repos
+            .namespaces()
+            .delete("namespace_tombstone_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_tombstones_by_parquet_file(catalog: Arc<dyn Catalog>) {
@@ -1998,6 +2115,7 @@ pub(crate) mod test_helpers {
         let min_time = Timestamp::new(10);
         let max_time = Timestamp::new(20);
         let max_sequence_number = SequenceNumber::new(140);
+        let max_l0_created_at = Timestamp::new(0);
 
         let parquet_file_params = ParquetFileParams {
             shard_id: shard.id,
@@ -2013,6 +2131,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at,
         };
         let parquet_file = repos
             .parquet_files()
@@ -2172,6 +2291,12 @@ pub(crate) mod test_helpers {
             "\ntombstones: {:#?}\nexpected: {:#?}\nparquet_file: {:#?}",
             tombstones, expected, parquet_file
         );
+
+        repos
+            .namespaces()
+            .delete("namespace_tombstones_by_parquet_file_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_parquet_file(catalog: Arc<dyn Catalog>) {
@@ -2223,6 +2348,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
         let parquet_file = repos
             .parquet_files()
@@ -2688,6 +2814,97 @@ pub(crate) mod test_helpers {
         assert!(ids.is_empty());
     }
 
+    async fn test_parquet_file_delete_broken(catalog: Arc<dyn Catalog>) {
+        let mut repos = catalog.repositories().await;
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
+        let pool = repos.query_pools().create_or_get("foo").await.unwrap();
+        let namespace_1 = repos
+            .namespaces()
+            .create("retention_broken_1", None, topic.id, pool.id)
+            .await
+            .unwrap();
+        let namespace_2 = repos
+            .namespaces()
+            .create("retention_broken_2", Some(1), topic.id, pool.id)
+            .await
+            .unwrap();
+        let table_1 = repos
+            .tables()
+            .create_or_get("test_table", namespace_1.id)
+            .await
+            .unwrap();
+        let table_2 = repos
+            .tables()
+            .create_or_get("test_table", namespace_2.id)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
+            .await
+            .unwrap();
+        let partition_1 = repos
+            .partitions()
+            .create_or_get("one".into(), shard.id, table_1.id)
+            .await
+            .unwrap();
+        let partition_2 = repos
+            .partitions()
+            .create_or_get("one".into(), shard.id, table_2.id)
+            .await
+            .unwrap();
+
+        let parquet_file_params_1 = ParquetFileParams {
+            shard_id: shard.id,
+            namespace_id: namespace_1.id,
+            table_id: table_1.id,
+            partition_id: partition_1.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(140),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(1),
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
+        };
+        let parquet_file_params_2 = ParquetFileParams {
+            shard_id: shard.id,
+            namespace_id: namespace_2.id,
+            table_id: table_2.id,
+            partition_id: partition_2.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(140),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(1),
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
+        };
+        let _parquet_file_1 = repos
+            .parquet_files()
+            .create(parquet_file_params_1.clone())
+            .await
+            .unwrap();
+        let parquet_file_2 = repos
+            .parquet_files()
+            .create(parquet_file_params_2.clone())
+            .await
+            .unwrap();
+
+        let ids = repos
+            .parquet_files()
+            .flag_for_delete_by_retention()
+            .await
+            .unwrap();
+        assert_eq!(ids, vec![parquet_file_2.id]);
+    }
+
     async fn test_parquet_file_compaction_level_0(catalog: Arc<dyn Catalog>) {
         let mut repos = catalog.repositories().await;
         let topic = repos.topics().create_or_get("foo").await.unwrap();
@@ -2741,6 +2958,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
 
         let parquet_file = repos
@@ -2804,6 +3022,13 @@ pub(crate) mod test_helpers {
             "\nlevel 0: {:#?}\nexpected: {:#?}",
             level_0, expected,
         );
+
+        // drop the namespace to avoid the created data in this tests from affecting other tests
+        repos
+            .namespaces()
+            .delete("namespace_parquet_file_compaction_level_0_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_parquet_file_compaction_level_1(catalog: Arc<dyn Catalog>) {
@@ -2842,12 +3067,20 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), shard.id, table.id)
+            .create_or_get(
+                "test_parquet_file_compaction_level_1_one".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         let other_partition = repos
             .partitions()
-            .create_or_get("two".into(), shard.id, table.id)
+            .create_or_get(
+                "test_parquet_file_compaction_level_1_two".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
 
@@ -2870,6 +3103,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
         let parquet_file = repos
             .parquet_files()
@@ -3023,6 +3257,13 @@ pub(crate) mod test_helpers {
             "\nlevel 1: {:#?}\nexpected: {:#?}",
             level_1, expected,
         );
+
+        // drop the namespace to avoid the created data in this tests from affecting other tests
+        repos
+            .namespaces()
+            .delete("namespace_parquet_file_compaction_level_1_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_most_cold_files_partitions(catalog: Arc<dyn Catalog>) {
@@ -3054,6 +3295,7 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
 
+        let time_now = Timestamp::from(catalog.time_provider().now());
         let time_five_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(5));
         let time_8_hours_ago = Timestamp::from(catalog.time_provider().hours_ago(8));
         let time_38_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(38));
@@ -3126,6 +3368,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: time_38_hour_ago,
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: time_now,
         };
         let delete_l0_file = repos
             .parquet_files()
@@ -3271,7 +3514,11 @@ pub(crate) mod test_helpers {
         // Partition_2 has 2 non-deleted L0 file created 38 hours ago
         let partition_2 = repos
             .partitions()
-            .create_or_get("two".into(), shard.id, table.id)
+            .create_or_get(
+                "test_most_cold_files_partitions_two".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         let another_file_params = ParquetFileParams {
@@ -3320,7 +3567,11 @@ pub(crate) mod test_helpers {
         // non-deleted L1
         let partition_3 = repos
             .partitions()
-            .create_or_get("three".into(), shard.id, table.id)
+            .create_or_get(
+                "test_most_cold_files_partitions_three".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         // recent L1 but since no L0, this partition is still cold
@@ -3436,7 +3687,11 @@ pub(crate) mod test_helpers {
         // The DB now has 4 cold partitions but partition_2 should still be skipped
         let partition_4 = repos
             .partitions()
-            .create_or_get("four".into(), shard.id, table.id)
+            .create_or_get(
+                "test_most_cold_files_partitions_four".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         for _ in 0..3 {
@@ -3654,7 +3909,392 @@ pub(crate) mod test_helpers {
         assert_eq!(partitions[2].partition_id, partition_3.id);
         // then should be partition_1 witth 1 file: 1 L0
         assert_eq!(partitions[3].partition_id, partition_1.id);
+
+        // drop the namespace to avoid the created data in this tests from affecting other tests
+        repos
+            .namespaces()
+            .delete("test_most_level_0_files_partitions")
+            .await
+            .expect("delete namespace should succeed");
+
         repos.abort().await.unwrap();
+    }
+
+    async fn test_partitions_with_recent_created_files(catalog: Arc<dyn Catalog>) {
+        let max_num_partition = 100;
+        let mut repos = catalog.repositories().await;
+        let topic = repos
+            .topics()
+            .create_or_get("recent_created_files")
+            .await
+            .unwrap();
+        let pool = repos
+            .query_pools()
+            .create_or_get("recent_created_files")
+            .await
+            .unwrap();
+        let namespace = repos
+            .namespaces()
+            .create(
+                "test_partitions_with_recent_created_files",
+                None,
+                topic.id,
+                pool.id,
+            )
+            .await
+            .unwrap();
+        let table = repos
+            .tables()
+            .create_or_get("test_table_for_recent_created_files", namespace.id)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(101))
+            .await
+            .unwrap();
+
+        // param for the tests
+        let time_now = Timestamp::from(catalog.time_provider().now());
+        let time_one_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(1));
+        let time_two_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(2));
+        let time_three_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(3));
+        let time_five_hour_ago = Timestamp::from(catalog.time_provider().hours_ago(5));
+
+        // Db has no partition
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // -----------------
+        // PARTITION one
+        // The DB has 1 partition but it does not have any file
+        let partition1 = repos
+            .partitions()
+            .create_or_get("one".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // create files for partition one
+
+        let parquet_file_params = ParquetFileParams {
+            shard_id: shard.id,
+            namespace_id: namespace.id,
+            table_id: partition1.table_id,
+            partition_id: partition1.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(140),
+            min_time: Timestamp::new(1),
+            max_time: Timestamp::new(10),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: time_three_hour_ago,
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: time_now,
+        };
+
+        // create a deleted L0 file that was created 3 hours ago
+        let delete_l0_file = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        repos
+            .parquet_files()
+            .flag_for_delete(delete_l0_file.id)
+            .await
+            .unwrap();
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert!(partitions.is_empty());
+
+        // create a deleted L0 file that was created 1 hour ago which is recently
+        let l0_one_hour_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_one_hour_ago,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_one_hour_ago_file_params.clone())
+            .await
+            .unwrap();
+        // partition one should be returned
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], partition1.id);
+
+        // -----------------
+        // PARTITION two
+        // Partition two without any file
+        let partition2 = repos
+            .partitions()
+            .create_or_get("two".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        // should return partittion one only
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], partition1.id);
+
+        // Add a L0 file created non-recently (5 hours ago)
+        let l0_five_hour_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_five_hour_ago,
+            partition_id: partition2.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_five_hour_ago_file_params.clone())
+            .await
+            .unwrap();
+        // still return partittione one only
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        assert_eq!(partitions[0], partition1.id);
+
+        //  Add a L1 created recently (just now)
+        let l1_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_now,
+            partition_id: partition2.id,
+            compaction_level: CompactionLevel::FileNonOverlapped,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l1_file_params.clone())
+            .await
+            .unwrap();
+        // should return both partitions
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort_by(|a, b| a.partition_id.cmp(&b.partition_id));
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        assert_eq!(partitions[1].partition_id, partition2.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort();
+        assert_eq!(partitions[0], partition1.id);
+        assert_eq!(partitions[1], partition2.id);
+
+        // -----------------
+        // PARTITION three
+        // Partition three without any file
+        let partition3 = repos
+            .partitions()
+            .create_or_get("three".into(), shard.id, table.id)
+            .await
+            .unwrap();
+        // should return partittion one and two only
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort_by(|a, b| a.partition_id.cmp(&b.partition_id));
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        assert_eq!(partitions[1].partition_id, partition2.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort();
+        assert_eq!(partitions[0], partition1.id);
+        assert_eq!(partitions[1], partition2.id);
+
+        // Add a L2 created recently (just now) for partition three
+        // Since it is L2, the partition won't get updated
+        let l2_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_now,
+            partition_id: partition3.id,
+            compaction_level: CompactionLevel::Final,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l2_file_params.clone())
+            .await
+            .unwrap();
+        // still should return partittion one and two only
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort_by(|a, b| a.partition_id.cmp(&b.partition_id));
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        assert_eq!(partitions[1].partition_id, partition2.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort();
+        assert_eq!(partitions[0], partition1.id);
+        assert_eq!(partitions[1], partition2.id);
+
+        // add an L0 file created recently (one hour ago) for partition three
+        let l0_one_hour_ago_file_params = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            created_at: time_one_hour_ago,
+            partition_id: partition3.id,
+            ..parquet_file_params.clone()
+        };
+        repos
+            .parquet_files()
+            .create(l0_one_hour_ago_file_params.clone())
+            .await
+            .unwrap();
+        // should return all partitions
+        // get from partition table
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, max_num_partition)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort_by(|a, b| a.partition_id.cmp(&b.partition_id));
+        assert_eq!(partitions[0].partition_id, partition1.id);
+        assert_eq!(partitions[1].partition_id, partition2.id);
+        assert_eq!(partitions[2].partition_id, partition3.id);
+        // read from partition table only
+        let partitions = repos
+            .partitions()
+            .partitions_to_compact(time_two_hour_ago)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 3);
+        // sort by partition id
+        let mut partitions = partitions;
+        partitions.sort();
+        assert_eq!(partitions[0], partition1.id);
+        assert_eq!(partitions[1], partition2.id);
+        assert_eq!(partitions[2], partition3.id);
+
+        // Limit max num partition
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, 2)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 2);
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, 1)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 1);
+        let partitions = repos
+            .partitions()
+            .partitions_with_recent_created_files(time_two_hour_ago, 0)
+            .await
+            .unwrap();
+        assert_eq!(partitions.len(), 0);
+
+        // drop the namespace to avoid the created data in this tests from affecting other tests
+        repos
+            .namespaces()
+            .delete("test_partitions_with_recent_created_files")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_recent_highest_throughput_partitions(catalog: Arc<dyn Catalog>) {
@@ -3779,6 +4419,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: time_now,
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: time_now,
         };
         let delete_l0_file = repos
             .parquet_files()
@@ -3881,7 +4522,11 @@ pub(crate) mod test_helpers {
         // Let us create another partition with 2 L0 recent files
         let another_partition = repos
             .partitions()
-            .create_or_get("two".into(), shard.id, table.id)
+            .create_or_get(
+                "test_recent_highest_throughput_partitions_two".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         let l0_2_hours_ago_file_params = ParquetFileParams {
@@ -4072,6 +4717,14 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].partition_id, partition.id);
+
+        // Uncomment this out after https://github.com/influxdata/influxdb_iox/issues/6517 is fixed
+        // // remove namespace to avoid it from affecting later tests
+        // repos
+        //     .namespaces()
+        //     .delete("test_recent_highest_throughput_partitions")
+        //     .await
+        //     .expect("delete namespace should succeed");
     }
 
     async fn test_partitions_with_small_l1_file_count(catalog: Arc<dyn Catalog>) {
@@ -4164,6 +4817,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::FileNonOverlapped,
             created_at: time_now,
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: time_now,
         };
         let delete_l1_file = repos
             .parquet_files()
@@ -4269,6 +4923,7 @@ pub(crate) mod test_helpers {
             )
             .await
             .unwrap();
+        // BUG: https://github.com/influxdata/influxdb_iox/issues/6517
         assert_eq!(partitions.len(), 1);
         // must be the partition with 2 files
         assert_eq!(partitions[0].partition_id, another_partition.id);
@@ -4309,6 +4964,13 @@ pub(crate) mod test_helpers {
             .unwrap();
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0].partition_id, partition.id);
+
+        // remove namespace to avoid it from affecting later tests
+        repos
+            .namespaces()
+            .delete("test_partitions_with_small_l1_file_count")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_list_by_partiton_not_to_delete(catalog: Arc<dyn Catalog>) {
@@ -4338,12 +5000,20 @@ pub(crate) mod test_helpers {
 
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), shard.id, table.id)
+            .create_or_get(
+                "test_list_by_partiton_not_to_delete_one".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
         let partition2 = repos
             .partitions()
-            .create_or_get("two".into(), shard.id, table.id)
+            .create_or_get(
+                "test_list_by_partiton_not_to_delete_two".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
 
@@ -4364,6 +5034,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
 
         let parquet_file = repos
@@ -4422,6 +5093,13 @@ pub(crate) mod test_helpers {
         assert_eq!(files.len(), 2);
         assert_matches!(files.iter().find(|f| f.id == parquet_file.id), Some(_));
         assert_matches!(files.iter().find(|f| f.id == level1_file.id), Some(_));
+
+        // remove namespace to avoid it from affecting later tests
+        repos
+            .namespaces()
+            .delete("namespace_parquet_file_test_list_by_partiton_not_to_delete")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_update_to_compaction_level_1(catalog: Arc<dyn Catalog>) {
@@ -4450,7 +5128,11 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), shard.id, table.id)
+            .create_or_get(
+                "test_update_to_compaction_level_1_one".into(),
+                shard.id,
+                table.id,
+            )
             .await
             .unwrap();
 
@@ -4474,6 +5156,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
         let parquet_file = repos
             .parquet_files()
@@ -4546,6 +5229,13 @@ pub(crate) mod test_helpers {
             "\nlevel 1: {:#?}\nexpected: {:#?}",
             level_1, expected,
         );
+
+        // remove namespace to avoid it from affecting later tests
+        repos
+            .namespaces()
+            .delete("namespace_update_to_compaction_level_1_test")
+            .await
+            .expect("delete namespace should succeed");
     }
 
     async fn test_processed_tombstones(catalog: Arc<dyn Catalog>) {
@@ -4574,7 +5264,7 @@ pub(crate) mod test_helpers {
             .unwrap();
         let partition = repos
             .partitions()
-            .create_or_get("one".into(), shard.id, table.id)
+            .create_or_get("test_processed_tombstones_one".into(), shard.id, table.id)
             .await
             .unwrap();
 
@@ -4593,6 +5283,7 @@ pub(crate) mod test_helpers {
             compaction_level: CompactionLevel::Initial,
             created_at: Timestamp::new(1),
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
         };
         let p1 = repos
             .parquet_files()
@@ -4724,6 +5415,457 @@ pub(crate) mod test_helpers {
             .await
             .unwrap();
         assert_eq!(count, 0);
+
+        // remove namespace to avoid it from affecting later tests
+        repos
+            .namespaces()
+            .delete("namespace_processed_tombstone_test")
+            .await
+            .expect("delete namespace should succeed");
+    }
+
+    async fn test_delete_namespace(catalog: Arc<dyn Catalog>) {
+        let mut repos = catalog.repositories().await;
+        let topic = repos.topics().create_or_get("foo").await.unwrap();
+        let pool = repos.query_pools().create_or_get("foo").await.unwrap();
+        let namespace_1 = repos
+            .namespaces()
+            .create("namespace_test_delete_namespace_1", None, topic.id, pool.id)
+            .await
+            .unwrap();
+        let table_1 = repos
+            .tables()
+            .create_or_get("test_table_1", namespace_1.id)
+            .await
+            .unwrap();
+        let _c = repos
+            .columns()
+            .create_or_get("column_test_1", table_1.id, ColumnType::Tag)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
+            .await
+            .unwrap();
+        let partition_1 = repos
+            .partitions()
+            .create_or_get("test_delete_namespace_one".into(), shard.id, table_1.id)
+            .await
+            .unwrap();
+
+        // parquet files
+        let parquet_file_params = ParquetFileParams {
+            namespace_id: namespace_1.id,
+            shard_id: shard.id,
+            table_id: partition_1.table_id,
+            partition_id: partition_1.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(1),
+            min_time: Timestamp::new(100),
+            max_time: Timestamp::new(250),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(1),
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
+        };
+        let p1_n1 = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        let parquet_file_params_2 = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(3),
+            min_time: Timestamp::new(200),
+            max_time: Timestamp::new(300),
+            ..parquet_file_params
+        };
+        let p2_n1 = repos
+            .parquet_files()
+            .create(parquet_file_params_2.clone())
+            .await
+            .unwrap();
+
+        // tombstones
+        let t1_n1 = repos
+            .tombstones()
+            .create_or_get(
+                table_1.id,
+                shard.id,
+                SequenceNumber::new(10),
+                Timestamp::new(1),
+                Timestamp::new(10),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+        let t2_n1 = repos
+            .tombstones()
+            .create_or_get(
+                table_1.id,
+                shard.id,
+                SequenceNumber::new(11),
+                Timestamp::new(100),
+                Timestamp::new(110),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+        let t3_n1 = repos
+            .tombstones()
+            .create_or_get(
+                table_1.id,
+                shard.id,
+                SequenceNumber::new(12),
+                Timestamp::new(200),
+                Timestamp::new(210),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+
+        // processed tombstones
+        // p1, t2
+        let _pt1 = repos
+            .processed_tombstones()
+            .create(p1_n1.id, t2_n1.id)
+            .await
+            .unwrap();
+        // p1, t3
+        let _pt2 = repos
+            .processed_tombstones()
+            .create(p1_n1.id, t3_n1.id)
+            .await
+            .unwrap();
+        // p2, t3
+        let _pt3 = repos
+            .processed_tombstones()
+            .create(p2_n1.id, t3_n1.id)
+            .await
+            .unwrap();
+
+        // test exist
+        let exist = repos
+            .processed_tombstones()
+            .exist(p1_n1.id, t1_n1.id)
+            .await
+            .unwrap();
+        assert!(!exist);
+        let exist = repos
+            .processed_tombstones()
+            .exist(p1_n1.id, t2_n1.id)
+            .await
+            .unwrap();
+        assert!(exist);
+
+        // we've now created a namespace with a table, parquet files, tombstones and processed
+        // tombstones. before we test deleting it let's create another so we can ensure that
+        // doesn't get deleted.
+        let namespace_2 = repos
+            .namespaces()
+            .create("namespace_test_delete_namespace_2", None, topic.id, pool.id)
+            .await
+            .unwrap();
+        let table_2 = repos
+            .tables()
+            .create_or_get("test_table_2", namespace_2.id)
+            .await
+            .unwrap();
+        let _c = repos
+            .columns()
+            .create_or_get("column_test_2", table_2.id, ColumnType::Tag)
+            .await
+            .unwrap();
+        let shard = repos
+            .shards()
+            .create_or_get(&topic, ShardIndex::new(1))
+            .await
+            .unwrap();
+        let partition_2 = repos
+            .partitions()
+            .create_or_get("test_delete_namespace_two".into(), shard.id, table_2.id)
+            .await
+            .unwrap();
+
+        // parquet files
+        let parquet_file_params = ParquetFileParams {
+            namespace_id: namespace_2.id,
+            shard_id: shard.id,
+            table_id: partition_2.table_id,
+            partition_id: partition_2.id,
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(1),
+            min_time: Timestamp::new(100),
+            max_time: Timestamp::new(250),
+            file_size_bytes: 1337,
+            row_count: 0,
+            compaction_level: CompactionLevel::Initial,
+            created_at: Timestamp::new(1),
+            column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: Timestamp::new(1),
+        };
+        let p1_n2 = repos
+            .parquet_files()
+            .create(parquet_file_params.clone())
+            .await
+            .unwrap();
+        let parquet_file_params_2 = ParquetFileParams {
+            object_store_id: Uuid::new_v4(),
+            max_sequence_number: SequenceNumber::new(3),
+            min_time: Timestamp::new(200),
+            max_time: Timestamp::new(300),
+            ..parquet_file_params
+        };
+        let p2_n2 = repos
+            .parquet_files()
+            .create(parquet_file_params_2.clone())
+            .await
+            .unwrap();
+
+        // tombstones
+        let t1_n2 = repos
+            .tombstones()
+            .create_or_get(
+                table_2.id,
+                shard.id,
+                SequenceNumber::new(10),
+                Timestamp::new(1),
+                Timestamp::new(10),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+        let t2_n2 = repos
+            .tombstones()
+            .create_or_get(
+                table_2.id,
+                shard.id,
+                SequenceNumber::new(11),
+                Timestamp::new(100),
+                Timestamp::new(110),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+        let t3_n2 = repos
+            .tombstones()
+            .create_or_get(
+                table_2.id,
+                shard.id,
+                SequenceNumber::new(12),
+                Timestamp::new(200),
+                Timestamp::new(210),
+                "whatevs",
+            )
+            .await
+            .unwrap();
+
+        // processed tombstones
+        // p1, t2
+        let _pt1 = repos
+            .processed_tombstones()
+            .create(p1_n2.id, t2_n2.id)
+            .await
+            .unwrap();
+        // p1, t3
+        let _pt2 = repos
+            .processed_tombstones()
+            .create(p1_n2.id, t3_n2.id)
+            .await
+            .unwrap();
+        // p2, t3
+        let _pt3 = repos
+            .processed_tombstones()
+            .create(p2_n2.id, t3_n2.id)
+            .await
+            .unwrap();
+
+        // test exist
+        let exist = repos
+            .processed_tombstones()
+            .exist(p1_n2.id, t1_n2.id)
+            .await
+            .unwrap();
+        assert!(!exist);
+        let exist = repos
+            .processed_tombstones()
+            .exist(p1_n2.id, t2_n2.id)
+            .await
+            .unwrap();
+        assert!(exist);
+
+        // now delete namespace_1 and assert it's all gone and none of namespace_2 is gone
+        repos
+            .namespaces()
+            .delete("namespace_test_delete_namespace_1")
+            .await
+            .expect("delete namespace should succeed");
+        // assert that namespace, table, column, tombstones, parquet files and processed tombstones
+        // are all gone
+        assert!(repos
+            .namespaces()
+            .get_by_id(namespace_1.id)
+            .await
+            .expect("get namespace should succeed")
+            .is_none());
+        assert!(repos
+            .tables()
+            .get_by_id(table_1.id)
+            .await
+            .expect("get table should succeed")
+            .is_none());
+        assert_eq!(
+            repos
+                .columns()
+                .list_by_namespace_id(namespace_1.id)
+                .await
+                .expect("listing columns should succeed")
+                .len(),
+            0
+        );
+        assert_eq!(
+            repos
+                .columns()
+                .list_by_table_id(table_1.id)
+                .await
+                .expect("listing columns should succeed")
+                .len(),
+            0
+        );
+        assert_eq!(
+            repos
+                .tombstones()
+                .list_by_namespace(namespace_1.id)
+                .await
+                .expect("listing tombstones should succeed")
+                .len(),
+            0
+        );
+        assert_eq!(
+            repos
+                .tombstones()
+                .list_by_table(table_1.id)
+                .await
+                .expect("listing tombstones should succeed")
+                .len(),
+            0
+        );
+        assert!(repos
+            .partitions()
+            .get_by_id(partition_1.id)
+            .await
+            .expect("fetching partition by id should succeed")
+            .is_none());
+        assert!(!repos
+            .parquet_files()
+            .exist(p1_n1.id)
+            .await
+            .expect("parquet file exists check should succeed"));
+        assert!(!repos
+            .parquet_files()
+            .exist(p2_n1.id)
+            .await
+            .expect("parquet file exists check should succeed"));
+        assert!(!repos
+            .processed_tombstones()
+            .exist(p1_n1.id, t2_n1.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
+        assert!(!repos
+            .processed_tombstones()
+            .exist(p1_n1.id, t3_n1.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
+        assert!(!repos
+            .processed_tombstones()
+            .exist(p2_n1.id, t3_n1.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
+
+        // assert that the namespace, table, column, tombstone, parquet files and processed
+        // tombstones for namespace_2 are still there
+        assert!(repos
+            .namespaces()
+            .get_by_id(namespace_2.id)
+            .await
+            .expect("get namespace should succeed")
+            .is_some());
+        assert!(repos
+            .tables()
+            .get_by_id(table_2.id)
+            .await
+            .expect("get table should succeed")
+            .is_some());
+        assert_eq!(
+            repos
+                .columns()
+                .list_by_namespace_id(namespace_2.id)
+                .await
+                .expect("listing columns should succeed")
+                .len(),
+            1
+        );
+        assert_eq!(
+            repos
+                .columns()
+                .list_by_table_id(table_2.id)
+                .await
+                .expect("listing columns should succeed")
+                .len(),
+            1
+        );
+        assert_eq!(
+            repos
+                .tombstones()
+                .list_by_namespace(namespace_2.id)
+                .await
+                .expect("listing tombstones should succeed")
+                .len(),
+            3
+        );
+        assert_eq!(
+            repos
+                .tombstones()
+                .list_by_table(table_2.id)
+                .await
+                .expect("listing tombstones should succeed")
+                .len(),
+            3
+        );
+        assert!(repos
+            .partitions()
+            .get_by_id(partition_2.id)
+            .await
+            .expect("fetching partition by id should succeed")
+            .is_some());
+        assert!(repos
+            .parquet_files()
+            .exist(p1_n2.id)
+            .await
+            .expect("parquet file exists check should succeed"));
+        assert!(repos
+            .parquet_files()
+            .exist(p2_n2.id)
+            .await
+            .expect("parquet file exists check should succeed"));
+        assert!(repos
+            .processed_tombstones()
+            .exist(p1_n2.id, t2_n2.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
+        assert!(repos
+            .processed_tombstones()
+            .exist(p1_n2.id, t3_n2.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
+        assert!(repos
+            .processed_tombstones()
+            .exist(p2_n2.id, t3_n2.id)
+            .await
+            .expect("processed tombstone exists check should succeed"));
     }
 
     async fn test_txn_isolation(catalog: Arc<dyn Catalog>) {

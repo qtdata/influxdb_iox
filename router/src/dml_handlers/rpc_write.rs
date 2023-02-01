@@ -1,31 +1,25 @@
+mod balancer;
+mod circuit_breaker;
+mod circuit_breaking_client;
 mod client;
+pub mod lazy_connector;
+
+use crate::dml_handlers::rpc_write::client::WriteClient;
+
+use self::{balancer::Balancer, circuit_breaking_client::CircuitBreakingClient};
 
 use super::{DmlHandler, Partitioned};
 use async_trait::async_trait;
 use data_types::{DeletePredicate, NamespaceId, NamespaceName, TableId};
 use dml::{DmlMeta, DmlWrite};
-use generated_types::influxdata::iox::ingester::v1::{
-    write_service_client::WriteServiceClient, WriteRequest,
-};
+use generated_types::influxdata::iox::ingester::v1::WriteRequest;
 use hashbrown::HashMap;
 use mutable_batch::MutableBatch;
 use mutable_batch_pb::encode::encode_write;
 use observability_deps::tracing::*;
-use sharder::RoundRobin;
-use std::{fmt::Debug, time::Duration};
+use std::{fmt::Debug, sync::Arc, time::Duration};
 use thiserror::Error;
 use trace::ctx::SpanContext;
-
-/// Create a client to the ingester's write service.
-pub async fn write_service_client(
-    ingester_addr: &str,
-) -> WriteServiceClient<client_util::connection::GrpcConnection> {
-    let connection = client_util::connection::Builder::default()
-        .build(format!("http://{}", ingester_addr))
-        .await
-        .unwrap_or_else(|e| panic!("failed to connect to server {ingester_addr}: {e}"));
-    WriteServiceClient::new(connection.into_grpc_connection())
-}
 
 /// The bound on RPC request duration.
 ///
@@ -43,13 +37,18 @@ pub enum RpcWriteError {
     #[error("timeout writing to upstream ingester")]
     Timeout(#[from] tokio::time::error::Elapsed),
 
+    /// There are no healthy ingesters to route a write to.
+    #[error("no healthy upstream ingesters available")]
+    NoUpstreams,
+
+    /// The upstream connection is not established.
+    #[error("upstream {0} is not connected")]
+    UpstreamNotConnected(String),
+
     /// A delete request was rejected (not supported).
     #[error("deletes are not supported")]
     DeletesUnsupported,
 }
-
-/// A convenience alias for the generated gRPC client.
-type GrpcClient = WriteServiceClient<client_util::connection::GrpcConnection>;
 
 /// An [`RpcWrite`] handler submits a write directly to an Ingester via the
 /// [gRPC write service].
@@ -63,24 +62,35 @@ type GrpcClient = WriteServiceClient<client_util::connection::GrpcConnection>;
 /// This handler drops delete requests, logging the attempt and returning an
 /// error to the client.
 ///
-/// [gRPC write service]: WriteServiceClient
+/// [gRPC write service]: client::WriteClient
 #[derive(Debug)]
-pub struct RpcWrite<C = GrpcClient> {
-    endpoints: RoundRobin<C>,
+pub struct RpcWrite<C> {
+    endpoints: Balancer<C>,
 }
 
 impl<C> RpcWrite<C> {
     /// Initialise a new [`RpcWrite`] that sends requests to an arbitrary
     /// downstream Ingester, using a round-robin strategy.
-    pub fn new(endpoints: RoundRobin<C>) -> Self {
-        Self { endpoints }
+    pub fn new<N>(endpoints: impl IntoIterator<Item = (C, N)>, metrics: &metric::Registry) -> Self
+    where
+        C: Send + Sync + Debug + 'static,
+        N: Into<Arc<str>>,
+    {
+        Self {
+            endpoints: Balancer::new(
+                endpoints
+                    .into_iter()
+                    .map(|(client, name)| CircuitBreakingClient::new(client, name.into())),
+                Some(metrics),
+            ),
+        }
     }
 }
 
 #[async_trait]
 impl<C> DmlHandler for RpcWrite<C>
 where
-    C: client::WriteClient,
+    C: client::WriteClient + 'static,
 {
     type WriteInput = Partitioned<HashMap<TableId, (String, MutableBatch)>>;
     type WriteOutput = Vec<DmlMeta>;
@@ -118,18 +128,7 @@ where
         };
 
         // Perform the gRPC write to an ingester.
-        //
-        // This includes a dirt simple retry mechanism that WILL need improving
-        // (#6173).
-        tokio::time::timeout(RPC_TIMEOUT, async {
-            loop {
-                match self.endpoints.next().write(req.clone()).await {
-                    Ok(()) => break,
-                    Err(e) => warn!(error=%e, "failed ingester rpc write"),
-                };
-            }
-        })
-        .await?;
+        tokio::time::timeout(RPC_TIMEOUT, write_loop(self.endpoints.endpoints(), req)).await??;
 
         debug!(
             %partition_key,
@@ -159,6 +158,29 @@ where
         );
 
         Err(RpcWriteError::DeletesUnsupported)
+    }
+}
+
+async fn write_loop<T>(
+    mut endpoints: impl Iterator<Item = T> + Send,
+    req: WriteRequest,
+) -> Result<(), RpcWriteError>
+where
+    T: WriteClient,
+{
+    let mut delay = Duration::from_millis(50);
+    loop {
+        match endpoints
+            .next()
+            .ok_or(RpcWriteError::NoUpstreams)?
+            .write(req.clone())
+            .await
+        {
+            Ok(()) => return Ok(()),
+            Err(e) => warn!(error=%e, "failed ingester rpc write"),
+        };
+        tokio::time::sleep(delay).await;
+        delay = delay.saturating_mul(2);
     }
 }
 
@@ -203,7 +225,10 @@ mod tests {
 
         // Init the write handler with a mock client to capture the rpc calls.
         let client = Arc::new(MockWriteClient::default());
-        let handler = RpcWrite::new(RoundRobin::new([Arc::clone(&client)]));
+        let handler = RpcWrite::new(
+            [(Arc::clone(&client), "mock client")],
+            &metric::Registry::default(),
+        );
 
         // Drive the RPC writer
         let got = handler
@@ -255,10 +280,13 @@ mod tests {
                 .with_ret([Err(RpcWriteError::Upstream(tonic::Status::internal("")))]),
         );
         let client2 = Arc::new(MockWriteClient::default());
-        let handler = RpcWrite::new(RoundRobin::new([
-            Arc::clone(&client1),
-            Arc::clone(&client2),
-        ]));
+        let handler = RpcWrite::new(
+            [
+                (Arc::clone(&client1), "client1"),
+                (Arc::clone(&client2), "client2"),
+            ],
+            &metric::Registry::default(),
+        );
 
         // Drive the RPC writer
         let got = handler

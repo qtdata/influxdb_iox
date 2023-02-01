@@ -10,6 +10,8 @@ use crate::{
     Predicate, PredicateMatch, QueryChunk, QueryChunkData, QueryChunkMeta, QueryCompletedToken,
     QueryNamespace, QueryText,
 };
+use arrow::array::{BooleanArray, Float64Array};
+use arrow::datatypes::SchemaRef;
 use arrow::{
     array::{
         ArrayRef, DictionaryArray, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
@@ -22,8 +24,15 @@ use data_types::{
     ChunkId, ChunkOrder, ColumnSummary, DeletePredicate, InfluxDbType, PartitionId, StatValues,
     Statistics, TableSummary,
 };
+use datafusion::catalog::catalog::CatalogProvider;
+use datafusion::catalog::schema::SchemaProvider;
+use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::SessionState;
+use datafusion::logical_expr::Expr;
+use datafusion::physical_plan::ExecutionPlan;
 use hashbrown::HashSet;
+use itertools::Itertools;
 use observability_deps::tracing::debug;
 use parking_lot::Mutex;
 use predicate::rpc_predicate::QueryNamespaceMeta;
@@ -142,7 +151,7 @@ impl QueryNamespace for TestDatabase {
 }
 
 impl QueryNamespaceMeta for TestDatabase {
-    fn table_schema(&self, table_name: &str) -> Option<Arc<Schema>> {
+    fn table_schema(&self, table_name: &str) -> Option<Schema> {
         let mut merger = SchemaMerger::new();
         let mut found_one = false;
 
@@ -150,7 +159,7 @@ impl QueryNamespaceMeta for TestDatabase {
         for partition in partitions.values() {
             for chunk in partition.values() {
                 if chunk.table_name() == table_name {
-                    merger = merger.merge(&chunk.schema()).expect("consistent schemas");
+                    merger = merger.merge(chunk.schema()).expect("consistent schemas");
                     found_one = true;
                 }
             }
@@ -177,8 +186,115 @@ impl ExecutionContextProvider for TestDatabase {
         // Note: unlike Db this does not register a catalog provider
         self.executor
             .new_execution_config(ExecutorType::Query)
+            .with_default_catalog(Arc::new(TestDatabaseCatalogProvider::from_test_database(
+                self,
+            )))
             .with_span_context(span_ctx)
             .build()
+    }
+}
+
+// The default schema name - this impacts what SQL queries use if not specified
+const DEFAULT_SCHEMA: &str = "iox";
+
+struct TestDatabaseCatalogProvider {
+    partitions: BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>,
+}
+
+impl TestDatabaseCatalogProvider {
+    fn from_test_database(db: &TestDatabase) -> Self {
+        Self {
+            partitions: db.partitions.lock().clone(),
+        }
+    }
+}
+
+impl CatalogProvider for TestDatabaseCatalogProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema_names(&self) -> Vec<String> {
+        vec![DEFAULT_SCHEMA.to_string()]
+    }
+
+    fn schema(&self, name: &str) -> Option<Arc<dyn SchemaProvider>> {
+        match name {
+            DEFAULT_SCHEMA => Some(Arc::new(TestDatabaseSchemaProvider {
+                partitions: self.partitions.clone(),
+            })),
+            _ => None,
+        }
+    }
+}
+
+struct TestDatabaseSchemaProvider {
+    partitions: BTreeMap<String, BTreeMap<ChunkId, Arc<TestChunk>>>,
+}
+
+#[async_trait]
+impl SchemaProvider for TestDatabaseSchemaProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn table_names(&self) -> Vec<String> {
+        self.partitions
+            .values()
+            .flat_map(|c| c.values())
+            .map(|c| c.table_name.to_owned())
+            .unique()
+            .collect()
+    }
+
+    async fn table(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
+        Some(Arc::new(TestDatabaseTableProvider {
+            partitions: self
+                .partitions
+                .values()
+                .flat_map(|chunks| chunks.values().filter(|c| c.table_name() == name))
+                .map(Clone::clone)
+                .collect(),
+        }))
+    }
+
+    fn table_exist(&self, name: &str) -> bool {
+        self.table_names().contains(&name.to_string())
+    }
+}
+
+struct TestDatabaseTableProvider {
+    partitions: Vec<Arc<TestChunk>>,
+}
+
+#[async_trait]
+impl TableProvider for TestDatabaseTableProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.partitions
+            .iter()
+            .fold(SchemaMerger::new(), |merger, chunk| {
+                merger.merge(chunk.schema()).expect("consistent schemas")
+            })
+            .build()
+            .as_arrow()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        _ctx: &SessionState,
+        _projection: Option<&Vec<usize>>,
+        _filters: &[Expr],
+        _limit: Option<usize>,
+    ) -> crate::exec::context::Result<Arc<dyn ExecutionPlan>> {
+        unimplemented!()
     }
 }
 
@@ -188,7 +304,7 @@ pub struct TestChunk {
     table_name: String,
 
     /// Schema of the table
-    schema: Arc<Schema>,
+    schema: Schema,
 
     /// Return value for summary()
     table_summary: TableSummary,
@@ -223,6 +339,9 @@ pub struct TestChunk {
 
     /// The partition sort key of this chunk
     partition_sort_key: Option<SortKey>,
+
+    /// Suppress output
+    quiet: bool,
 }
 
 /// Implements a method for adding a column with default stats
@@ -291,7 +410,7 @@ impl TestChunk {
         let table_name = table_name.into();
         Self {
             table_name,
-            schema: Arc::new(SchemaBuilder::new().build().unwrap()),
+            schema: SchemaBuilder::new().build().unwrap(),
             table_summary: TableSummary::default(),
             id: ChunkId::new_test(0),
             may_contain_pk_duplicates: Default::default(),
@@ -304,7 +423,14 @@ impl TestChunk {
             sort_key: None,
             partition_sort_key: None,
             partition_id: PartitionId::new(0),
+            quiet: false,
         }
+    }
+
+    /// Returns the receiver configured to suppress any output to STDOUT.
+    pub fn with_quiet(mut self) -> Self {
+        self.quiet = true;
+        self
     }
 
     pub fn with_id(mut self, id: u128) -> Self {
@@ -542,9 +668,7 @@ impl TestChunk {
     ) -> Self {
         let mut merger = SchemaMerger::new();
         merger = merger.merge(&new_column_schema).unwrap();
-        merger = merger
-            .merge(self.schema.as_ref())
-            .expect("merging was successful");
+        merger = merger.merge(&self.schema).expect("merging was successful");
         self.schema = merger.build();
 
         for i in 0..new_column_schema.len() {
@@ -609,6 +733,8 @@ impl TestChunk {
                     let dict: DictionaryArray<Int32Type> = vec!["MA"].into_iter().collect();
                     Arc::new(dict) as ArrayRef
                 }
+                DataType::Float64 => Arc::new(Float64Array::from(vec![99.5])) as ArrayRef,
+                DataType::Boolean => Arc::new(BooleanArray::from(vec![true])) as ArrayRef,
                 _ => unimplemented!(
                     "Unimplemented data type for test database: {:?}",
                     field.data_type()
@@ -617,8 +743,10 @@ impl TestChunk {
             .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
-        println!("TestChunk batch data: {:#?}", batch);
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
+        if !self.quiet {
+            println!("TestChunk batch data: {:#?}", batch);
+        }
 
         self.table_data.push(Arc::new(batch));
         self
@@ -655,8 +783,10 @@ impl TestChunk {
             .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
-        println!("TestChunk batch data: {:#?}", batch);
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
+        if !self.quiet {
+            println!("TestChunk batch data: {:#?}", batch);
+        }
 
         self.table_data.push(Arc::new(batch));
         self
@@ -717,7 +847,7 @@ impl TestChunk {
             .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
 
         self.table_data.push(Arc::new(batch));
         self
@@ -780,7 +910,7 @@ impl TestChunk {
             .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
 
         self.table_data.push(Arc::new(batch));
         self
@@ -850,7 +980,7 @@ impl TestChunk {
                 .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
 
         self.table_data.push(Arc::new(batch));
         self
@@ -927,7 +1057,7 @@ impl TestChunk {
             .collect::<Vec<_>>();
 
         let batch =
-            RecordBatch::try_new(self.schema.as_ref().into(), columns).expect("made record batch");
+            RecordBatch::try_new(self.schema.as_arrow(), columns).expect("made record batch");
 
         self.table_data.push(Arc::new(batch));
         self
@@ -1055,8 +1185,8 @@ impl QueryChunkMeta for TestChunk {
         Arc::new(self.table_summary.clone())
     }
 
-    fn schema(&self) -> Arc<Schema> {
-        Arc::clone(&self.schema)
+    fn schema(&self) -> &Schema {
+        &self.schema
     }
 
     fn partition_sort_key(&self) -> Option<&SortKey> {

@@ -7,11 +7,11 @@ license.workspace = true
 
 [dependencies]
 arrow = { workspace = true, features = ["prettyprint"] }
-arrow_util = { path = "../arrow_util" }
 arrow-flight = { workspace = true }
-async-trait = "0.1.60"
+arrow_util = { path = "../arrow_util" }
+async-trait = "0.1.64"
 backoff = { path = "../backoff" }
-bytes = "1.3"
+bytes = "1.4"
 chrono = { version = "0.4", default-features = false }
 data_types = { path = "../data_types" }
 datafusion = { workspace = true }
@@ -41,7 +41,7 @@ schema = { path = "../schema" }
 service_grpc_catalog = { path = "../service_grpc_catalog"}
 snafu = "0.7"
 thiserror = "1.0"
-tokio = { version = "1.22", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.25", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.4" }
 tonic = { version = "0.8" }
 trace = { path = "../trace" }

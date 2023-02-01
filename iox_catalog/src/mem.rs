@@ -328,6 +328,60 @@ impl NamespaceRepo for MemTxn {
         Ok(stage.namespaces.iter().find(|n| n.name == name).cloned())
     }
 
+    // performs a cascading delete of all things attached to the namespace, then deletes the
+    // namespace
+    async fn delete(&mut self, name: &str) -> Result<()> {
+        let stage = self.stage();
+        // get namespace by name
+        let namespace_id = match stage.namespaces.iter().find(|n| n.name == name) {
+            Some(n) => n.id,
+            None => {
+                return Err(Error::NamespaceNotFoundByName {
+                    name: name.to_string(),
+                })
+            }
+        };
+        // get list of parquet files that match the namespace id
+        let parquet_file_ids: Vec<_> = stage
+            .parquet_files
+            .iter()
+            .filter_map(|f| (f.namespace_id == namespace_id).then_some(f.id))
+            .collect();
+        // delete all processed tombstones for those parquet files
+        stage
+            .processed_tombstones
+            .retain(|pt| !parquet_file_ids.iter().any(|id| *id == pt.parquet_file_id));
+        // delete all the parquet files
+        stage
+            .parquet_files
+            .retain(|pf| !parquet_file_ids.iter().any(|id| *id == pf.id));
+        // get tables with that namespace id
+        let table_ids: HashSet<_> = stage
+            .tables
+            .iter()
+            .filter_map(|table| (table.namespace_id == namespace_id).then_some(table.id))
+            .collect();
+        // delete partitions for those tables
+        stage
+            .partitions
+            .retain(|p| !table_ids.iter().any(|id| *id == p.table_id));
+        // delete tombstones for those tables
+        stage
+            .tombstones
+            .retain(|t| !table_ids.iter().any(|id| *id == t.table_id));
+        // delete columns for those tables
+        stage
+            .columns
+            .retain(|c| !table_ids.iter().any(|id| *id == c.table_id));
+        // delete those tables
+        stage
+            .tables
+            .retain(|t| !table_ids.iter().any(|id| *id == t.id));
+        // finally, delete the namespace
+        stage.namespaces.retain(|n| n.id != namespace_id);
+        Ok(())
+    }
+
     async fn update_table_limit(&mut self, name: &str, new_max: i32) -> Result<Namespace> {
         let stage = self.stage();
         match stage.namespaces.iter_mut().find(|n| n.name == name) {
@@ -758,6 +812,7 @@ impl PartitionRepo for MemTxn {
                         partition_key: key,
                         sort_key: vec![],
                         persisted_sequence_number: None,
+                        new_file_at: None,
                     };
                     stage.partitions.push(p);
                     stage.partitions.last().unwrap()
@@ -880,6 +935,18 @@ impl PartitionRepo for MemTxn {
         Ok(())
     }
 
+    async fn get_in_skipped_compaction(
+        &mut self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>> {
+        let stage = self.stage();
+        Ok(stage
+            .skipped_compactions
+            .iter()
+            .find(|s| s.partition_id == partition_id)
+            .cloned())
+    }
+
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
         let stage = self.stage();
         Ok(stage.skipped_compactions.clone())
@@ -930,6 +997,52 @@ impl PartitionRepo for MemTxn {
             .take(n)
             .cloned()
             .collect())
+    }
+
+    async fn partitions_with_recent_created_files(
+        &mut self,
+        time_in_the_past: Timestamp,
+        max_num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>> {
+        let stage = self.stage();
+
+        let partitions: Vec<_> = stage
+            .partitions
+            .iter()
+            .filter(|p| p.new_file_at > Some(time_in_the_past))
+            .map(|p| {
+                // get namesapce_id of this partition
+                let namespace_id = stage
+                    .tables
+                    .iter()
+                    .find(|t| t.id == p.table_id)
+                    .map(|t| t.namespace_id)
+                    .unwrap_or(NamespaceId::new(1));
+
+                PartitionParam {
+                    partition_id: p.id,
+                    table_id: p.table_id,
+                    shard_id: ShardId::new(1), // this is unused and will be removed when we remove shard_id
+                    namespace_id,
+                }
+            })
+            .take(max_num_partitions)
+            .collect();
+
+        Ok(partitions)
+    }
+
+    async fn partitions_to_compact(&mut self, recent_time: Timestamp) -> Result<Vec<PartitionId>> {
+        let stage = self.stage();
+
+        let partitions: Vec<_> = stage
+            .partitions
+            .iter()
+            .filter(|p| p.new_file_at > Some(recent_time))
+            .map(|p| p.id)
+            .collect();
+
+        Ok(partitions)
     }
 }
 
@@ -1066,48 +1179,35 @@ impl ParquetFileRepo for MemTxn {
     async fn create(&mut self, parquet_file_params: ParquetFileParams) -> Result<ParquetFile> {
         let stage = self.stage();
 
-        let ParquetFileParams {
-            shard_id,
-            namespace_id,
-            table_id,
-            partition_id,
-            object_store_id,
-            max_sequence_number,
-            min_time,
-            max_time,
-            file_size_bytes,
-            row_count,
-            compaction_level,
-            created_at,
-            column_set,
-        } = parquet_file_params;
-
         if stage
             .parquet_files
             .iter()
-            .any(|f| f.object_store_id == object_store_id)
+            .any(|f| f.object_store_id == parquet_file_params.object_store_id)
         {
-            return Err(Error::FileExists { object_store_id });
+            return Err(Error::FileExists {
+                object_store_id: parquet_file_params.object_store_id,
+            });
         }
 
-        let parquet_file = ParquetFile {
-            id: ParquetFileId::new(stage.parquet_files.len() as i64 + 1),
-            shard_id,
-            namespace_id,
-            table_id,
-            partition_id,
-            object_store_id,
-            max_sequence_number,
-            min_time,
-            max_time,
-            row_count,
-            to_delete: None,
-            file_size_bytes,
-            compaction_level,
-            created_at,
-            column_set,
-        };
+        let parquet_file = ParquetFile::from_params(
+            parquet_file_params,
+            ParquetFileId::new(stage.parquet_files.len() as i64 + 1),
+        );
+        let compaction_level = parquet_file.compaction_level;
+        let created_at = parquet_file.created_at;
+        let partition_id = parquet_file.partition_id;
         stage.parquet_files.push(parquet_file);
+
+        // Update the new_file_at field its partition to the time of created_at
+        // Only update if the compaction level is not Final which signal more compaction needed
+        if compaction_level < CompactionLevel::Final {
+            let partition = stage
+                .partitions
+                .iter_mut()
+                .find(|p| p.id == partition_id)
+                .ok_or(Error::PartitionNotFound { id: partition_id })?;
+            partition.new_file_at = Some(created_at);
+        }
 
         Ok(stage.parquet_files.last().unwrap().clone())
     }

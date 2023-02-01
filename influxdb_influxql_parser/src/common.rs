@@ -16,6 +16,19 @@ use nom::sequence::{delimited, pair, preceded, terminated};
 use std::fmt::{Display, Formatter};
 use std::ops::{Deref, DerefMut};
 
+/// A error returned when parsing an InfluxQL query, expressions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseError {
+    pub(crate) message: String,
+    pub(crate) pos: usize,
+}
+
+impl Display for ParseError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} at pos {}", self.message, self.pos)
+    }
+}
+
 /// Represents a measurement name as either an identifier or a regular expression.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum MeasurementName {
@@ -435,6 +448,12 @@ impl<T> Deref for OneOrMore<T> {
     }
 }
 
+impl<T> DerefMut for OneOrMore<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.contents
+    }
+}
+
 impl<T: Parser> OneOrMore<T> {
     /// Parse a list of one or more `T`, separated by commas.
     ///
@@ -496,6 +515,12 @@ impl<T> Deref for ZeroOrMore<T> {
 
     fn deref(&self) -> &Self::Target {
         &self.contents
+    }
+}
+
+impl<T> DerefMut for ZeroOrMore<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.contents
     }
 }
 
@@ -835,7 +860,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got.head(), "foo");
         assert_eq!(*got, vec!["foo"]); // deref
-        assert_eq!(format!("{}", got), "foo");
+        assert_eq!(got.to_string(), "foo");
 
         let (_, got) =
             OneOrMoreString::separated_list1("Expects one or more")("foo ,  bar,foobar").unwrap();
@@ -843,7 +868,7 @@ mod tests {
         assert_eq!(got.head(), "foo");
         assert_eq!(got.tail(), vec!["bar", "foobar"]);
         assert_eq!(*got, vec!["foo", "bar", "foobar"]); // deref
-        assert_eq!(format!("{}", got), "foo, bar, foobar");
+        assert_eq!(got.to_string(), "foo, bar, foobar");
 
         // Fallible cases
 
@@ -877,7 +902,7 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got.head().unwrap(), "foo");
         assert_eq!(*got, vec!["foo"]); // deref
-        assert_eq!(format!("{}", got), "foo");
+        assert_eq!(got.to_string(), "foo");
 
         let (_, got) =
             ZeroOrMoreString::separated_list1("Expects one or more")("foo ,  bar,foobar").unwrap();
@@ -885,7 +910,7 @@ mod tests {
         assert_eq!(got.head().unwrap(), "foo");
         assert_eq!(got.tail(), vec!["bar", "foobar"]);
         assert_eq!(*got, vec!["foo", "bar", "foobar"]); // deref
-        assert_eq!(format!("{}", got), "foo, bar, foobar");
+        assert_eq!(got.to_string(), "foo, bar, foobar");
 
         // should not panic
         let got = ZeroOrMoreString::new(vec![]);

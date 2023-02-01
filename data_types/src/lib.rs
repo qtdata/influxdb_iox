@@ -13,6 +13,8 @@
     clippy::dbg_macro
 )]
 
+pub mod sequence_number_set;
+
 use influxdb_line_protocol::FieldValue;
 use observability_deps::tracing::warn;
 use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
@@ -34,6 +36,13 @@ use std::{
     sync::Arc,
 };
 use uuid::Uuid;
+
+/// Magic number to be used shard indices and shard ids in "kafkaless".
+pub const TRANSITION_SHARD_NUMBER: i32 = 1234;
+/// In kafkaless mode all new persisted data uses this shard id.
+pub const TRANSITION_SHARD_ID: ShardId = ShardId::new(TRANSITION_SHARD_NUMBER as i64);
+/// In kafkaless mode all new persisted data uses this shard index.
+pub const TRANSITION_SHARD_INDEX: ShardIndex = ShardIndex::new(TRANSITION_SHARD_NUMBER);
 
 /// Compaction levels
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy, Hash, sqlx::Type)]
@@ -241,7 +250,7 @@ pub enum IngesterMapping {
 }
 
 /// Unique ID for a `Partition`
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, sqlx::Type, sqlx::FromRow)]
 #[sqlx(transparent)]
 pub struct PartitionId(i64);
 
@@ -355,6 +364,12 @@ impl Timestamp {
 impl From<iox_time::Time> for Timestamp {
     fn from(time: iox_time::Time) -> Self {
         Self::new(time.timestamp_nanos())
+    }
+}
+
+impl From<Timestamp> for iox_time::Time {
+    fn from(time: Timestamp) -> iox_time::Time {
+        iox_time::Time::from_timestamp_nanos(time.get())
     }
 }
 
@@ -904,6 +919,9 @@ pub struct Partition {
     ///
     /// If [`None`] no data has been persisted for this partition.
     pub persisted_sequence_number: Option<SequenceNumber>,
+
+    /// The time at which the newest file of the partition is created
+    pub new_file_at: Option<Timestamp>,
 }
 
 impl Partition {
@@ -922,6 +940,7 @@ impl Partition {
 pub struct PartitionParam {
     /// the partition
     pub partition_id: PartitionId,
+    // Remove this shard_id: https://github.com/influxdata/influxdb_iox/issues/6518
     /// the partition's shard
     pub shard_id: ShardId,
     /// the partition's namespace
@@ -1099,9 +1118,35 @@ pub struct ParquetFile {
     /// The columns that are present in the table-wide schema are sorted according to the partition
     /// sort key. The occur in the parquet file according to this order.
     pub column_set: ColumnSet,
+    /// the max of created_at of all L0 files needed for file/chunk ordering for deduplication
+    pub max_l0_created_at: Timestamp,
 }
 
 impl ParquetFile {
+    /// Create new file from given parameters and ID.
+    ///
+    /// [`to_delete`](Self::to_delete) will be set to `None`.
+    pub fn from_params(params: ParquetFileParams, id: ParquetFileId) -> Self {
+        Self {
+            id,
+            shard_id: params.shard_id,
+            namespace_id: params.namespace_id,
+            table_id: params.table_id,
+            partition_id: params.partition_id,
+            object_store_id: params.object_store_id,
+            max_sequence_number: params.max_sequence_number,
+            min_time: params.min_time,
+            max_time: params.max_time,
+            to_delete: None,
+            file_size_bytes: params.file_size_bytes,
+            row_count: params.row_count,
+            compaction_level: params.compaction_level,
+            created_at: params.created_at,
+            column_set: params.column_set,
+            max_l0_created_at: params.max_l0_created_at,
+        }
+    }
+
     /// Estimate the memory consumption of this object and its contents
     pub fn size(&self) -> usize {
         std::mem::size_of_val(self) + self.column_set.size()
@@ -1138,6 +1183,29 @@ pub struct ParquetFileParams {
     pub created_at: Timestamp,
     /// columns in this file.
     pub column_set: ColumnSet,
+    /// the max of created_at of all L0 files
+    pub max_l0_created_at: Timestamp,
+}
+
+impl From<ParquetFile> for ParquetFileParams {
+    fn from(value: ParquetFile) -> Self {
+        Self {
+            shard_id: value.shard_id,
+            namespace_id: value.namespace_id,
+            table_id: value.table_id,
+            partition_id: value.partition_id,
+            object_store_id: value.object_store_id,
+            max_sequence_number: value.max_sequence_number,
+            min_time: value.min_time,
+            max_time: value.max_time,
+            file_size_bytes: value.file_size_bytes,
+            row_count: value.row_count,
+            compaction_level: value.compaction_level,
+            created_at: value.created_at,
+            column_set: value.column_set,
+            max_l0_created_at: value.max_l0_created_at,
+        }
+    }
 }
 
 /// Data for a processed tombstone reference in the catalog.

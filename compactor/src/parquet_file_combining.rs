@@ -356,7 +356,7 @@ impl CompactPlanBuilder {
             ReorgPlanner::new(ctx.child_ctx("ReorgPlanner"))
                 .compact_plan(
                     Arc::from(partition.table.name.clone()),
-                    Arc::clone(&merged_schema),
+                    &merged_schema,
                     query_chunks,
                     sort_key.clone(),
                 )
@@ -384,7 +384,7 @@ impl CompactPlanBuilder {
                 ReorgPlanner::new(ctx.child_ctx("ReorgPlanner"))
                     .compact_plan(
                         Arc::from(partition.table.name.clone()),
-                        Arc::clone(&merged_schema),
+                        &merged_schema,
                         query_chunks,
                         sort_key.clone(),
                     )
@@ -394,7 +394,7 @@ impl CompactPlanBuilder {
                 ReorgPlanner::new(ctx.child_ctx("ReorgPlanner"))
                     .split_plan(
                         Arc::from(partition.table.name.clone()),
-                        Arc::clone(&merged_schema),
+                        &merged_schema,
                         query_chunks,
                         sort_key.clone(),
                         split_times,
@@ -537,7 +537,7 @@ impl CompactPlanBuilder {
         let plan = ReorgPlanner::new(ctx.child_ctx("ReorgPlanner"))
             .compact_plan(
                 Arc::from(partition.table.name.clone()),
-                Arc::clone(&merged_schema),
+                &merged_schema,
                 query_chunks,
                 sort_key.clone(),
             )
@@ -650,9 +650,10 @@ impl CompactPlan {
                         .context(ExecuteCompactPlanSnafu)?;
                     trace!(partition = i, "built result stream for partition");
 
+                    let time_now = time_provider.now();
                     let meta = IoxMetadata {
                         object_store_id: Uuid::new_v4(),
-                        creation_timestamp: time_provider.now(),
+                        creation_timestamp: time_now,
                         shard_id: partition.shard_id(),
                         namespace_id: partition.namespace_id(),
                         namespace_name: partition.namespace.name.clone().into(),
@@ -663,6 +664,7 @@ impl CompactPlan {
                         max_sequence_number,
                         compaction_level: target_level,
                         sort_key: Some(sort_key.clone()),
+                        max_l0_created_at: time_now,
                     };
 
                     debug!(
@@ -769,7 +771,7 @@ fn to_queryable_parquet_chunk(
         .map(|sk| sk.filter_to(&pk, file.partition_id().get()));
     let file = Arc::new(ParquetFile::from(file));
 
-    let parquet_chunk = ParquetChunk::new(Arc::clone(&file), Arc::new(schema), store);
+    let parquet_chunk = ParquetChunk::new(Arc::clone(&file), schema, store);
 
     trace!(
         parquet_file_id=?file.id,
@@ -883,6 +885,7 @@ mod tests {
     use arrow_util::{assert_batches_eq, assert_batches_sorted_eq};
     use data_types::{ColumnType, PartitionParam};
     use iox_tests::util::{TestCatalog, TestParquetFileBuilder, TestTable};
+    use iox_time::SystemProvider;
     use itertools::Itertools;
     use metric::U64HistogramOptions;
     use parquet_file::storage::StorageId;
@@ -972,6 +975,10 @@ mod tests {
                 partition_key: partition.partition.partition_key.clone(),
             });
 
+            let time = SystemProvider::new();
+            let time_60_minutes_ago = time.minutes_ago(60);
+            let time_50_minutes_ago = time.minutes_ago(50);
+
             let lp = vec![
                 "table,tag2=PA,tag3=15 field_int=1601i 30000",
                 "table,tag2=OH,tag3=21 field_int=21i 36000",
@@ -979,7 +986,6 @@ mod tests {
             .join("\n");
             let builder = TestParquetFileBuilder::default()
                 .with_line_protocol(&lp)
-                .with_max_seq(20) // This should be irrelevant because this is a level 1 file
                 .with_compaction_level(CompactionLevel::FileNonOverlapped); // Prev compaction
             let level_1_file = partition.create_parquet_file(builder).await.into();
 
@@ -991,7 +997,7 @@ mod tests {
             .join("\n");
             let builder = TestParquetFileBuilder::default()
                 .with_line_protocol(&lp)
-                .with_max_seq(1);
+                .with_creation_time(time_60_minutes_ago);
             let level_0_max_seq_1 = partition.create_parquet_file(builder).await.into();
 
             let lp = vec![
@@ -1002,7 +1008,7 @@ mod tests {
             .join("\n");
             let builder = TestParquetFileBuilder::default()
                 .with_line_protocol(&lp)
-                .with_max_seq(2);
+                .with_creation_time(time_50_minutes_ago);
             let level_0_max_seq_2 = partition.create_parquet_file(builder).await.into();
 
             let lp = vec![
@@ -1012,7 +1018,6 @@ mod tests {
             .join("\n");
             let builder = TestParquetFileBuilder::default()
                 .with_line_protocol(&lp)
-                .with_max_seq(5) // This should be irrelevant because this is a level 1 file
                 .with_compaction_level(CompactionLevel::FileNonOverlapped); // Prev compaction
             let level_1_with_duplicates = partition.create_parquet_file(builder).await.into();
 

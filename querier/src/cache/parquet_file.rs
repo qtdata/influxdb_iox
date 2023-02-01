@@ -15,7 +15,6 @@ use data_types::{ParquetFile, SequenceNumber, TableId};
 use iox_catalog::interface::Catalog;
 use iox_time::TimeProvider;
 use observability_deps::tracing::debug;
-use parking_lot::RwLock;
 use snafu::{ResultExt, Snafu};
 use std::{collections::HashMap, mem, sync::Arc};
 use trace::span::Span;
@@ -34,19 +33,33 @@ pub enum Error {
     },
 }
 
+type IngesterCounts = Option<Arc<Vec<(Uuid, u64)>>>;
+
 /// Holds catalog information about a parquet file
 #[derive(Debug)]
 pub struct CachedParquetFiles {
     /// Parquet catalog information
     pub files: Arc<Vec<Arc<ParquetFile>>>,
+
+    /// Number of persisted Parquet files per table ID per ingester UUID that ingesters have told
+    /// us about. When a call to `get` includes a number of persisted Parquet files for this table
+    /// and a particular ingester UUID that doesn't match what we've previously seen, the cache
+    /// needs to be expired.
+    ///
+    /// **This list is sorted!**
+    persisted_file_counts_from_ingesters: IngesterCounts,
 }
 
 impl CachedParquetFiles {
-    fn new(parquet_files: Vec<ParquetFile>) -> Self {
+    fn new(
+        parquet_files: Vec<ParquetFile>,
+        persisted_file_counts_from_ingesters: IngesterCounts,
+    ) -> Self {
         let files: Vec<_> = parquet_files.into_iter().map(Arc::new).collect();
 
         Self {
             files: Arc::new(files),
+            persisted_file_counts_from_ingesters,
         }
     }
 
@@ -64,12 +77,14 @@ impl CachedParquetFiles {
         // Note size_of_val is the size of the Arc
         // https://play.rust-lang.org/?version=stable&mode=debug&edition=2021&gist=ae8fee8b4f7f5f013dc01ea1fda165da
 
-        // size of the Arc itself
+        // size of the Arc+(Option+HashMap) itself
         mem::size_of_val(self) +
         // Vec overhead
             mem::size_of_val(self.files.as_ref()) +
         // size of the underlying parquet files
-            self.files.iter().map(|f| f.size()).sum::<usize>()
+            self.files.iter().map(|f| f.size()).sum::<usize>() +
+        // hashmap data
+            self.persisted_file_counts_from_ingesters.as_ref().map(|map| std::mem::size_of_val(map.as_ref()) + map.capacity() * mem::size_of::<(Uuid, u64)>()).unwrap_or_default()
     }
 
     /// Returns the greatest parquet sequence number stored in this cache entry
@@ -82,7 +97,7 @@ type CacheT = Box<
     dyn Cache<
         K = TableId,
         V = Arc<CachedParquetFiles>,
-        GetExtra = ((), Option<Span>),
+        GetExtra = (IngesterCounts, Option<Span>),
         PeekExtra = ((), Option<Span>),
     >,
 >;
@@ -96,12 +111,6 @@ pub struct ParquetFileCache {
 
     /// Handle that allows clearing entries for existing cache entries
     remove_if_handle: RemoveIfHandle<TableId, Arc<CachedParquetFiles>>,
-
-    /// Number of persisted Parquet files per table ID per ingester UUID that ingesters have told
-    /// us about. When a call to `get` includes a number of persisted Parquet files for this table
-    /// and a particular ingester UUID that doesn't match what we've previously seen, the cache
-    /// needs to be expired.
-    persisted_file_counts_from_ingesters: RwLock<HashMap<TableId, HashMap<Uuid, u64>>>,
 }
 
 impl ParquetFileCache {
@@ -114,35 +123,38 @@ impl ParquetFileCache {
         ram_pool: Arc<ResourcePool<RamSize>>,
         testing: bool,
     ) -> Self {
-        let loader = FunctionLoader::new(move |table_id: TableId, _extra: ()| {
+        let loader = FunctionLoader::new(move |table_id: TableId, extra: IngesterCounts| {
             let catalog = Arc::clone(&catalog);
             let backoff_config = backoff_config.clone();
 
             async move {
                 Backoff::new(&backoff_config)
-                    .retry_all_errors("get parquet_files", || async {
-                        // TODO refreshing all parquet files for the
-                        // entire table is likely to be quite wasteful
-                        // for large tables.
-                        //
-                        // Some this code could be more efficeint:
-                        //
-                        // 1. incrementally fetch only NEW parquet
-                        // files that aren't already in the cache
-                        //
-                        // 2. track time ranges needed for queries and
-                        // limit files fetched to what is actually
-                        // needed
-                        let parquet_files: Vec<_> = catalog
-                            .repositories()
-                            .await
-                            .parquet_files()
-                            .list_by_table_not_to_delete(table_id)
-                            .await
-                            .context(CatalogSnafu)?;
+                    .retry_all_errors("get parquet_files", || {
+                        let extra = extra.clone();
+                        async {
+                            // TODO refreshing all parquet files for the
+                            // entire table is likely to be quite wasteful
+                            // for large tables.
+                            //
+                            // Some this code could be more efficeint:
+                            //
+                            // 1. incrementally fetch only NEW parquet
+                            // files that aren't already in the cache
+                            //
+                            // 2. track time ranges needed for queries and
+                            // limit files fetched to what is actually
+                            // needed
+                            let parquet_files: Vec<_> = catalog
+                                .repositories()
+                                .await
+                                .parquet_files()
+                                .list_by_table_not_to_delete(table_id)
+                                .await
+                                .context(CatalogSnafu)?;
 
-                        Ok(Arc::new(CachedParquetFiles::new(parquet_files)))
-                            as std::result::Result<_, Error>
+                            Ok(Arc::new(CachedParquetFiles::new(parquet_files, extra)))
+                                as std::result::Result<_, Error>
+                        }
                     })
                     .await
                     .expect("retry forever")
@@ -181,7 +193,6 @@ impl ParquetFileCache {
         Self {
             cache,
             remove_if_handle,
-            persisted_file_counts_from_ingesters: Default::default(),
         }
     }
 
@@ -221,22 +232,15 @@ impl ParquetFileCache {
         persisted_file_counts_by_ingester_uuid: Option<HashMap<Uuid, u64>>,
         span: Option<Span>,
     ) -> Arc<CachedParquetFiles> {
-        // Make a copy of the information we've stored about the ingesters and the number of files
-        // they've persisted, for the closure to use to decide whether to expire the cache.
-        let stored_counts = self
-            .persisted_file_counts_from_ingesters
-            .read()
-            .get(&table_id)
-            .cloned();
-
-        // Update the stored information with what we've just seen from the ingesters, if anything.
-        if let Some(ingester_counts) = &persisted_file_counts_by_ingester_uuid {
-            self.persisted_file_counts_from_ingesters
-                .write()
-                .entry(table_id)
-                .and_modify(|existing| existing.extend(ingester_counts))
-                .or_insert_with(|| ingester_counts.clone());
-        }
+        let persisted_file_counts_by_ingester_uuid =
+            persisted_file_counts_by_ingester_uuid.map(|map| {
+                let mut entries = map.into_iter().collect::<Vec<_>>();
+                entries.sort();
+                entries.shrink_to_fit();
+                Arc::new(entries)
+            });
+        let persisted_file_counts_by_ingester_uuid_captured =
+            persisted_file_counts_by_ingester_uuid.clone();
 
         self.remove_if_handle
             .remove_if_and_get(
@@ -263,15 +267,23 @@ impl ParquetFileCache {
                         );
 
                         expire
-                    } else if let Some(ingester_counts) = &persisted_file_counts_by_ingester_uuid {
+                    } else if let Some(ingester_counts) =
+                        &persisted_file_counts_by_ingester_uuid_captured
+                    {
                         // If there's new or different information about the ingesters or the
                         // number of files they've persisted, we need to refresh.
-                        new_or_different(stored_counts.as_ref(), ingester_counts)
+                        different(
+                            cached_file
+                                .persisted_file_counts_from_ingesters
+                                .as_ref()
+                                .map(|x| x.as_ref().as_ref()),
+                            ingester_counts,
+                        )
                     } else {
                         false
                     }
                 },
-                ((), span),
+                (persisted_file_counts_by_ingester_uuid, span),
             )
             .await
     }
@@ -283,30 +295,10 @@ impl ParquetFileCache {
     }
 }
 
-fn new_or_different(
-    stored_counts: Option<&HashMap<Uuid, u64>>,
-    ingester_counts: &HashMap<Uuid, u64>,
-) -> bool {
+fn different(stored_counts: Option<&[(Uuid, u64)]>, ingester_counts: &[(Uuid, u64)]) -> bool {
     // If we have some information stored for this table,
     if let Some(stored) = stored_counts {
-        // Go through all the ingester info we just got
-        for (ingester_uuid, ingester_file_count) in ingester_counts {
-            // Look up the value we've stored for this ingester UUID (if any)
-            let stored_file_count = stored.get(ingester_uuid);
-            match stored_file_count {
-                // If we've never seen this UUID before, we need to refresh the cache.
-                None => return true,
-                // If we've seen this UUID before but the file count we have stored is different,
-                // we need to refresh the cache
-                Some(s) if s != ingester_file_count => return true,
-                // Otherwise, the file count is the same and we DON'T need to refresh the cache on
-                // account of this ingester; keep checking the rest.
-                Some(_) => (),
-            }
-        }
-        // If we get to this point, all ingester UUIDs and all counts we just got from the ingester
-        // requests match up, and we don't need to refresh the cache.
-        false
+        ingester_counts != stored
     } else {
         // Otherwise, we've never seen ingester file counts for this table.
         // If the hashmap we got is empty, then we still haven't gotten any information, so we
@@ -399,8 +391,8 @@ mod tests {
         partition.create_parquet_file(builder).await;
         let table_id = table.table.id;
 
-        let single_file_size = 216;
-        let two_file_size = 400;
+        let single_file_size = 232;
+        let two_file_size = 424;
         assert!(single_file_size < two_file_size);
 
         let cache = make_cache(&catalog);
@@ -526,26 +518,14 @@ mod tests {
 
         // Empty metadata again: still use the cache
         cache.get(table_id, None, Some(HashMap::new()), None).await;
-        assert_histogram_metric_count(&catalog.metric_registry, METRIC_NAME, 3);
+        assert_histogram_metric_count(&catalog.metric_registry, METRIC_NAME, 4);
 
         // See a new UUID and not the old one: refresh the cache
         let new_uuid = Uuid::new_v4();
         cache
             .get(table_id, None, Some(HashMap::from([(new_uuid, 1)])), None)
             .await;
-        assert_histogram_metric_count(&catalog.metric_registry, METRIC_NAME, 4);
-
-        // See the "new" UUID *and* the old UUID with the same counts as seen before: still use the
-        // cache
-        cache
-            .get(
-                table_id,
-                None,
-                Some(HashMap::from([(new_uuid, 1), (uuid, 4)])),
-                None,
-            )
-            .await;
-        assert_histogram_metric_count(&catalog.metric_registry, METRIC_NAME, 4);
+        assert_histogram_metric_count(&catalog.metric_registry, METRIC_NAME, 5);
     }
 
     #[tokio::test]

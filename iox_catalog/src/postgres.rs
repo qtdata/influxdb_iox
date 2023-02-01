@@ -680,6 +680,21 @@ WHERE name = $1;
         Ok(Some(namespace))
     }
 
+    async fn delete(&mut self, name: &str) -> Result<()> {
+        // note that there is a uniqueness constraint on the name column in the DB
+        sqlx::query(
+            r#"
+DELETE FROM namespace
+WHERE name = $1;
+        "#,
+        )
+        .bind(name)
+        .execute(&mut self.inner)
+        .await
+        .context(interface::CouldNotDeleteNamespaceSnafu)
+        .map(|_| ())
+    }
+
     async fn update_table_limit(&mut self, name: &str, new_max: i32) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
@@ -1339,6 +1354,26 @@ skipped_at = EXCLUDED.skipped_at;
         Ok(())
     }
 
+    async fn get_in_skipped_compaction(
+        &mut self,
+        partition_id: PartitionId,
+    ) -> Result<Option<SkippedCompaction>> {
+        let rec = sqlx::query_as::<_, SkippedCompaction>(
+            r#"SELECT * FROM skipped_compactions WHERE partition_id = $1;"#,
+        )
+        .bind(partition_id) // $1
+        .fetch_one(&mut self.inner)
+        .await;
+
+        if let Err(sqlx::Error::RowNotFound) = rec {
+            return Ok(None);
+        }
+
+        let skipped_partition_record = rec.map_err(|e| Error::SqlxError { source: e })?;
+
+        Ok(Some(skipped_partition_record))
+    }
+
     async fn list_skipped_compactions(&mut self) -> Result<Vec<SkippedCompaction>> {
         sqlx::query_as::<_, SkippedCompaction>(
             r#"
@@ -1394,6 +1429,41 @@ WHERE id = $2;
         )
         .bind(shards.iter().map(|v| v.get()).collect::<Vec<_>>())
         .bind(n as i64)
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
+    async fn partitions_with_recent_created_files(
+        &mut self,
+        time_in_the_past: Timestamp,
+        max_num_partitions: usize,
+    ) -> Result<Vec<PartitionParam>> {
+        sqlx::query_as(
+            r#"
+            SELECT p.id as partition_id, p.table_id, t.namespace_id, p.shard_id
+            FROM partition p, table_name t
+            WHERE p.new_file_at > $1
+                AND p.table_id = t.id
+            LIMIT $2;
+            "#,
+        )
+        .bind(time_in_the_past) // $1
+        .bind(max_num_partitions as i64) // $2
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
+    async fn partitions_to_compact(&mut self, recent_time: Timestamp) -> Result<Vec<PartitionId>> {
+        sqlx::query_as(
+            r#"
+            SELECT p.id as partition_id
+            FROM partition p
+            WHERE p.new_file_at > $1
+            "#,
+        )
+        .bind(recent_time) // $1
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })
@@ -1619,6 +1689,7 @@ impl ParquetFileRepo for PostgresTxn {
             compaction_level,
             created_at,
             column_set,
+            max_l0_created_at,
         } = parquet_file_params;
 
         let rec = sqlx::query_as::<_, ParquetFile>(
@@ -1626,8 +1697,8 @@ impl ParquetFileRepo for PostgresTxn {
 INSERT INTO parquet_file (
     shard_id, table_id, partition_id, object_store_id,
     max_sequence_number, min_time, max_time, file_size_bytes,
-    row_count, compaction_level, created_at, namespace_id, column_set )
-VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13 )
+    row_count, compaction_level, created_at, namespace_id, column_set, max_l0_created_at )
+VALUES ( $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14 )
 RETURNING *;
         "#,
         )
@@ -1644,6 +1715,7 @@ RETURNING *;
         .bind(created_at) // $11
         .bind(namespace_id) // $12
         .bind(column_set) // $13
+        .bind(max_l0_created_at) // $14
         .fetch_one(&mut self.inner)
         .await
         .map_err(|e| {
@@ -1680,9 +1752,10 @@ RETURNING *;
                 UPDATE parquet_file
                 SET to_delete = $1
                 FROM namespace
-                WHERE retention_period_ns IS NOT NULL
-                AND to_delete IS NULL
-                AND max_time < $1 - retention_period_ns
+                WHERE namespace.retention_period_ns IS NOT NULL
+                AND parquet_file.to_delete IS NULL
+                AND parquet_file.max_time < $1 - namespace.retention_period_ns
+                AND namespace.id = parquet_file.namespace_id
                 RETURNING parquet_file.id;
             "#,
         )
@@ -1706,7 +1779,7 @@ RETURNING *;
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE shard_id = $1
   AND max_sequence_number > $2
@@ -1732,7 +1805,8 @@ SELECT parquet_file.id, parquet_file.shard_id, parquet_file.namespace_id,
        parquet_file.table_id, parquet_file.partition_id, parquet_file.object_store_id,
        parquet_file.max_sequence_number, parquet_file.min_time,
        parquet_file.max_time, parquet_file.to_delete, parquet_file.file_size_bytes,
-       parquet_file.row_count, parquet_file.compaction_level, parquet_file.created_at, parquet_file.column_set
+       parquet_file.row_count, parquet_file.compaction_level, parquet_file.created_at, parquet_file.column_set,
+       parquet_file.max_l0_created_at
 FROM parquet_file
 INNER JOIN table_name on table_name.id = parquet_file.table_id
 WHERE table_name.namespace_id = $1
@@ -1752,7 +1826,7 @@ WHERE table_name.namespace_id = $1
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE table_id = $1 AND to_delete IS NULL;
              "#,
@@ -1812,7 +1886,7 @@ RETURNING id;
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE parquet_file.shard_id = $1
   AND parquet_file.compaction_level = $2
@@ -1839,7 +1913,7 @@ WHERE parquet_file.shard_id = $1
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE parquet_file.shard_id = $1
   AND parquet_file.table_id = $2
@@ -2045,7 +2119,7 @@ LIMIT $4;
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE parquet_file.partition_id = $1
   AND parquet_file.to_delete IS NULL;
@@ -2180,7 +2254,7 @@ WHERE table_id = $1
             r#"
 SELECT id, shard_id, namespace_id, table_id, partition_id, object_store_id,
        max_sequence_number, min_time, max_time, to_delete, file_size_bytes,
-       row_count, compaction_level, created_at, column_set
+       row_count, compaction_level, created_at, column_set, max_l0_created_at
 FROM parquet_file
 WHERE object_store_id = $1;
              "#,
@@ -3078,6 +3152,7 @@ mod tests {
             compaction_level: CompactionLevel::Initial, // level of file of new writes
             created_at: time_now,
             column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+            max_l0_created_at: time_now,
         };
         let f1 = postgres
             .repositories()

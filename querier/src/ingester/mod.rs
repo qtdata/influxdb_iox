@@ -3,10 +3,12 @@ use self::{
     flight_client::{
         Error as FlightClientError, FlightClientImpl, FlightError, IngesterFlightClient,
     },
+    invalidate_on_error::InvalidateOnErrorFlightClient,
     test_util::MockIngesterConnection,
 };
 use crate::cache::{namespace::CachedTable, CatalogCache};
 use arrow::{datatypes::DataType, error::ArrowError, record_batch::RecordBatch};
+use arrow_flight::decode::DecodedPayload;
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig, BackoffError};
 use client_util::connection;
@@ -22,7 +24,6 @@ use generated_types::{
     write_info::merge_responses,
 };
 use influxdb_iox_client::flight::generated_types::IngesterQueryResponseMetadata;
-use iox_arrow_flight::DecodedPayload;
 use iox_query::{
     exec::{stringset::StringSet, IOxSessionContext},
     util::{compute_timenanosecond_min_max, create_basic_summary},
@@ -45,6 +46,7 @@ use uuid::Uuid;
 
 mod circuit_breaker;
 pub(crate) mod flight_client;
+mod invalidate_on_error;
 pub(crate) mod test_util;
 
 #[derive(Debug, Snafu)]
@@ -382,6 +384,7 @@ impl IngesterConnectionImpl {
         open_circuit_after_n_errors: u64,
     ) -> Self {
         let flight_client = Arc::new(FlightClientImpl::new());
+        let flight_client = Arc::new(InvalidateOnErrorFlightClient::new(flight_client));
         let flight_client = Arc::new(CircuitBreakerFlightClient::new(
             flight_client,
             catalog_cache.time_provider(),
@@ -438,6 +441,7 @@ impl IngesterConnectionImpl {
         open_circuit_after_n_errors: u64,
     ) -> Self {
         let flight_client = Arc::new(FlightClientImpl::new());
+        let flight_client = Arc::new(InvalidateOnErrorFlightClient::new(flight_client));
         let flight_client = Arc::new(CircuitBreakerFlightClient::new(
             flight_client,
             catalog_cache.time_provider(),
@@ -513,7 +517,7 @@ async fn execute(
             return Ok(vec![]);
         }
         Err(FlightClientError::Flight {
-            source: FlightError::ArrowFlightError(iox_arrow_flight::FlightError::Tonic(status)),
+            source: FlightError::ArrowFlightError(arrow_flight::error::FlightError::Tonic(status)),
         }) if status.code() == tonic::Code::NotFound => {
             debug!(
                 ingester_address = ingester_address.as_ref(),
@@ -576,13 +580,46 @@ async fn execute(
     decoder.finalize().await
 }
 
+/// Current partition used while decoding the ingester response stream.
+#[derive(Debug)]
+enum CurrentPartition {
+    /// There exists a partition.
+    Some(IngesterPartition),
+
+    /// There is no existing partition.
+    None,
+
+    /// Skip the current partition (e.g. because it is gone from the catalog).
+    Skip,
+}
+
+impl CurrentPartition {
+    fn take(&mut self) -> Option<IngesterPartition> {
+        let mut tmp = Self::None;
+        std::mem::swap(&mut tmp, self);
+
+        match tmp {
+            Self::None | Self::Skip => None,
+            Self::Some(p) => Some(p),
+        }
+    }
+
+    fn is_skip(&self) -> bool {
+        matches!(self, Self::Skip)
+    }
+
+    fn is_some(&self) -> bool {
+        matches!(self, Self::Some(_))
+    }
+}
+
 /// Helper to disassemble the data from the ingester Apache Flight arrow stream.
 ///
 /// This should be used AFTER the stream was drained because we will perform some catalog IO and
 /// this should likely not block the ingester.
 struct IngesterStreamDecoder {
     finished_partitions: HashMap<PartitionId, IngesterPartition>,
-    current_partition: Option<IngesterPartition>,
+    current_partition: CurrentPartition,
     current_chunk: Option<(Schema, Vec<RecordBatch>)>,
     ingester_address: Arc<str>,
     catalog_cache: Arc<CatalogCache>,
@@ -600,7 +637,7 @@ impl IngesterStreamDecoder {
     ) -> Self {
         Self {
             finished_partitions: HashMap::new(),
-            current_partition: None,
+            current_partition: CurrentPartition::None,
             current_chunk: None,
             ingester_address,
             catalog_cache,
@@ -616,8 +653,11 @@ impl IngesterStreamDecoder {
                 .current_partition
                 .take()
                 .expect("Partition should have been checked before chunk creation");
-            self.current_partition =
-                Some(current_partition.try_add_chunk(ChunkId::new(), Arc::new(schema), batches)?);
+            self.current_partition = CurrentPartition::Some(current_partition.try_add_chunk(
+                ChunkId::new(),
+                schema,
+                batches,
+            )?);
         }
 
         Ok(())
@@ -701,6 +741,11 @@ impl IngesterStreamDecoder {
                     )
                     .await;
 
+                let Some(shard_id) = shard_id else {
+                    self.current_partition = CurrentPartition::Skip;
+                    return Ok(())
+                };
+
                 // Use a temporary empty partition sort key. We are going to fetch this AFTER we
                 // know all chunks because then we are able to detect all relevant primary key
                 // columns that the sort key must cover.
@@ -727,9 +772,13 @@ impl IngesterStreamDecoder {
                     None,
                     partition_sort_key,
                 );
-                self.current_partition = Some(partition);
+                self.current_partition = CurrentPartition::Some(partition);
             }
             DecodedPayload::Schema(schema) => {
+                if self.current_partition.is_skip() {
+                    return Ok(());
+                }
+
                 self.flush_chunk()?;
                 ensure!(
                     self.current_partition.is_some(),
@@ -751,6 +800,10 @@ impl IngesterStreamDecoder {
                 self.current_chunk = Some((schema, vec![]));
             }
             DecodedPayload::RecordBatch(batch) => {
+                if self.current_partition.is_skip() {
+                    return Ok(());
+                }
+
                 let current_chunk =
                     self.current_chunk
                         .as_mut()
@@ -1043,7 +1096,7 @@ impl IngesterPartition {
     pub(crate) fn try_add_chunk(
         mut self,
         chunk_id: ChunkId,
-        expected_schema: Arc<Schema>,
+        expected_schema: Schema,
         batches: Vec<RecordBatch>,
     ) -> Result<Self> {
         // ignore chunk if there are no batches
@@ -1059,7 +1112,7 @@ impl IngesterPartition {
         // details)
         let batches = batches
             .into_iter()
-            .map(|batch| ensure_schema(batch, expected_schema.as_ref()))
+            .map(|batch| ensure_schema(batch, &expected_schema))
             .collect::<Result<Vec<RecordBatch>>>()?;
 
         // TODO: may want to ask the Ingester to send this value instead of computing it here.
@@ -1141,7 +1194,7 @@ impl IngesterPartition {
 pub struct IngesterChunk {
     chunk_id: ChunkId,
     partition_id: PartitionId,
-    schema: Arc<Schema>,
+    schema: Schema,
 
     /// Partition-wide sort key.
     partition_sort_key: Option<Arc<SortKey>>,
@@ -1198,9 +1251,9 @@ impl QueryChunkMeta for IngesterChunk {
         Arc::clone(&self.summary)
     }
 
-    fn schema(&self) -> Arc<Schema> {
+    fn schema(&self) -> &Schema {
         trace!(schema=?self.schema, "IngesterChunk schema");
-        Arc::clone(&self.schema)
+        &self.schema
     }
 
     fn partition_sort_key(&self) -> Option<&SortKey> {
@@ -1421,6 +1474,57 @@ mod tests {
     async fn test_flight_no_partitions() {
         let mock_flight_client = Arc::new(
             MockFlightClient::new([("addr1", Ok(MockQueryData { results: vec![] }))]).await,
+        );
+        let ingester_conn = mock_flight_client.ingester_conn().await;
+        let partitions = get_partitions(&ingester_conn, &[1]).await.unwrap();
+        assert!(partitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_flight_unknown_partitions() {
+        let record_batch = lp_to_record_batch("table foo=1 1");
+
+        let schema = record_batch.schema();
+
+        let mock_flight_client = Arc::new(
+            MockFlightClient::new([(
+                "addr1",
+                Ok(MockQueryData {
+                    results: vec![
+                        metadata(
+                            1000,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: Some(11),
+                            }),
+                        ),
+                        metadata(
+                            1001,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: Some(11),
+                            }),
+                        ),
+                        Ok((
+                            DecodedPayload::Schema(Arc::clone(&schema)),
+                            IngesterQueryResponseMetadata::default(),
+                        )),
+                        metadata(
+                            1002,
+                            Some(PartitionStatus {
+                                parquet_max_sequence_number: Some(11),
+                            }),
+                        ),
+                        Ok((
+                            DecodedPayload::Schema(Arc::clone(&schema)),
+                            IngesterQueryResponseMetadata::default(),
+                        )),
+                        Ok((
+                            DecodedPayload::RecordBatch(record_batch),
+                            IngesterQueryResponseMetadata::default(),
+                        )),
+                    ],
+                }),
+            )])
+            .await,
         );
         let ingester_conn = mock_flight_client.ingester_conn().await;
         let partitions = get_partitions(&ingester_conn, &[1]).await.unwrap();
@@ -2011,16 +2115,14 @@ mod tests {
             .await
     }
 
-    fn schema() -> Arc<Schema> {
-        Arc::new(
-            SchemaBuilder::new()
-                .influx_field("bar", InfluxFieldType::Float)
-                .influx_field("baz", InfluxFieldType::Float)
-                .influx_field("foo", InfluxFieldType::Float)
-                .timestamp()
-                .build()
-                .unwrap(),
-        )
+    fn schema() -> Schema {
+        SchemaBuilder::new()
+            .influx_field("bar", InfluxFieldType::Float)
+            .influx_field("baz", InfluxFieldType::Float)
+            .influx_field("foo", InfluxFieldType::Float)
+            .timestamp()
+            .build()
+            .unwrap()
     }
 
     fn lp_to_record_batch(lp: &str) -> RecordBatch {
@@ -2148,6 +2250,10 @@ mod tests {
 
     #[async_trait]
     impl IngesterFlightClient for MockFlightClient {
+        async fn invalidate_connection(&self, _ingester_address: Arc<str>) {
+            // no cache
+        }
+
         async fn query(
             &self,
             ingester_address: Arc<str>,
@@ -2165,7 +2271,7 @@ mod tests {
 
     #[test]
     fn test_ingester_partition_type_cast() {
-        let expected_schema = Arc::new(SchemaBuilder::new().tag("t").timestamp().build().unwrap());
+        let expected_schema = SchemaBuilder::new().tag("t").timestamp().build().unwrap();
 
         let cases = vec![
             // send a batch that matches the schema exactly
@@ -2188,7 +2294,7 @@ mod tests {
                 tombstone_max_sequence_number,
                 None,
             )
-            .try_add_chunk(ChunkId::new(), Arc::clone(&expected_schema), vec![case])
+            .try_add_chunk(ChunkId::new(), expected_schema.clone(), vec![case])
             .unwrap();
 
             for batch in &ingester_partition.chunks[0].batches {
@@ -2199,15 +2305,12 @@ mod tests {
 
     #[test]
     fn test_ingester_partition_fail_type_cast() {
-        let expected_schema = Arc::new(
-            SchemaBuilder::new()
-                .field("b", DataType::Boolean)
-                .unwrap()
-                .timestamp()
-                .build()
-                .unwrap(),
-        );
-
+        let expected_schema = SchemaBuilder::new()
+            .field("b", DataType::Boolean)
+            .unwrap()
+            .timestamp()
+            .build()
+            .unwrap();
         let batch =
             RecordBatch::try_from_iter(vec![("b", int64_array()), ("time", ts_array())]).unwrap();
 
@@ -2223,7 +2326,7 @@ mod tests {
             tombstone_max_sequence_number,
             None,
         )
-        .try_add_chunk(ChunkId::new(), Arc::clone(&expected_schema), vec![batch])
+        .try_add_chunk(ChunkId::new(), expected_schema, vec![batch])
         .unwrap_err();
 
         assert_matches!(err, Error::RecordBatchType { .. });

@@ -17,9 +17,9 @@
 use crate::common::{statement_terminator, ws0};
 use crate::internal::Error as InternalError;
 use crate::statement::{statement, Statement};
+use common::ParseError;
 use nom::combinator::eof;
 use nom::Offset;
-use std::fmt::{Debug, Display, Formatter};
 
 #[cfg(test)]
 mod test_util;
@@ -47,20 +47,6 @@ pub mod statement;
 pub mod string;
 pub mod visit;
 pub mod visit_mut;
-
-/// A error returned when parsing an InfluxQL query using
-/// [`parse_statements`] fails.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ParseError {
-    message: String,
-    pos: usize,
-}
-
-impl Display for ParseError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{} at pos {}", self.message, self.pos)
-    }
-}
 
 /// ParseResult is type that represents the success or failure of parsing
 /// a given input into a set of InfluxQL statements.
@@ -124,26 +110,26 @@ mod test {
     fn test_parse_statements() {
         // Parse a single statement, without a terminator
         let got = parse_statements("SHOW MEASUREMENTS").unwrap();
-        assert_eq!(format!("{}", got.first().unwrap()), "SHOW MEASUREMENTS");
+        assert_eq!(got.first().unwrap().to_string(), "SHOW MEASUREMENTS");
 
         // Parse a single statement, with a terminator
         let got = parse_statements("SHOW MEASUREMENTS;").unwrap();
-        assert_eq!(format!("{}", got[0]), "SHOW MEASUREMENTS");
+        assert_eq!(got[0].to_string(), "SHOW MEASUREMENTS");
 
         // Parse multiple statements with whitespace
         let got = parse_statements("SHOW MEASUREMENTS;\nSHOW MEASUREMENTS LIMIT 1").unwrap();
-        assert_eq!(format!("{}", got[0]), "SHOW MEASUREMENTS");
-        assert_eq!(format!("{}", got[1]), "SHOW MEASUREMENTS LIMIT 1");
+        assert_eq!(got[0].to_string(), "SHOW MEASUREMENTS");
+        assert_eq!(got[1].to_string(), "SHOW MEASUREMENTS LIMIT 1");
 
         // Parse multiple statements with a terminator in quotes, ensuring it is not interpreted as
         // a terminator
         let got =
             parse_statements("SHOW MEASUREMENTS WITH MEASUREMENT = \";\";SHOW DATABASES").unwrap();
         assert_eq!(
-            format!("{}", got[0]),
+            got[0].to_string(),
             "SHOW MEASUREMENTS WITH MEASUREMENT = \";\""
         );
-        assert_eq!(format!("{}", got[1]), "SHOW DATABASES");
+        assert_eq!(got[1].to_string(), "SHOW DATABASES");
 
         // Parses a statement with a comment
         let got = parse_statements(
@@ -151,7 +137,7 @@ mod test {
         )
         .unwrap();
         assert_eq!(
-            format!("{}", got[0]),
+            got[0].to_string(),
             "SELECT idle FROM cpu WHERE host = 'host1'"
         );
 
@@ -161,24 +147,24 @@ mod test {
         )
         .unwrap();
         assert_eq!(
-            format!("{}", got[0]),
+            got[0].to_string(),
             "SELECT idle FROM cpu WHERE host = 'host1'"
         );
-        assert_eq!(format!("{}", got[1]), "SHOW DATABASES");
+        assert_eq!(got[1].to_string(), "SHOW DATABASES");
 
         // Parses statement with inline comment
         let got = parse_statements(r#"SELECT idle FROM cpu WHERE/* time > now() AND */host = 'host1' --GROUP BY host fill(null)"#).unwrap();
         assert_eq!(
-            format!("{}", got[0]),
+            got[0].to_string(),
             "SELECT idle FROM cpu WHERE host = 'host1'"
         );
 
         // Returns error for invalid statement
         let got = parse_statements("BAD SQL").unwrap_err();
-        assert_eq!(format!("{}", got), "invalid SQL statement at pos 0");
+        assert_eq!(got.to_string(), "invalid SQL statement at pos 0");
 
         // Returns error for invalid statement after first
         let got = parse_statements("SHOW MEASUREMENTS;BAD SQL").unwrap_err();
-        assert_eq!(format!("{}", got), "invalid SQL statement at pos 18");
+        assert_eq!(got.to_string(), "invalid SQL statement at pos 18");
     }
 }

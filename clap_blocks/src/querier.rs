@@ -1,8 +1,9 @@
 //! Querier-related configs.
 use data_types::{IngesterMapping, ShardIndex};
+use http::Uri;
 use serde::Deserialize;
 use snafu::{ResultExt, Snafu};
-use std::{collections::HashMap, fs, io, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, fs, io, path::PathBuf, str::FromStr, sync::Arc};
 
 #[derive(Debug, Snafu)]
 #[allow(missing_docs)]
@@ -36,6 +37,15 @@ pub enum Error {
         shard_index: ShardIndex,
         name: Arc<str>,
     },
+
+    #[snafu(display("Could not parse ingester URI `{uri}`: {source}"))]
+    CouldNotParseIngesterUri {
+        uri: String,
+        source: http::uri::InvalidUri,
+    },
+
+    #[snafu(display("Ingester URI `{uri}` is missing {item}"))]
+    IngesterUriMissingItem { uri: Uri, item: &'static str },
 }
 
 /// CLI config for querier configuration
@@ -211,7 +221,7 @@ pub struct QuerierConfig {
     /// "http://10.10.10.1:8083,http://10.10.10.2:8083"
     ///
     /// for multiple addresses.
-    #[clap(long = "ingester-addresses", env = "INFLUXDB_IOX_INGESTER_ADDRESSES")]
+    #[clap(long = "ingester-addresses", env = "INFLUXDB_IOX_INGESTER_ADDRESSES", num_args=1.., value_delimiter = ',')]
     pub ingester_addresses: Vec<String>,
 
     /// Size of the RAM cache used to store catalog metadata information in bytes.
@@ -300,6 +310,9 @@ impl QuerierConfig {
                 Ok(IngesterAddresses::ByShardIndex(map))
             }
         } else if !self.ingester_addresses.is_empty() {
+            self.ingester_addresses
+                .iter()
+                .try_for_each(|uri| validate_uri(uri))?;
             Ok(IngesterAddresses::List(
                 self.ingester_addresses
                     .iter()
@@ -397,6 +410,20 @@ fn deserialize_shard_ingester_map(
     Ok(map)
 }
 
+/// Validate that a URI parses and has a scheme (like "http") and a port.
+fn validate_uri(uri: &str) -> Result<(), Error> {
+    let uri = Uri::from_str(uri).context(CouldNotParseIngesterUriSnafu { uri })?;
+    match (uri.scheme(), uri.port()) {
+        (Some(_), Some(_)) => Ok(()),
+        (None, _) => IngesterUriMissingItemSnafu {
+            uri,
+            item: "scheme",
+        }
+        .fail(),
+        (_, None) => IngesterUriMissingItemSnafu { uri, item: "port" }.fail(),
+    }
+}
+
 /// Ingester addresses.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IngesterAddresses {
@@ -464,6 +491,58 @@ mod tests {
             actual.ingester_addresses().unwrap(),
             IngesterAddresses::None,
         ));
+    }
+
+    #[test]
+    fn test_ingester_addresses_list() {
+        let actual = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--ingester-addresses",
+            "http://ingester-0:8082",
+        ])
+        .unwrap();
+
+        let expected = IngesterAddresses::List(vec!["http://ingester-0:8082".into()]);
+        assert_eq!(actual.ingester_addresses().unwrap(), expected);
+
+        let actual = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--ingester-addresses",
+            "http://ingester-0:8082,http://ingester-1:8082",
+        ])
+        .unwrap();
+
+        let expected = IngesterAddresses::List(vec![
+            "http://ingester-0:8082".into(),
+            "http://ingester-1:8082".into(),
+        ]);
+        assert_eq!(actual.ingester_addresses().unwrap(), expected);
+    }
+
+    #[test]
+    fn bad_ingester_addresses_list() {
+        let actual = QuerierConfig::try_parse_from([
+            "my_binary",
+            "--ingester-addresses",
+            "\\ingester-0:8082",
+        ])
+        .unwrap()
+        .ingester_addresses();
+        assert_error!(actual, Error::CouldNotParseIngesterUri { .. });
+    }
+
+    #[test]
+    fn ingester_addresses_missing_items() {
+        let cases = vec![
+            "ingester-0:8082",   // missing schema
+            "http://ingester-0", // missing port
+        ];
+        for c in &cases {
+            let actual = QuerierConfig::try_parse_from(["my_binary", "--ingester-addresses", c])
+                .unwrap()
+                .ingester_addresses();
+            assert_error!(actual, Error::IngesterUriMissingItem { .. });
+        }
     }
 
     #[test]

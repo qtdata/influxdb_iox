@@ -1,8 +1,9 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use iox_catalog::interface::Catalog;
 use iox_query::{exec::Executor, QueryChunkMeta};
+use metric::{DurationHistogram, DurationHistogramOptions, U64Counter, U64Gauge, DURATION_MAX};
 use observability_deps::tracing::*;
 use parking_lot::Mutex;
 use parquet_file::storage::ParquetStorage;
@@ -14,11 +15,12 @@ use tokio::{
 };
 
 use super::{
-    backpressure::PersistState, context::PersistRequest, queue::PersistQueue,
-    worker::SharedWorkerState,
+    backpressure::PersistState, completion_observer::PersistCompletionObserver,
+    context::PersistRequest, queue::PersistQueue, worker::SharedWorkerState,
 };
 use crate::{
     buffer_tree::partition::{persisting::PersistingData, PartitionData, SortKeyState},
+    ingest_state::IngestState,
     persist::worker,
 };
 
@@ -106,18 +108,18 @@ use crate::{
 /// prevent the generation of new persist tasks on a best-effort basis (for
 /// example; by blocking any further ingest).
 ///
-/// When the persist queue is saturated, the [`PersistState::is_saturated()`]
-/// returns true. Once the backlog of persist jobs is reduced, the
-/// [`PersistState`] is switched back to a healthy state and new persist jobs
-/// may be generated as normal.
+/// When the persist queue is saturated, a call to [`IngestState::read()`]
+/// returns [`IngestStateError::PersistSaturated`]. Once the backlog of persist
+/// jobs is reduced, the [`PersistState`] is switched back to a healthy state
+/// and new persist jobs may be generated as normal.
 ///
 /// For details of the exact saturation detection & recovery logic, see
 /// [`PersistState`].
+///
+/// [`IngestStateError::PersistSaturated`]:
+///     crate::ingest_state::IngestStateError::PersistSaturated
 #[derive(Debug)]
 pub(crate) struct PersistHandle {
-    /// THe state/dependencies shared across all worker tasks.
-    worker_state: Arc<SharedWorkerState>,
-
     /// Task handles for the worker tasks, aborted on drop of all
     /// [`PersistHandle`] instances.
     worker_tasks: Vec<AbortOnDrop<()>>,
@@ -151,20 +153,29 @@ pub(crate) struct PersistHandle {
     /// key, ensuring sort key updates are serialised per-partition.
     worker_queues: JumpHash<mpsc::UnboundedSender<PersistRequest>>,
 
-    /// Records the saturation state of the persist system.
+    /// Marks and recovers the saturation state of the persist system.
     persist_state: Arc<PersistState>,
+
+    /// A counter tracking the number of enqueued into the persist system.
+    enqueued_jobs: U64Counter,
 }
 
 impl PersistHandle {
     /// Initialise a new persist actor & obtain the first handle.
-    pub(crate) fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new<O>(
         n_workers: usize,
         persist_queue_depth: usize,
+        ingest_state: Arc<IngestState>,
         exec: Arc<Executor>,
         store: ParquetStorage,
         catalog: Arc<dyn Catalog>,
+        completion_observer: O,
         metrics: &metric::Registry,
-    ) -> (Self, Arc<PersistState>) {
+    ) -> Self
+    where
+        O: PersistCompletionObserver + 'static,
+    {
         assert_ne!(n_workers, 0, "must run at least 1 persist worker");
         assert_ne!(
             persist_queue_depth, 0,
@@ -178,7 +189,55 @@ impl PersistHandle {
             exec,
             store,
             catalog,
+            completion_observer,
         });
+
+        // Initialise a histogram to capture persist job duration & time spent
+        // in the queue.
+        let persist_duration = metrics
+            .register_metric::<DurationHistogram>(
+                "ingester_persist_active_duration",
+                "the distribution of persist job processing duration in seconds",
+            )
+            .recorder(&[]);
+        let queue_duration = metrics
+            .register_metric_with_options::<DurationHistogram, _>(
+                "ingester_persist_enqueue_duration",
+                "the distribution of duration a persist job spent enqueued, waiting to be processed in seconds",
+                || DurationHistogramOptions::new([
+                    Duration::from_millis(500),
+                    Duration::from_secs(1),
+                    Duration::from_secs(2),
+                    Duration::from_secs(4),
+                    Duration::from_secs(8),
+                    Duration::from_secs(16),
+                    Duration::from_secs(32),
+                    Duration::from_secs(64),
+                    Duration::from_secs(128),
+                    Duration::from_secs(256),
+                    DURATION_MAX,
+                ])
+            )
+            .recorder(&[]);
+
+        // Set the values of static metrics exporting the configured capacity
+        // of the persist system.
+        //
+        // This allows dashboards/alerts to calculate saturation.
+        metrics
+            .register_metric::<U64Gauge>(
+                "ingester_persist_max_parallelism",
+                "the maximum parallelism of persist tasks (number of workers)",
+            )
+            .recorder(&[])
+            .set(n_workers as _);
+        metrics
+            .register_metric::<U64Gauge>(
+                "ingester_persist_max_queue_depth",
+                "the maximum parallelism of persist tasks (number of workers)",
+            )
+            .recorder(&[])
+            .set(persist_queue_depth as _);
 
         // Initialise the global queue.
         //
@@ -199,6 +258,8 @@ impl PersistHandle {
                         worker_state,
                         global_rx.clone(),
                         rx,
+                        queue_duration.clone(),
+                        persist_duration.clone(),
                     ))),
                 )
             })
@@ -213,22 +274,31 @@ impl PersistHandle {
         // Initialise the saturation state as "not saturated" and provide it
         // with the task semaphore and total permit count.
         let persist_state = Arc::new(PersistState::new(
+            ingest_state,
             persist_queue_depth,
             Arc::clone(&sem),
             metrics,
         ));
 
-        (
-            Self {
-                worker_state,
-                sem,
-                global_queue: global_tx,
-                worker_queues: JumpHash::new(tx_handles),
-                worker_tasks,
-                persist_state: Arc::clone(&persist_state),
-            },
+        // Initialise a metric tracking the number of jobs enqueued.
+        //
+        // When combined with the completion count metric, this allows us to
+        // derive the rate of enqueues and the number of outstanding jobs.
+        let enqueued_jobs = metrics
+            .register_metric::<U64Counter>(
+                "ingester_persist_enqueued_jobs",
+                "the number of partition persist tasks enqueued",
+            )
+            .recorder(&[]);
+
+        Self {
+            sem,
+            global_queue: global_tx,
+            worker_queues: JumpHash::new(tx_handles),
+            worker_tasks,
             persist_state,
-        )
+            enqueued_jobs,
+        }
     }
 
     fn assign_worker(&self, r: PersistRequest) {
@@ -281,7 +351,12 @@ impl PersistQueue for PersistHandle {
         let partition_id = data.partition_id().get();
         debug!(partition_id, "enqueuing persistence task");
 
+        // Record a starting timestamp, and increment the number of persist jobs
+        // before waiting on the semaphore - this ensures the difference between
+        // started and completed includes the full count of pending jobs (even
+        // those blocked waiting for queue capacity).
         let enqueued_at = Instant::now();
+        self.enqueued_jobs.inc(1);
 
         // Try and acquire the persist task permit immediately.
         let permit = match Arc::clone(&self.sem).try_acquire_owned() {
@@ -339,7 +414,7 @@ impl PersistQueue for PersistHandle {
         };
 
         // Build the persist task request.
-        let schema = data.schema();
+        let schema = data.schema().clone();
         let (r, notify) = PersistRequest::new(Arc::clone(&partition), data, permit, enqueued_at);
 
         match sort_key {
@@ -388,11 +463,12 @@ impl<T> Drop for AbortOnDrop<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::{sync::Arc, task::Poll, time::Duration};
 
     use assert_matches::assert_matches;
     use data_types::{NamespaceId, PartitionId, PartitionKey, ShardId, TableId};
     use dml::DmlOperation;
+    use futures::Future;
     use iox_catalog::mem::MemCatalog;
     use lazy_static::lazy_static;
     use object_store::memory::InMemory;
@@ -412,6 +488,11 @@ mod tests {
         },
         deferred_load::DeferredLoad,
         dml_sink::DmlSink,
+        ingest_state::IngestStateError,
+        persist::{
+            completion_observer::{mock::MockCompletionObserver, NopObserver},
+            tests::{assert_metric_counter, assert_metric_gauge},
+        },
         test_util::make_write_op,
     };
 
@@ -485,9 +566,16 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
-        let (mut handle, state) =
-            PersistHandle::new(1, 2, Arc::clone(&EXEC), storage, catalog, &metrics);
-        assert!(!state.is_saturated());
+        let mut handle = PersistHandle::new(
+            1,
+            2,
+            Arc::new(IngestState::default()),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            Arc::new(MockCompletionObserver::default()),
+            &metrics,
+        );
 
         // Kill the workers, and replace the queues so we can inspect the
         // enqueue output.
@@ -554,9 +642,16 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
-        let (mut handle, state) =
-            PersistHandle::new(1, 2, Arc::clone(&EXEC), storage, catalog, &metrics);
-        assert!(!state.is_saturated());
+        let mut handle = PersistHandle::new(
+            1,
+            2,
+            Arc::new(IngestState::default()),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            Arc::new(MockCompletionObserver::default()),
+            &metrics,
+        );
 
         // Kill the workers, and replace the queues so we can inspect the
         // enqueue output.
@@ -635,9 +730,16 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
-        let (mut handle, state) =
-            PersistHandle::new(1, 2, Arc::clone(&EXEC), storage, catalog, &metrics);
-        assert!(!state.is_saturated());
+        let mut handle = PersistHandle::new(
+            1,
+            2,
+            Arc::new(IngestState::default()),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            Arc::new(MockCompletionObserver::default()),
+            &metrics,
+        );
 
         // Kill the workers, and replace the queues so we can inspect the
         // enqueue output.
@@ -716,9 +818,16 @@ mod tests {
         let metrics = Arc::new(metric::Registry::default());
         let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
 
-        let (mut handle, state) =
-            PersistHandle::new(1, 2, Arc::clone(&EXEC), storage, catalog, &metrics);
-        assert!(!state.is_saturated());
+        let mut handle = PersistHandle::new(
+            1,
+            2,
+            Arc::new(IngestState::default()),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            Arc::new(MockCompletionObserver::default()),
+            &metrics,
+        );
 
         // Kill the workers, and replace the queues so we can inspect the
         // enqueue output.
@@ -780,5 +889,101 @@ mod tests {
             .try_recv()
             .expect("task should be in global queue");
         assert_eq!(msg.partition_id(), PARTITION_ID);
+    }
+
+    /// A test that a ensures tasks waiting to be enqueued (waiting on the
+    /// semaphore) appear in the metrics.
+    #[tokio::test]
+    async fn test_persist_saturated_enqueue_counter() {
+        let storage = ParquetStorage::new(Arc::new(InMemory::default()), StorageId::from("iox"));
+        let metrics = Arc::new(metric::Registry::default());
+        let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+        let ingest_state = Arc::new(IngestState::default());
+
+        let mut handle = PersistHandle::new(
+            1,
+            1,
+            Arc::clone(&ingest_state),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            NopObserver::default(),
+            &metrics,
+        );
+        assert!(ingest_state.read().is_ok());
+
+        // Kill the workers, and replace the queues so we can inspect the
+        // enqueue output.
+        handle.worker_tasks = vec![];
+
+        let (global_tx, _global_rx) = async_channel::unbounded();
+        handle.global_queue = global_tx;
+
+        let (worker1_tx, _worker1_rx) = mpsc::unbounded_channel();
+        let (worker2_tx, _worker2_rx) = mpsc::unbounded_channel();
+        handle.worker_queues = JumpHash::new([worker1_tx, worker2_tx]);
+
+        // Generate a partition
+        let p = new_partition(
+            PARTITION_ID,
+            SortKeyState::Deferred(Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
+                Some(SortKey::from_columns(["time", "good"]))
+            }))),
+        )
+        .await;
+        let data = p.lock().mark_persisting().unwrap();
+
+        // Enqueue it
+        let _notify1 = handle.enqueue(p, data).await;
+
+        // Generate a second partition
+        let p = new_partition(
+            PARTITION_ID,
+            SortKeyState::Deferred(Arc::new(DeferredLoad::new(Duration::from_secs(1), async {
+                Some(SortKey::from_columns(["time", "good"]))
+            }))),
+        )
+        .await;
+        let data = p.lock().mark_persisting().unwrap();
+
+        // Enqueue it
+        let fut = handle.enqueue(p, data);
+
+        // Poll it to the pending state
+        let waker = futures::task::noop_waker();
+        let mut cx = futures::task::Context::from_waker(&waker);
+        futures::pin_mut!(fut);
+
+        let poll = std::pin::Pin::new(&mut fut).poll(&mut cx);
+        assert_matches!(poll, Poll::Pending);
+
+        // The queue is now full, and the second enqueue above is blocked
+        assert_matches!(ingest_state.read(), Err(IngestStateError::PersistSaturated));
+
+        // And the counter shows two persist ops.
+        assert_metric_counter(&metrics, "ingester_persist_enqueued_jobs", 2);
+    }
+
+    /// Export metrics showing the static config values.
+    #[tokio::test]
+    async fn test_static_config_metrics() {
+        let storage = ParquetStorage::new(Arc::new(InMemory::default()), StorageId::from("iox"));
+        let metrics = Arc::new(metric::Registry::default());
+        let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+        let ingest_state = Arc::new(IngestState::default());
+
+        let _handle = PersistHandle::new(
+            5,
+            42,
+            Arc::clone(&ingest_state),
+            Arc::clone(&EXEC),
+            storage,
+            catalog,
+            NopObserver::default(),
+            &metrics,
+        );
+
+        assert_metric_gauge(&metrics, "ingester_persist_max_parallelism", 5);
+        assert_metric_gauge(&metrics, "ingester_persist_max_queue_depth", 42);
     }
 }

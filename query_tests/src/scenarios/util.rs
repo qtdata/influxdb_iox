@@ -1,5 +1,7 @@
 //! This module contains util functions for testing scenarios
 use super::DbScenario;
+use arrow_flight::decode::DecodedPayload;
+use arrow_flight::decode::FlightDataDecoder;
 use async_trait::async_trait;
 use backoff::BackoffConfig;
 use data_types::{
@@ -9,16 +11,14 @@ use data_types::{
 use dml::{DmlDelete, DmlMeta, DmlOperation, DmlWrite};
 use futures::StreamExt;
 use generated_types::{
-    influxdata::iox::ingester::v1::{IngesterQueryResponseMetadata, PartitionStatus},
-    ingester::IngesterQueryRequest,
+    influxdata::iox::ingester::v1::IngesterQueryResponseMetadata, ingester::IngesterQueryRequest,
 };
 use influxdb_iox_client::flight::Error as FlightError;
 use ingester::{
     data::{DmlApplyAction, IngesterData, Persister},
     lifecycle::mock_handle::MockLifecycleHandle,
-    querier_handler::{prepare_data_to_querier, FlatIngesterQueryResponse, IngesterQueryResponse},
+    querier_handler::{prepare_data_to_querier, IngesterQueryResponse},
 };
-use iox_arrow_flight::DecodedPayload;
 use iox_catalog::interface::get_schema_by_name;
 use iox_query::exec::{DedicatedExecutors, ExecutorType};
 use iox_tests::util::{TestCatalog, TestNamespace, TestShard};
@@ -964,12 +964,17 @@ impl MockIngester {
             catalog.exec(),
             Some(ingester_connection),
             sharder,
+            false,
         ))
     }
 }
 
 #[async_trait]
 impl IngesterFlightClient for MockIngester {
+    async fn invalidate_connection(&self, _ingester_address: Arc<str>) {
+        // no cache
+    }
+
     async fn query(
         &self,
         _ingester_address: Arc<str>,
@@ -997,10 +1002,7 @@ impl IngesterFlightClient for MockIngester {
 /// Helper struct to present [`IngesterQueryResponse`] (produces by the ingester) as a
 /// [`IngesterFlightClientQueryData`] (used by the querier) without doing any real gRPC IO.
 struct QueryDataAdapter {
-    messages: Box<
-        dyn Iterator<Item = Result<(DecodedPayload, IngesterQueryResponseMetadata), FlightError>>
-            + Send,
-    >,
+    inner: FlightDataDecoder,
 }
 
 impl std::fmt::Debug for QueryDataAdapter {
@@ -1011,52 +1013,10 @@ impl std::fmt::Debug for QueryDataAdapter {
 
 impl QueryDataAdapter {
     /// Create new adapter.
-    ///
-    /// This pre-calculates some data structure that we are going to need later.
     async fn new(response: IngesterQueryResponse) -> Self {
-        let mut messages = vec![];
-        let mut stream = response.flatten();
-        while let Some(msg_res) = stream.next().await {
-            match msg_res {
-                Ok(msg) => {
-                    let (msg, md) = match msg {
-                        FlatIngesterQueryResponse::StartPartition {
-                            partition_id,
-                            status,
-                        } => (
-                            DecodedPayload::None,
-                            IngesterQueryResponseMetadata {
-                                partition_id: partition_id.get(),
-                                status: Some(PartitionStatus {
-                                    parquet_max_sequence_number: status
-                                        .parquet_max_sequence_number
-                                        .map(|x| x.get()),
-                                }),
-                                // These fields are only used in ingester2.
-                                ingester_uuid: String::new(),
-                                completed_persistence_count: 0,
-                            },
-                        ),
-                        FlatIngesterQueryResponse::StartSnapshot { schema } => (
-                            DecodedPayload::Schema(schema),
-                            IngesterQueryResponseMetadata::default(),
-                        ),
-                        FlatIngesterQueryResponse::RecordBatch { batch } => (
-                            DecodedPayload::RecordBatch(batch),
-                            IngesterQueryResponseMetadata::default(),
-                        ),
-                    };
-                    messages.push(Ok((msg, md)));
-                }
-                Err(e) => {
-                    messages.push(Err(FlightError::ArrowError(e)));
-                }
-            }
-        }
+        let inner = FlightDataDecoder::new(response.flatten());
 
-        Self {
-            messages: Box::new(messages.into_iter()),
-        }
+        Self { inner }
     }
 }
 
@@ -1065,6 +1025,19 @@ impl IngesterFlightClientQueryData for QueryDataAdapter {
     async fn next_message(
         &mut self,
     ) -> Result<Option<(DecodedPayload, IngesterQueryResponseMetadata)>, FlightError> {
-        self.messages.next().transpose()
+        match self.inner.next().await {
+            None => Ok(None),
+            Some(Ok(data)) => {
+                let arrow_flight::decode::DecodedFlightData { inner, payload } = data;
+                // decode the app metadata
+                let app_metadata = &inner.app_metadata[..];
+                let app_metadata: IngesterQueryResponseMetadata =
+                    prost::Message::decode(app_metadata).unwrap();
+
+                let res = (payload, app_metadata);
+                Ok(Some(res))
+            }
+            Some(Err(e)) => Err(FlightError::ArrowFlightError(e)),
+        }
     }
 }

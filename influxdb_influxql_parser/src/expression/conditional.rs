@@ -1,7 +1,8 @@
-use crate::common::ws0;
+use crate::common::{ws0, ParseError};
 use crate::expression::arithmetic::{
     arithmetic, call_expression, var_ref, ArithmeticParsers, Expr,
 };
+use crate::internal::Error as InternalError;
 use crate::internal::{expect, verify, ParseResult};
 use crate::keywords::keyword;
 use crate::literal::{literal_no_regex, literal_regex, Literal};
@@ -12,10 +13,12 @@ use nom::character::complete::char;
 use nom::combinator::{map, value};
 use nom::multi::many0;
 use nom::sequence::{delimited, preceded, tuple};
+use nom::Offset;
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
+use std::str::FromStr;
 
-/// Represents on of the conditional operators supported by [`ConditionalExpression::Binary`].
+/// Represents one of the conditional operators supported by [`ConditionalExpression::Binary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConditionalOperator {
     /// Represents the `=` operator.
@@ -78,6 +81,17 @@ pub enum ConditionalExpression {
 
     /// Represents a conditional expression enclosed in parenthesis.
     Grouped(Box<ConditionalExpression>),
+}
+
+impl ConditionalExpression {
+    /// Returns the inner arithmetic [`Expr`].
+    pub fn expr(&self) -> Option<&Expr> {
+        if let Self::Expr(expr) = self {
+            Some(expr)
+        } else {
+            None
+        }
+    }
 }
 
 impl Display for ConditionalExpression {
@@ -185,6 +199,70 @@ pub(crate) fn conditional_expression(i: &str) -> ParseResult<&str, ConditionalEx
     disjunction(i)
 }
 
+/// Parse the input completely and return a [`ConditionalExpression`].
+///
+/// All leading and trailing whitespace is consumed. If any input remains after parsing,
+/// an error is returned.
+pub fn parse_conditional_expression(input: &str) -> Result<ConditionalExpression, ParseError> {
+    let mut i: &str = input;
+
+    // Consume whitespace from the input
+    i = match ws0(i) {
+        Ok((i1, _)) => i1,
+        _ => unreachable!("ws0 is infallible"),
+    };
+
+    if i.is_empty() {
+        return Err(ParseError {
+            message: "unexpected eof".into(),
+            pos: 0,
+        });
+    }
+
+    let (mut i, cond) = match conditional_expression(i) {
+        Ok((i1, cond)) => (i1, cond),
+        Err(nom::Err::Failure(InternalError::Syntax {
+            input: pos,
+            message,
+        })) => {
+            return Err(ParseError {
+                message: message.into(),
+                pos: input.offset(pos),
+            })
+        }
+        // any other error indicates an invalid expression
+        Err(_) => {
+            return Err(ParseError {
+                message: "invalid conditional expression".into(),
+                pos: input.offset(i),
+            })
+        }
+    };
+
+    // Consume remaining whitespace from the input
+    i = match ws0(i) {
+        Ok((i1, _)) => i1,
+        _ => unreachable!("ws0 is infallible"),
+    };
+
+    if !i.is_empty() {
+        return Err(ParseError {
+            message: "invalid conditional expression".into(),
+            pos: input.offset(i),
+        });
+    }
+
+    Ok(cond)
+}
+
+impl FromStr for ConditionalExpression {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_conditional_expression(s)
+    }
+}
+
 /// Folds `expr` and `remainder` into a [ConditionalExpression::Binary] tree.
 fn reduce_expr(
     expr: ConditionalExpression,
@@ -233,7 +311,7 @@ impl ArithmeticParsers for ConditionalExpression {
 }
 
 /// Parse an arithmetic expression used by conditional expressions.
-fn arithmetic_expression(i: &str) -> ParseResult<&str, Expr> {
+pub(crate) fn arithmetic_expression(i: &str) -> ParseResult<&str, Expr> {
     arithmetic::<ConditionalExpression>(i)
 }
 
@@ -242,13 +320,29 @@ mod test {
     use super::*;
     use crate::expression::arithmetic::Expr;
     use crate::{
-        assert_expect_error, assert_failure, binary_op, call, cond_op, grouped, regex, unary,
-        var_ref,
+        assert_expect_error, assert_failure, binary_op, call, cond_op, grouped, regex, var_ref,
     };
+    use test_helpers::assert_error;
 
     impl From<Expr> for ConditionalExpression {
         fn from(v: Expr) -> Self {
             Self::Expr(Box::new(v))
+        }
+    }
+
+    impl From<i32> for Box<ConditionalExpression> {
+        fn from(v: i32) -> Self {
+            Self::new(ConditionalExpression::Expr(Box::new(Expr::Literal(
+                (v as i64).into(),
+            ))))
+        }
+    }
+
+    impl From<i64> for Box<ConditionalExpression> {
+        fn from(v: i64) -> Self {
+            Self::new(ConditionalExpression::Expr(Box::new(Expr::Literal(
+                v.into(),
+            ))))
         }
     }
 
@@ -315,7 +409,7 @@ mod test {
         assert_eq!(got, *cond_op!(var_ref!("foo"), Gt, binary_op!(5, Add, 6)));
 
         let (_, got) = conditional_expression("5 <= -6").unwrap();
-        assert_eq!(got, *cond_op!(5, LtEq, unary!(-6)));
+        assert_eq!(got, *cond_op!(5, LtEq, -6));
 
         // simple expressions
         let (_, got) = conditional_expression("true").unwrap();
@@ -330,7 +424,7 @@ mod test {
         assert_eq!(got, *cond_op!(var_ref!("foo"), Gt, binary_op!(5, Add, 6)));
 
         let (_, got) = conditional_expression("5<=-6").unwrap();
-        assert_eq!(got, *cond_op!(5, LtEq, unary!(-6)));
+        assert_eq!(got, *cond_op!(5, LtEq, -6));
 
         // var refs with cast operator
         let (_, got) = conditional_expression("foo::integer = 5").unwrap();
@@ -422,7 +516,50 @@ mod test {
     #[test]
     fn test_display_expr() {
         let (_, e) = conditional_expression("foo = 'test'").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "foo = 'test'");
+        assert_eq!(e.to_string(), "foo = 'test'");
+    }
+
+    #[test]
+    fn test_parse_conditional_expression() {
+        assert_eq!(
+            parse_conditional_expression("a>b").unwrap().to_string(),
+            "a > b"
+        );
+
+        // with leading and trailing whitespace
+        assert_eq!(
+            parse_conditional_expression("  a>b  ").unwrap().to_string(),
+            "a > b"
+        );
+
+        // Fallible cases
+
+        // Expected regular expression
+        assert_error!(parse_conditional_expression("a =~ 'foo'"), ref e @ ParseError { .. } if e.pos == 4);
+
+        // Invalid operator
+        assert_error!(parse_conditional_expression("a ~= /foo/"), ref e @ ParseError { .. } if e.pos == 2);
+    }
+
+    /// Validate the [`FromStr`] implementation for [`ConditionalExpression`].
+    #[test]
+    fn test_conditional_expression_parse() {
+        let cond = " a>b ".parse::<ConditionalExpression>().unwrap();
+        assert_eq!(cond.to_string(), "a > b");
+    }
+
+    #[test]
+    fn test_conditional_expression_expr() {
+        let cond: ConditionalExpression = "a + 1 > b - 2".parse().unwrap();
+        assert!(cond.expr().is_none());
+
+        let cond: ConditionalExpression = "(a + 1 > b - 2)".parse().unwrap();
+        assert!(cond.expr().is_none());
+
+        let cond: ConditionalExpression = "a + 1".parse().unwrap();
+        assert_eq!(cond.expr().unwrap().to_string(), "a + 1");
+
+        let cond: ConditionalExpression = "(a + 1)".parse().unwrap();
+        assert_eq!(cond.expr().unwrap().to_string(), "(a + 1)");
     }
 }

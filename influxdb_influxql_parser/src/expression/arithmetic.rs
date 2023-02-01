@@ -1,6 +1,6 @@
 use crate::common::ws0;
 use crate::identifier::unquoted_identifier;
-use crate::internal::{expect, ParseResult};
+use crate::internal::{expect, Error, ParseError, ParseResult};
 use crate::keywords::keyword;
 use crate::literal::literal_regex;
 use crate::{
@@ -14,7 +14,9 @@ use nom::character::complete::char;
 use nom::combinator::{cut, map, opt, value};
 use nom::multi::{many0, separated_list0};
 use nom::sequence::{delimited, pair, preceded, separated_pair, terminated, tuple};
+use num_traits::cast;
 use std::fmt::{Display, Formatter, Write};
+use std::ops::Neg;
 
 /// An InfluxQL arithmetic expression.
 #[derive(Clone, Debug, PartialEq)]
@@ -66,9 +68,6 @@ pub enum Expr {
     /// A DISTINCT `<identifier>` expression.
     Distinct(Identifier),
 
-    /// Unary operation such as + 5 or - 1h3m
-    UnaryOp(UnaryOperator, Box<Expr>),
-
     /// Function call
     Call {
         /// Represents the name of the function call.
@@ -98,6 +97,12 @@ impl From<Literal> for Expr {
     }
 }
 
+impl From<i64> for Expr {
+    fn from(v: i64) -> Self {
+        Self::Literal(v.into())
+    }
+}
+
 impl From<u64> for Expr {
     fn from(v: u64) -> Self {
         Self::Literal(v.into())
@@ -116,6 +121,18 @@ impl From<u64> for Box<Expr> {
     }
 }
 
+impl From<i64> for Box<Expr> {
+    fn from(v: i64) -> Self {
+        Self::new(v.into())
+    }
+}
+
+impl From<i32> for Box<Expr> {
+    fn from(v: i32) -> Self {
+        Self::new((v as i64).into())
+    }
+}
+
 impl Display for Expr {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -127,7 +144,6 @@ impl Display for Expr {
             }
             Self::BindParameter(v) => write!(f, "{}", v)?,
             Self::Literal(v) => write!(f, "{}", v)?,
-            Self::UnaryOp(op, e) => write!(f, "{}{}", op, e)?,
             Self::Binary { lhs, op, rhs } => write!(f, "{} {} {}", lhs, op, rhs)?,
             Self::Nested(e) => write!(f, "({})", e)?,
             Self::Call { name, args } => {
@@ -175,20 +191,36 @@ impl Display for WildcardType {
 /// InfluxQL only supports casting between [`Self::Float`] and [`Self::Integer`] types.
 ///
 /// [cast]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#cast-operations
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum VarRefDataType {
     /// Represents a 64-bit float.
     Float,
     /// Represents a 64-bit integer.
     Integer,
+    /// Represents a 64-bit unsigned integer.
+    Unsigned,
     /// Represents a UTF-8 string.
     String,
     /// Represents a boolean.
     Boolean,
-    /// Represents a tag.
-    Tag,
     /// Represents a field.
     Field,
+    /// Represents a tag.
+    Tag,
+    /// Represents a timestamp.
+    Timestamp,
+}
+
+impl VarRefDataType {
+    /// Returns true if the receiver is a data type that identifies as a field type.
+    pub fn is_field_type(&self) -> bool {
+        *self < Self::Tag
+    }
+
+    /// Returns true if the receiver is a data type that identifies as a tag type.
+    pub fn is_tag_type(&self) -> bool {
+        *self == Self::Tag
+    }
 }
 
 impl Display for VarRefDataType {
@@ -196,10 +228,12 @@ impl Display for VarRefDataType {
         match self {
             Self::Float => f.write_str("float"),
             Self::Integer => f.write_str("integer"),
+            Self::Unsigned => f.write_str("unsigned"),
             Self::String => f.write_str("string"),
             Self::Boolean => f.write_str("boolean"),
             Self::Tag => f.write_str("tag"),
             Self::Field => f.write_str("field"),
+            Self::Timestamp => f.write_str("timestamp"),
         }
     }
 }
@@ -243,6 +277,58 @@ pub enum BinaryOperator {
     BitwiseXor,
 }
 
+impl BinaryOperator {
+    fn reduce_number<T>(&self, lhs: T, rhs: T) -> T
+    where
+        T: num_traits::NumOps,
+        T: num_traits::identities::Zero,
+    {
+        match self {
+            Self::Add => lhs + rhs,
+            Self::Sub => lhs - rhs,
+            Self::Mul => lhs * rhs,
+            // Divide by zero yields zero per
+            // https://github.com/influxdata/influxql/blob/1ba470371ec093d57a726b143fe6ccbacf1b452b/ast.go#L5216-L5218
+            Self::Div if rhs.is_zero() => T::zero(),
+            Self::Div => lhs / rhs,
+            Self::Mod => lhs % rhs,
+            _ => unreachable!(),
+        }
+    }
+
+    /// Return a value by applying the operation defined by the receiver.
+    pub fn reduce<T: num_traits::int::PrimInt>(&self, lhs: T, rhs: T) -> T {
+        match self {
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => {
+                self.reduce_number(lhs, rhs)
+            }
+            Self::BitwiseAnd => lhs & rhs,
+            Self::BitwiseOr => lhs | rhs,
+            Self::BitwiseXor => lhs ^ rhs,
+        }
+    }
+
+    /// Return a value by applying the operation defined by the receiver or [`None`]
+    /// if the operation is not supported.
+    pub fn try_reduce<T, U>(&self, lhs: T, rhs: U) -> Option<T>
+    where
+        T: num_traits::Float,
+        U: num_traits::NumOps,
+        U: num_traits::NumCast,
+    {
+        match self {
+            Self::Add | Self::Sub | Self::Mul | Self::Div | Self::Mod => Some(self.reduce_number(
+                lhs,
+                match cast(rhs) {
+                    Some(v) => v,
+                    None => return None,
+                },
+            )),
+            _ => None,
+        }
+    }
+}
+
 impl Display for BinaryOperator {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -273,7 +359,46 @@ where
 
     let (i, e) = factor::<T>(i)?;
 
-    Ok((i, Expr::UnaryOp(op, e.into())))
+    // Unary minus is expressed by negating existing literals,
+    // or producing a binary arithmetic expression that multiplies
+    // Expr `e` by -1
+    let e = if op == UnaryOperator::Minus {
+        match e {
+            Expr::Literal(Literal::Float(v)) => Expr::Literal(Literal::Float(v.neg())),
+            Expr::Literal(Literal::Integer(v)) => Expr::Literal(Literal::Integer(v.neg())),
+            Expr::Literal(Literal::Duration(v)) => Expr::Literal(Literal::Duration((v.0.neg()).into())),
+            Expr::Literal(Literal::Unsigned(v)) => {
+                if v == (i64::MAX as u64) + 1 {
+                    // The minimum i64 is parsed as a Literal::Unsigned, as it exceeds
+                    // int64::MAX, so we explicitly handle that case per
+                    // https://github.com/influxdata/influxql/blob/7e7d61973256ffeef4b99edd0a89f18a9e52fa2d/parser.go#L2750-L2755
+                    Expr::Literal(Literal::Integer(i64::MIN))
+                } else {
+                    return Err(nom::Err::Failure(Error::from_message(
+                        i,
+                        "constant overflows signed integer",
+                    )));
+                }
+            },
+            v @ Expr::VarRef { .. } | v @ Expr::Call { .. } | v @ Expr::Nested(..) | v @ Expr::BindParameter(..) => {
+                Expr::Binary {
+                    lhs: Box::new(Expr::Literal(Literal::Integer(-1))),
+                    op: BinaryOperator::Mul,
+                    rhs: Box::new(v),
+                }
+            }
+            _ => {
+                return Err(nom::Err::Failure(Error::from_message(
+                    i,
+                    "unexpected unary expression: expected literal integer, float, duration, field, function or parenthesis",
+                )))
+            }
+        }
+    } else {
+        e
+    };
+
+    Ok((i, e))
 }
 
 /// Parse a parenthesis expression.
@@ -460,7 +585,7 @@ mod test {
     use super::*;
     use crate::literal::literal_no_regex;
     use crate::parameter::parameter;
-    use crate::{assert_expect_error, assert_failure, binary_op, nested, param, unary, var_ref};
+    use crate::{assert_expect_error, assert_failure, binary_op, nested, param, var_ref};
 
     struct TestParsers;
 
@@ -493,33 +618,25 @@ mod test {
         // are nested deeper in the AST.
 
         let (_, got) = arithmetic_expression("5 % -3 | 2").unwrap();
-        assert_eq!(
-            got,
-            binary_op!(binary_op!(5, Mod, unary!(-3)), BitwiseOr, 2)
-        );
+        assert_eq!(got, binary_op!(binary_op!(5, Mod, -3), BitwiseOr, 2));
 
         let (_, got) = arithmetic_expression("-3 | 2 % 5").unwrap();
-        assert_eq!(
-            got,
-            binary_op!(unary!(-3), BitwiseOr, binary_op!(2, Mod, 5))
-        );
+        assert_eq!(got, binary_op!(-3, BitwiseOr, binary_op!(2, Mod, 5)));
 
         let (_, got) = arithmetic_expression("5 % 2 | -3").unwrap();
-        assert_eq!(
-            got,
-            binary_op!(binary_op!(5, Mod, 2), BitwiseOr, unary!(-3))
-        );
+        assert_eq!(got, binary_op!(binary_op!(5, Mod, 2), BitwiseOr, -3));
 
         let (_, got) = arithmetic_expression("2 | -3 % 5").unwrap();
-        assert_eq!(
-            got,
-            binary_op!(2, BitwiseOr, binary_op!(unary!(-3), Mod, 5))
-        );
+        assert_eq!(got, binary_op!(2, BitwiseOr, binary_op!(-3, Mod, 5)));
 
         let (_, got) = arithmetic_expression("5 - -(3 | 2)").unwrap();
         assert_eq!(
             got,
-            binary_op!(5, Sub, unary!(-nested!(binary_op!(3, BitwiseOr, 2))))
+            binary_op!(
+                5,
+                Sub,
+                binary_op!(-1, Mul, nested!(binary_op!(3, BitwiseOr, 2)))
+            )
         );
 
         let (_, got) = arithmetic_expression("2 | 5 % 3").unwrap();
@@ -536,22 +653,35 @@ mod test {
         let (_, got) = arithmetic_expression("5- -(3|2)").unwrap();
         assert_eq!(
             got,
-            binary_op!(5, Sub, unary!(-nested!(binary_op!(3, BitwiseOr, 2))))
+            binary_op!(
+                5,
+                Sub,
+                binary_op!(-1, Mul, nested!(binary_op!(3, BitwiseOr, 2)))
+            )
         );
 
         // whitespace is not significant between unary operators
         let (_, got) = arithmetic_expression("5+-(3|2)").unwrap();
         assert_eq!(
             got,
-            binary_op!(5, Add, unary!(-nested!(binary_op!(3, BitwiseOr, 2))))
+            binary_op!(
+                5,
+                Add,
+                binary_op!(-1, Mul, nested!(binary_op!(3, BitwiseOr, 2)))
+            )
         );
+
+        // Test unary max signed
+        let (_, got) = arithmetic_expression("-9223372036854775808").unwrap();
+        assert_eq!(got, Expr::Literal(Literal::Integer(-9223372036854775808)));
 
         // Fallible cases
 
         // invalid operator / incomplete expression
         assert_failure!(arithmetic_expression("5 || 3"));
-        // TODO: skip until https://github.com/influxdata/influxdb_iox/issues/5663 is implemented
-        // assert_failure!(arithmetic("5+--(3|2)"));
+        assert_failure!(arithmetic_expression("5+--(3|2)"));
+        // exceeds i64::MIN
+        assert_failure!(arithmetic_expression("-9223372036854775809"));
     }
 
     #[test]
@@ -569,7 +699,7 @@ mod test {
         //   * https://github.com/influxdata/influxql/blob/7e7d61973256ffeef4b99edd0a89f18a9e52fa2d/parser.go#L2551
         let (rem, got) = var_ref("db.rp.foo").unwrap();
         assert_eq!(got, var_ref!("db.rp.foo"));
-        assert_eq!(format!("{}", got), r#""db.rp.foo""#);
+        assert_eq!(got.to_string(), r#""db.rp.foo""#);
         assert_eq!(rem, "");
 
         // with cast operator
@@ -601,109 +731,107 @@ mod test {
         // Unquoted
         let (rem, id) = segmented_identifier("part0").unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "part0");
+        assert_eq!(id.to_string(), "part0");
 
         // id.id
         let (rem, id) = segmented_identifier("part1.part0").unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "\"part1.part0\"");
+        assert_eq!(id.to_string(), "\"part1.part0\"");
 
         // id..id
         let (rem, id) = segmented_identifier("part2..part0").unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "\"part2..part0\"");
+        assert_eq!(id.to_string(), "\"part2..part0\"");
 
         // id.id.id
         let (rem, id) = segmented_identifier("part2.part1.part0").unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "\"part2.part1.part0\"");
+        assert_eq!(id.to_string(), "\"part2.part1.part0\"");
 
         // "id"."id".id
         let (rem, id) = segmented_identifier(r#""part 2"."part 1".part0"#).unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "\"part 2.part 1.part0\"");
+        assert_eq!(id.to_string(), "\"part 2.part 1.part0\"");
 
         // Only parses 3 segments
         let (rem, id) = segmented_identifier("part2.part1.part0.foo").unwrap();
         assert_eq!(rem, ".foo");
-        assert_eq!(format!("{}", id), "\"part2.part1.part0\"");
+        assert_eq!(id.to_string(), "\"part2.part1.part0\"");
 
         // Quoted
         let (rem, id) = segmented_identifier("\"part0\"").unwrap();
         assert_eq!(rem, "");
-        assert_eq!(format!("{}", id), "part0");
+        assert_eq!(id.to_string(), "part0");
 
         // Additional test cases, with compatibility proven via https://go.dev/play/p/k2150CJocVl
 
         let (rem, id) = segmented_identifier(r#""part" 2"."part 1".part0"#).unwrap();
         assert_eq!(rem, r#" 2"."part 1".part0"#);
-        assert_eq!(format!("{}", id), "part");
+        assert_eq!(id.to_string(), "part");
 
         let (rem, id) = segmented_identifier(r#""part" 2."part 1".part0"#).unwrap();
         assert_eq!(rem, r#" 2."part 1".part0"#);
-        assert_eq!(format!("{}", id), "part");
+        assert_eq!(id.to_string(), "part");
 
         let (rem, id) = segmented_identifier(r#""part "2"."part 1".part0"#).unwrap();
         assert_eq!(rem, r#"2"."part 1".part0"#);
-        assert_eq!(format!("{}", id), r#""part ""#);
+        assert_eq!(id.to_string(), r#""part ""#);
 
         let (rem, id) = segmented_identifier(r#""part ""2"."part 1".part0"#).unwrap();
         assert_eq!(rem, r#""2"."part 1".part0"#);
-        assert_eq!(format!("{}", id), r#""part ""#);
+        assert_eq!(id.to_string(), r#""part ""#);
     }
 
     #[test]
     fn test_display_expr() {
-        let (_, e) = arithmetic_expression("5 + 51").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "5 + 51");
+        #[track_caller]
+        fn assert_display_expr(input: &str, expected: &str) {
+            let (_, e) = arithmetic_expression(input).unwrap();
+            assert_eq!(e.to_string(), expected);
+        }
 
-        let (_, e) = arithmetic_expression("5 + -10").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "5 + -10");
-
-        let (_, e) = arithmetic_expression("-(5 % 6)").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "-(5 % 6)");
+        assert_display_expr("5 + 51", "5 + 51");
+        assert_display_expr("5 + -10", "5 + -10");
+        assert_display_expr("-(5 % 6)", "-1 * (5 % 6)");
 
         // vary spacing
-        let (_, e) = arithmetic_expression("( 5 + 6 ) * -( 7+ 8)").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "(5 + 6) * -(7 + 8)");
+        assert_display_expr("( 5 + 6 ) * -( 7+ 8)", "(5 + 6) * -1 * (7 + 8)");
 
         // multiple unary and parenthesis
-        let (_, e) = arithmetic_expression("(-(5 + 6) & -+( 7 + 8 ))").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "(-(5 + 6) & -+(7 + 8))");
+        assert_display_expr("(-(5 + 6) & -+( 7 + 8 ))", "(-1 * (5 + 6) & -1 * (7 + 8))");
 
         // unquoted identifier
-        let (_, e) = arithmetic_expression("foo + 5").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "foo + 5");
+        assert_display_expr("foo + 5", "foo + 5");
+
+        // identifier, negated
+        assert_display_expr("-foo + 5", "-1 * foo + 5");
 
         // bind parameter identifier
-        let (_, e) = arithmetic_expression("foo + $0").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "foo + $0");
+        assert_display_expr("foo + $0", "foo + $0");
 
         // quoted identifier
-        let (_, e) = arithmetic_expression(r#""foo" + 'bar'"#).unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, r#"foo + 'bar'"#);
+        assert_display_expr(r#""foo" + 'bar'"#, r#"foo + 'bar'"#);
+
+        // quoted identifier, negated
+        assert_display_expr(r#"-"foo" + 'bar'"#, r#"-1 * foo + 'bar'"#);
+
+        // quoted identifier with spaces, negated
+        assert_display_expr(r#"-"foo bar" + 'bar'"#, r#"-1 * "foo bar" + 'bar'"#);
 
         // Duration
-        let (_, e) = arithmetic_expression("- 6h30m").unwrap();
-        let got = format!("{}", e);
-        assert_eq!(got, "-6h30m");
+        assert_display_expr("6h30m", "6h30m");
+
+        // Negated
+        assert_display_expr("- 6h30m", "-6h30m");
 
         // Validate other expression types
 
-        assert_eq!(format!("{}", Expr::Wildcard(None)), "*");
+        assert_eq!(Expr::Wildcard(None).to_string(), "*");
         assert_eq!(
-            format!("{}", Expr::Wildcard(Some(WildcardType::Field))),
+            Expr::Wildcard(Some(WildcardType::Field)).to_string(),
             "*::field"
         );
-        assert_eq!(format!("{}", Expr::Distinct("foo".into())), "DISTINCT foo");
+        assert_eq!(Expr::Distinct("foo".into()).to_string(), "DISTINCT foo");
 
         // can't parse literal regular expressions as part of an arithmetic expression
         assert_failure!(arithmetic_expression(r#""foo" + /^(no|match)$/"#));
@@ -716,34 +844,30 @@ mod test {
 
     #[test]
     fn test_call() {
+        #[track_caller]
+        fn assert_call(input: &str, expected: &str) {
+            let (_, ex) = call(input).unwrap();
+            assert_eq!(ex.to_string(), expected);
+        }
+
         // These tests validate a `Call` expression and also it's Display implementation.
         // We don't need to validate Expr trees, as we do that in the conditional and arithmetic
         // tests.
 
         // No arguments
-        let (_, ex) = call("FN()").unwrap();
-        let got = format!("{}", ex);
-        assert_eq!(got, "FN()");
+        assert_call("FN()", "FN()");
 
         // Single argument with surrounding whitespace
-        let (_, ex) = call("FN ( 1 )").unwrap();
-        let got = format!("{}", ex);
-        assert_eq!(got, "FN(1)");
+        assert_call("FN ( 1 )", "FN(1)");
 
         // Multiple arguments with varying whitespace
-        let (_, ex) = call("FN ( 1,2\n,3,\t4 )").unwrap();
-        let got = format!("{}", ex);
-        assert_eq!(got, "FN(1, 2, 3, 4)");
+        assert_call("FN ( 1,2\n,3,\t4 )", "FN(1, 2, 3, 4)");
 
         // Arguments as expressions
-        let (_, ex) = call("FN ( 1 + 2, foo, 'bar' )").unwrap();
-        let got = format!("{}", ex);
-        assert_eq!(got, "FN(1 + 2, foo, 'bar')");
+        assert_call("FN ( 1 + 2, foo, 'bar' )", "FN(1 + 2, foo, 'bar')");
 
         // A single regular expression argument
-        let (_, ex) = call("FN ( /foo/ )").unwrap();
-        let got = format!("{}", ex);
-        assert_eq!(got, "FN(/foo/)");
+        assert_call("FN ( /foo/ )", "FN(/foo/)");
 
         // Fallible cases
 
@@ -761,24 +885,101 @@ mod test {
     #[test]
     fn test_var_ref_display() {
         assert_eq!(
-            format!(
-                "{}",
-                Expr::VarRef {
-                    name: "foo".into(),
-                    data_type: None
-                }
-            ),
+            Expr::VarRef {
+                name: "foo".into(),
+                data_type: None
+            }
+            .to_string(),
             "foo"
         );
         assert_eq!(
-            format!(
-                "{}",
-                Expr::VarRef {
-                    name: "foo".into(),
-                    data_type: Some(VarRefDataType::Field)
-                }
-            ),
+            Expr::VarRef {
+                name: "foo".into(),
+                data_type: Some(VarRefDataType::Field)
+            }
+            .to_string(),
             "foo::field"
         );
+    }
+
+    #[test]
+    fn test_var_ref_data_type() {
+        use VarRefDataType::*;
+
+        // Ensure ordering of data types relative to one another.
+
+        assert!(Float < Integer);
+        assert!(Integer < Unsigned);
+        assert!(Unsigned < String);
+        assert!(String < Boolean);
+        assert!(Boolean < Field);
+        assert!(Field < Tag);
+
+        assert!(Float.is_field_type());
+        assert!(Integer.is_field_type());
+        assert!(Unsigned.is_field_type());
+        assert!(String.is_field_type());
+        assert!(Boolean.is_field_type());
+        assert!(Field.is_field_type());
+        assert!(Tag.is_tag_type());
+
+        assert!(!Float.is_tag_type());
+        assert!(!Integer.is_tag_type());
+        assert!(!Unsigned.is_tag_type());
+        assert!(!String.is_tag_type());
+        assert!(!Boolean.is_tag_type());
+        assert!(!Field.is_tag_type());
+        assert!(!Tag.is_field_type());
+    }
+
+    #[test]
+    fn test_binary_operator_reduce() {
+        use BinaryOperator::*;
+
+        //
+        // Integer, Integer
+        //
+
+        // Numeric operations
+        assert_eq!(Add.reduce(10, 2), 12);
+        assert_eq!(Sub.reduce(10, 2), 8);
+        assert_eq!(Mul.reduce(10, 2), 20);
+        assert_eq!(Div.reduce(10, 2), 5);
+        // Divide by zero yields zero
+        assert_eq!(Div.reduce(10, 0), 0);
+        assert_eq!(Mod.reduce(10, 2), 0);
+        // Bitwise operations
+        assert_eq!(BitwiseAnd.reduce(0b1111, 0b1010), 0b1010);
+        assert_eq!(BitwiseOr.reduce(0b0101, 0b1010), 0b1111);
+        assert_eq!(BitwiseXor.reduce(0b1101, 0b1010), 0b0111);
+
+        //
+        // Float, Float
+        //
+
+        assert_eq!(Add.try_reduce(10.0, 2.0).unwrap(), 12.0);
+        assert_eq!(Sub.try_reduce(10.0, 2.0).unwrap(), 8.0);
+        assert_eq!(Mul.try_reduce(10.0, 2.0).unwrap(), 20.0);
+        assert_eq!(Div.try_reduce(10.0, 2.0).unwrap(), 5.0);
+        // Divide by zero yields zero
+        assert_eq!(Div.try_reduce(10.0, 0.0).unwrap(), 0.0);
+        assert_eq!(Mod.try_reduce(10.0, 2.0).unwrap(), 0.0);
+
+        // Bitwise operations
+        assert!(BitwiseAnd.try_reduce(1.0, 1.0).is_none());
+        assert!(BitwiseOr.try_reduce(1.0, 1.0).is_none());
+        assert!(BitwiseXor.try_reduce(1.0, 1.0).is_none());
+
+        //
+        // Float, Integer
+        //
+
+        assert_eq!(Add.try_reduce(10.0, 2).unwrap(), 12.0);
+        assert_eq!(Sub.try_reduce(10.0, 2).unwrap(), 8.0);
+        assert_eq!(Mul.try_reduce(10.0, 2).unwrap(), 20.0);
+        assert_eq!(Div.try_reduce(10.0, 2).unwrap(), 5.0);
+        // Divide by zero yields zero
+        assert_eq!(Div.try_reduce(10.0, 0).unwrap(), 0.0);
+        assert_eq!(Mod.try_reduce(10.0, 2).unwrap(), 0.0);
     }
 }

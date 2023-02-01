@@ -126,6 +126,42 @@ impl catalog_service_server::CatalogService for CatalogService {
 
         Ok(Response::new(response))
     }
+
+    async fn get_parquet_files_by_namespace(
+        &self,
+        request: Request<GetParquetFilesByNamespaceRequest>,
+    ) -> Result<Response<GetParquetFilesByNamespaceResponse>, Status> {
+        let mut repos = self.catalog.repositories().await;
+        let req = request.into_inner();
+
+        let namespace = repos
+            .namespaces()
+            .get_by_name(&req.namespace_name)
+            .await
+            .map_err(|e| Status::unknown(e.to_string()))?
+            .ok_or_else(|| {
+                Status::not_found(format!("Namespace {} not found", req.namespace_name))
+            })?;
+
+        let parquet_files = repos
+            .parquet_files()
+            .list_by_namespace_not_to_delete(namespace.id)
+            .await
+            .map_err(|e| {
+                warn!(
+                    error=%e,
+                    %req.namespace_name,
+                    "failed to get parquet_files for namespace"
+                );
+                Status::not_found(e.to_string())
+            })?;
+
+        let parquet_files: Vec<_> = parquet_files.into_iter().map(to_parquet_file).collect();
+
+        let response = GetParquetFilesByNamespaceResponse { parquet_files };
+
+        Ok(Response::new(response))
+    }
 }
 
 // converts the catalog ParquetFile to protobuf
@@ -146,6 +182,7 @@ fn to_parquet_file(p: data_types::ParquetFile) -> ParquetFile {
         compaction_level: p.compaction_level as i32,
         created_at: p.created_at.get(),
         column_set: p.column_set.iter().map(|id| id.get()).collect(),
+        max_l0_created_at: p.max_l0_created_at.get(),
     }
 }
 
@@ -221,6 +258,7 @@ mod tests {
                 compaction_level: CompactionLevel::Initial,
                 created_at: Timestamp::new(2343),
                 column_set: ColumnSet::new([ColumnId::new(1), ColumnId::new(2)]),
+                max_l0_created_at: Timestamp::new(2343),
             };
             let p2params = ParquetFileParams {
                 object_store_id: Uuid::new_v4(),

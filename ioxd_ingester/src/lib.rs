@@ -26,6 +26,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
 use trace::TraceCollector;
 
 #[derive(Debug, Error)]
@@ -95,6 +96,7 @@ impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterSe
         add_service!(builder, self.server.grpc().flight_service());
         add_service!(builder, self.server.grpc().write_info_service());
         add_service!(builder, self.server.grpc().catalog_service());
+        add_service!(builder, self.server.grpc().persist_service());
 
         serve_builder!(builder);
 
@@ -105,7 +107,8 @@ impl<I: IngestHandler + Sync + Send + Debug + 'static> ServerType for IngesterSe
         self.server.join().await;
     }
 
-    fn shutdown(&self) {
+    fn shutdown(&self, frontend: CancellationToken) {
+        frontend.cancel();
         self.server.shutdown();
     }
 }

@@ -33,14 +33,22 @@ pub struct ChunkAdapter {
 
     /// Metric registry.
     metric_registry: Arc<metric::Registry>,
+
+    /// Use RPC-write path (aka router2/ingester2).
+    rpc_write: bool,
 }
 
 impl ChunkAdapter {
     /// Create new adapter with empty cache.
-    pub fn new(catalog_cache: Arc<CatalogCache>, metric_registry: Arc<metric::Registry>) -> Self {
+    pub fn new(
+        catalog_cache: Arc<CatalogCache>,
+        metric_registry: Arc<metric::Registry>,
+        rpc_write: bool,
+    ) -> Self {
         Self {
             catalog_cache,
             metric_registry,
+            rpc_write,
         }
     }
 
@@ -84,11 +92,7 @@ impl ChunkAdapter {
             .collect();
 
         // Prune on the most basic summary data (timestamps and column names) before trying to fully load the chunks
-        let keeps = match prune_summaries(
-            Arc::clone(&cached_table.schema),
-            &basic_summaries,
-            predicate,
-        ) {
+        let keeps = match prune_summaries(&cached_table.schema, &basic_summaries, predicate) {
             Ok(keeps) => keeps,
             Err(reason) => {
                 // Ignore pruning failures here - the chunk pruner should have already logged them.
@@ -207,7 +211,11 @@ impl ChunkAdapter {
 
         let chunk_id = ChunkId::from(Uuid::from_u128(parquet_file.id.get() as _));
 
-        let order = ChunkOrder::new(parquet_file.max_sequence_number.get());
+        let order = if self.rpc_write {
+            ChunkOrder::new(parquet_file.max_l0_created_at.get())
+        } else {
+            ChunkOrder::new(parquet_file.max_sequence_number.get())
+        };
 
         let meta = Arc::new(QuerierParquetChunkMeta {
             parquet_file_id: parquet_file.id,

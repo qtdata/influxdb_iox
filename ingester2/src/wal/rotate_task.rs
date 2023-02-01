@@ -1,36 +1,10 @@
 use observability_deps::tracing::*;
-use parking_lot::Mutex;
-use std::{fmt::Debug, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use crate::{
-    buffer_tree::partition::PartitionData,
+    partition_iter::PartitionIter,
     persist::{drain_buffer::persist_partitions, queue::PersistQueue},
 };
-
-/// An abstraction over any type that can yield an iterator of (potentially
-/// empty) [`PartitionData`].
-pub trait PartitionIter: Send + Debug {
-    /// Return the set of partitions in `self`.
-    fn partition_iter(&self) -> Box<dyn Iterator<Item = Arc<Mutex<PartitionData>>> + Send>;
-}
-
-impl<T> PartitionIter for Arc<T>
-where
-    T: PartitionIter + Send + Sync,
-{
-    fn partition_iter(&self) -> Box<dyn Iterator<Item = Arc<Mutex<PartitionData>>> + Send> {
-        (**self).partition_iter()
-    }
-}
-
-impl<O> PartitionIter for crate::buffer_tree::BufferTree<O>
-where
-    O: Send + Sync + Debug + 'static,
-{
-    fn partition_iter(&self) -> Box<dyn Iterator<Item = Arc<Mutex<PartitionData>>> + Send> {
-        Box::new(self.partitions())
-    }
-}
 
 /// Rotate the `wal` segment file every `period` duration of time.
 pub(crate) async fn periodic_rotation<T, P>(
@@ -43,6 +17,10 @@ pub(crate) async fn periodic_rotation<T, P>(
     P: PersistQueue + Clone,
 {
     let mut interval = tokio::time::interval(period);
+
+    // The first tick completes immediately. We want to wait one interval before rotating the wal
+    // and persisting for the first time, so tick once outside the loop first.
+    interval.tick().await;
 
     loop {
         interval.tick().await;
@@ -94,6 +72,8 @@ pub(crate) async fn periodic_rotation<T, P>(
         // special code path between "hot partition persist" and "wal rotation
         // persist" - it all works the same way!
         //
+        //      https://github.com/influxdata/influxdb_iox/issues/6566
+        //
         // TODO: this properly as described above.
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -112,7 +92,7 @@ pub(crate) async fn periodic_rotation<T, P>(
         // - a small price to pay for not having to block ingest while the WAL
         // is rotated, all outstanding writes + queries complete, and all then
         // partitions are marked as persisting.
-        persist_partitions(buffer.partition_iter(), persist.clone()).await;
+        persist_partitions(buffer.partition_iter(), &persist).await;
 
         debug!(
             closed_id = %stats.id(),

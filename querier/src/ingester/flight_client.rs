@@ -1,10 +1,14 @@
+use arrow_flight::{
+    decode::{DecodedFlightData, DecodedPayload, FlightDataDecoder},
+    Ticket,
+};
 use async_trait::async_trait;
 use client_util::connection::{self, Connection};
 use futures::StreamExt;
 use generated_types::ingester::IngesterQueryRequest;
 use influxdb_iox_client::flight::generated_types as proto;
-use iox_arrow_flight::{prost::Message, DecodedFlightData, DecodedPayload, FlightDataStream};
 use observability_deps::tracing::{debug, warn};
+use prost::Message;
 use snafu::{ResultExt, Snafu};
 use std::{collections::HashMap, fmt::Debug, ops::DerefMut, sync::Arc};
 use trace::ctx::SpanContext;
@@ -39,11 +43,40 @@ pub enum Error {
     CircuitBroken { ingester_address: String },
 }
 
+impl Error {
+    /// Checks if this is a connection / ingester-state error.
+    ///
+    /// This can lead to cutting the connection or breaking/opening the circuit.
+    pub fn is_upstream_error(&self) -> bool {
+        match self {
+            Self::Flight {
+                source:
+                    _source @ influxdb_iox_client::flight::Error::ArrowFlightError(
+                        arrow_flight::error::FlightError::Tonic(e),
+                    ),
+            } => !matches!(
+                e.code(),
+                tonic::Code::NotFound | tonic::Code::ResourceExhausted
+            ),
+            Self::Connecting { .. } | Self::Handshake { .. } | Self::Flight { .. } => true,
+            // do NOT break circuit for client-side errors
+            Self::CreatingRequest { .. } => false,
+            // circuit broken, not an upstream error
+            Self::CircuitBroken { .. } => false,
+        }
+    }
+}
+
 /// Abstract Flight client interface for Ingester.
 ///
 /// May use an internal connection pool.
 #[async_trait]
 pub trait IngesterFlightClient: Debug + Send + Sync + 'static {
+    /// Invalidate connection to given ingester.
+    ///
+    /// This is a no-op if there is no active connection to the given ingester.
+    async fn invalidate_connection(&self, ingester_address: Arc<str>);
+
     /// Send query to given ingester.
     async fn query(
         &self,
@@ -91,6 +124,14 @@ impl FlightClientImpl {
 
 #[async_trait]
 impl IngesterFlightClient for FlightClientImpl {
+    async fn invalidate_connection(&self, ingester_address: Arc<str>) {
+        let maybe_conn = self.connections.lock().remove(ingester_address.as_ref());
+
+        if let Some(conn) = maybe_conn {
+            conn.close().await;
+        }
+    }
+
     async fn query(
         &self,
         ingester_addr: Arc<str>,
@@ -118,8 +159,12 @@ impl IngesterFlightClient for FlightClientImpl {
         debug!(%ingester_addr, ?request, "Sending request to ingester");
         let request = serialize_ingester_query_request(request)?.encode_to_vec();
 
+        let ticket = Ticket {
+            ticket: request.into(),
+        };
+
         let data_stream = client
-            .do_get(request)
+            .do_get(ticket)
             .await
             // wrap in client error type
             .map_err(FlightError::ArrowFlightError)
@@ -180,7 +225,7 @@ impl SerializeFailureReason {
 
 /// Data that is returned by an ingester gRPC query.
 ///
-/// This is mostly the same as [`FlightDataStream`] but allows mocking in tests
+/// This is mostly the same as [`FlightDataDecoder`] but allows mocking in tests
 #[async_trait]
 pub trait QueryData: Debug + Send + 'static {
     /// Returns the next [`DecodedPayload`] available for this query, or `None` if
@@ -204,7 +249,7 @@ where
 
 #[async_trait]
 // Extracts the ingester metadata from the streaming FlightData
-impl QueryData for FlightDataStream {
+impl QueryData for FlightDataDecoder {
     async fn next_message(
         &mut self,
     ) -> Result<Option<(DecodedPayload, proto::IngesterQueryResponseMetadata)>, FlightError> {
@@ -270,6 +315,14 @@ impl CachedConnection {
             *maybe_connection = Some(connection.clone());
             Ok(connection)
         }
+    }
+
+    /// Close connection
+    async fn close(&self) {
+        let mut maybe_connection = self.maybe_connection.lock().await;
+
+        // dropping the channel seems to be enough to close it.
+        maybe_connection.take();
     }
 }
 

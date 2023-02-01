@@ -171,6 +171,11 @@ pub struct CompactorConfig {
     /// Minutes without any new data before a partition is considered cold
     pub minutes_without_new_writes_to_be_cold: u64,
 
+    /// When select cold partition candidates, partitions with new created files (any level) after
+    /// this threshold will be considered a candidate. However, only partitions without new writes
+    /// after this minutes_without_new_writes_to_be_cold will get compacted  
+    pub cold_partition_candidates_hours_threshold: u64,
+
     /// When querying for partitions with data for hot compaction, how many hours to look
     /// back for a first pass.
     pub hot_compaction_hours_threshold_1: u64,
@@ -184,6 +189,11 @@ pub struct CompactorConfig {
     /// However, we do not want to have that number too large which will cause the high usage of CPU cores
     /// and may also lead to inaccuracy of memory estimation. This number is to cap that.
     pub max_parallel_partitions: u64,
+
+    /// When select warm partition candidates, partitions with new created files (any level) after
+    /// this threshold will be considered a candidate. However, only partitions with many contiguous small
+    /// L1 files will get warm compacted
+    pub warm_partition_candidates_hours_threshold: u64,
 
     /// Upper bound on file size to be counted as "small" for warm compaction.
     pub warm_compaction_small_size_threshold_bytes: i64,

@@ -277,6 +277,21 @@ impl TestCatalog {
             .await
             .unwrap()
     }
+
+    /// Add a partition into skipped compaction
+    pub async fn add_to_skipped_compaction(
+        self: &Arc<Self>,
+        partition_id: PartitionId,
+        reason: &str,
+    ) {
+        let mut repos = self.catalog.repositories().await;
+
+        repos
+            .partitions()
+            .record_skipped_compaction(partition_id, reason, 0, 0, 0, 0, 0)
+            .await
+            .unwrap();
+    }
 }
 
 /// A test namespace
@@ -424,11 +439,7 @@ impl TestTable {
             .collect();
         let schema = table_schema.select_by_names(&selection).unwrap();
 
-        let chunk = ParquetChunk::new(
-            Arc::new(file),
-            Arc::new(schema),
-            self.catalog.parquet_store.clone(),
-        );
+        let chunk = ParquetChunk::new(Arc::new(file), schema, self.catalog.parquet_store.clone());
         chunk
             .parquet_exec_input()
             .read_to_batches(
@@ -608,6 +619,7 @@ impl TestPartition {
             to_delete,
             object_store_id,
             row_count,
+            max_l0_created_at,
         } = builder;
 
         let record_batch = record_batch.expect("A record batch is required");
@@ -624,7 +636,7 @@ impl TestPartition {
         );
         let row_count = record_batch.num_rows();
         assert!(row_count > 0, "Parquet file must have at least 1 row");
-        let (record_batch, sort_key) = sort_batch(record_batch, schema.clone());
+        let (record_batch, sort_key) = sort_batch(record_batch, &schema);
         let record_batch = dedup_batch(record_batch, &sort_key);
 
         let object_store_id = object_store_id.unwrap_or_else(Uuid::new_v4);
@@ -642,6 +654,7 @@ impl TestPartition {
             max_sequence_number,
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key.clone()),
+            max_l0_created_at: Time::from_timestamp_nanos(max_l0_created_at),
         };
         let real_file_size_bytes = create_parquet_file(
             ParquetStorage::new(
@@ -667,6 +680,7 @@ impl TestPartition {
             to_delete,
             object_store_id: Some(object_store_id),
             row_count: None, // will be computed from the record batch again
+            max_l0_created_at,
         };
 
         let result = self.create_parquet_file_catalog_record(builder).await;
@@ -693,6 +707,7 @@ impl TestPartition {
             to_delete,
             object_store_id,
             row_count,
+            max_l0_created_at,
             ..
         } = builder;
 
@@ -733,6 +748,7 @@ impl TestPartition {
             created_at: Timestamp::new(creation_time),
             compaction_level,
             column_set,
+            max_l0_created_at: Timestamp::new(max_l0_created_at),
         };
 
         let mut repos = self.catalog.catalog.repositories().await;
@@ -778,6 +794,7 @@ pub struct TestParquetFileBuilder {
     to_delete: bool,
     object_store_id: Option<Uuid>,
     row_count: Option<usize>,
+    max_l0_created_at: i64,
 }
 
 impl Default for TestParquetFileBuilder {
@@ -796,6 +813,7 @@ impl Default for TestParquetFileBuilder {
             to_delete: false,
             object_store_id: None,
             row_count: None,
+            max_l0_created_at: 1,
         }
     }
 }
@@ -849,6 +867,12 @@ impl TestParquetFileBuilder {
     /// Specify the creation time for the parquet file metadata.
     pub fn with_creation_time(mut self, creation_time: iox_time::Time) -> Self {
         self.creation_time = creation_time.timestamp_nanos();
+        self
+    }
+
+    /// specify max creation time of all L0 this file was created from
+    pub fn with_max_l0_created_at(mut self, time: iox_time::Time) -> Self {
+        self.max_l0_created_at = time.timestamp_nanos();
         self
     }
 
@@ -961,6 +985,14 @@ pub struct TestParquetFile {
     pub size_override: Option<i64>,
 }
 
+impl From<TestParquetFile> for ParquetFile {
+    fn from(tpf: TestParquetFile) -> Self {
+        let TestParquetFile { parquet_file, .. } = tpf;
+
+        parquet_file
+    }
+}
+
 impl TestParquetFile {
     /// Make the parquet file deletable
     pub async fn flag_for_delete(&self) {
@@ -974,7 +1006,7 @@ impl TestParquetFile {
     }
 
     /// Get Parquet file schema.
-    pub async fn schema(&self) -> Arc<Schema> {
+    pub async fn schema(&self) -> Schema {
         let table_schema = self.table.catalog_schema().await;
         let column_id_lookup = table_schema.column_id_map();
         let selection: Vec<_> = self
@@ -984,7 +1016,7 @@ impl TestParquetFile {
             .map(|id| *column_id_lookup.get(id).unwrap())
             .collect();
         let table_schema: Schema = table_schema.clone().try_into().unwrap();
-        Arc::new(table_schema.select_by_names(&selection).unwrap())
+        table_schema.select_by_names(&selection).unwrap()
     }
 }
 
@@ -1018,9 +1050,9 @@ pub fn now() -> Time {
 }
 
 /// Sort arrow record batch into arrow record batch and sort key.
-fn sort_batch(record_batch: RecordBatch, schema: Schema) -> (RecordBatch, SortKey) {
+fn sort_batch(record_batch: RecordBatch, schema: &Schema) -> (RecordBatch, SortKey) {
     // calculate realistic sort key
-    let sort_key = compute_sort_key(&schema, std::iter::once(&record_batch));
+    let sort_key = compute_sort_key(schema, std::iter::once(&record_batch));
 
     // set up sorting
     let mut sort_columns = Vec::with_capacity(record_batch.num_columns());

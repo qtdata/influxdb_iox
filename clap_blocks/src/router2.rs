@@ -1,5 +1,7 @@
 //! CLI config for the router using the RPC write path
 
+use std::{num::ParseIntError, time::Duration};
+
 /// CLI config for the router using the RPC write path
 #[derive(Debug, Clone, clap::Parser)]
 #[allow(missing_copy_implementations)]
@@ -34,7 +36,9 @@ pub struct Router2Config {
     #[clap(
         long = "ingester-addresses",
         env = "INFLUXDB_IOX_INGESTER_ADDRESSES",
-        required = true
+        required = true,
+        num_args=1..,
+        value_delimiter = ','
     )]
     pub ingester_addresses: Vec<String>,
 
@@ -78,4 +82,31 @@ pub struct Router2Config {
         action
     )]
     pub namespace_autocreation_enabled: bool,
+
+    /// A "strftime" format string used to derive the partition key from the row
+    /// timestamps.
+    ///
+    /// Changing this from the default value is experimental.
+    #[clap(
+        long = "partition-key-pattern",
+        env = "INFLUXDB_IOX_PARTITION_KEY_PATTERN",
+        default_value = "%Y-%m-%d",
+        action
+    )]
+    pub partition_key_pattern: String,
+
+    /// Specify the timeout in seconds for a single RPC write request to an
+    /// ingester.
+    #[clap(
+        long = "rpc-write-timeout-seconds",
+        env = "INFLUXDB_IOX_RPC_WRITE_TIMEOUT_SECONDS",
+        default_value = "3",
+        value_parser = parse_duration
+    )]
+    pub rpc_write_timeout_seconds: Duration,
+}
+
+/// Map a string containing an integer number of seconds into a [`Duration`].
+fn parse_duration(input: &str) -> Result<Duration, ParseIntError> {
+    input.parse().map(Duration::from_secs)
 }

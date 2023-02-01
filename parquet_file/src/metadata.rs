@@ -86,6 +86,7 @@
 //! [Apache Parquet]: https://parquet.apache.org/
 //! [Apache Thrift]: https://thrift.apache.org/
 //! [Thrift Compact Protocol]: https://github.com/apache/thrift/blob/master/doc/specs/thrift-compact-protocol.md
+use base64::{prelude::BASE64_STANDARD, Engine};
 use bytes::Bytes;
 use data_types::{
     ColumnId, ColumnSet, ColumnSummary, CompactionLevel, InfluxDbType, NamespaceId,
@@ -296,17 +297,24 @@ pub struct IoxMetadata {
 
     /// Sort key of this chunk
     pub sort_key: Option<SortKey>,
+
+    /// Max timestamp of creation timestamp of L0 files
+    /// If this metadata is for an L0 file, this value will be the same as the `creation_timestamp`
+    /// If this metadata is for an L1/L2 file, this value will be the max of all L0 files
+    ///  that are compacted into this file
+    pub max_l0_created_at: Time,
 }
 
 impl IoxMetadata {
     /// Convert to base64 encoded protobuf format
     pub fn to_base64(&self) -> std::result::Result<String, prost::EncodeError> {
-        Ok(base64::encode(self.to_protobuf()?))
+        Ok(BASE64_STANDARD.encode(self.to_protobuf()?))
     }
 
     /// Read from base64 encoded protobuf format
     pub fn from_base64(proto_base64: &[u8]) -> Result<Self> {
-        let proto_bytes = base64::decode(proto_base64)
+        let proto_bytes = BASE64_STANDARD
+            .decode(proto_base64)
             .map_err(|err| Box::new(err) as _)
             .context(IoxMetadataBrokenSnafu)?;
 
@@ -339,6 +347,7 @@ impl IoxMetadata {
             max_sequence_number: self.max_sequence_number.get(),
             sort_key,
             compaction_level: self.compaction_level as i32,
+            max_l0_created_at: Some(self.max_l0_created_at.date_time().into()),
         };
 
         let mut buf = Vec::new();
@@ -357,6 +366,8 @@ impl IoxMetadata {
         // extract creation timestamp
         let creation_timestamp =
             decode_timestamp_from_field(proto_msg.creation_timestamp, "creation_timestamp")?;
+        let max_l0_created_at =
+            decode_timestamp_from_field(proto_msg.max_l0_created_at, "max_l0_created_at")?;
 
         // extract strings
         let namespace_name = Arc::from(proto_msg.namespace_name.as_ref());
@@ -393,6 +404,7 @@ impl IoxMetadata {
                     compaction_level: proto_msg.compaction_level,
                 },
             )?,
+            max_l0_created_at,
         })
     }
 
@@ -414,6 +426,7 @@ impl IoxMetadata {
             max_sequence_number: SequenceNumber::new(1),
             compaction_level: CompactionLevel::Initial,
             sort_key: None,
+            max_l0_created_at: Time::from_timestamp_nanos(creation_timestamp_ns),
         }
     }
 
@@ -501,6 +514,7 @@ impl IoxMetadata {
             row_count: row_count.try_into().expect("row count overflows i64"),
             created_at: Timestamp::from(self.creation_timestamp),
             column_set: ColumnSet::new(columns),
+            max_l0_created_at: Timestamp::from(self.max_l0_created_at),
         }
     }
 
@@ -760,7 +774,7 @@ impl DecodedIoxParquetMetaData {
     }
 
     /// Read IOx schema from parquet metadata.
-    pub fn read_schema(&self) -> Result<Arc<Schema>> {
+    pub fn read_schema(&self) -> Result<Schema> {
         let file_metadata = self.md.file_metadata();
 
         let arrow_schema = parquet_to_arrow_schema(
@@ -776,10 +790,9 @@ impl DecodedIoxParquetMetaData {
         // as this metadata will vary from file to file
         let arrow_schema_ref = Arc::new(arrow_schema.with_metadata(Default::default()));
 
-        let schema: Schema = arrow_schema_ref
+        arrow_schema_ref
             .try_into()
-            .context(IoxFromArrowFailureSnafu {})?;
-        Ok(Arc::new(schema))
+            .context(IoxFromArrowFailureSnafu {})
     }
 
     /// Read IOx statistics (including timestamp range) from parquet metadata.
@@ -1000,9 +1013,11 @@ mod tests {
 
         let sort_key = SortKeyBuilder::new().with_col("sort_col").build();
 
+        let create_time = Time::from_timestamp(3234, 0).unwrap();
+
         let iox_metadata = IoxMetadata {
             object_store_id,
-            creation_timestamp: Time::from_timestamp(3234, 0).unwrap(),
+            creation_timestamp: create_time,
             namespace_id: NamespaceId::new(2),
             namespace_name: Arc::from("hi"),
             shard_id: ShardId::new(1),
@@ -1013,6 +1028,7 @@ mod tests {
             max_sequence_number: SequenceNumber::new(6),
             compaction_level: CompactionLevel::Initial,
             sort_key: Some(sort_key),
+            max_l0_created_at: create_time,
         };
 
         let proto = iox_metadata.to_protobuf().unwrap();
@@ -1037,6 +1053,7 @@ mod tests {
             max_sequence_number: SequenceNumber::new(11),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
+            max_l0_created_at: Time::from_timestamp_nanos(42),
         };
 
         let array = StringArray::from_iter([Some("bananas")]);

@@ -52,6 +52,18 @@ pub enum UploadError {
     Upload(#[from] object_store::Error),
 }
 
+impl From<UploadError> for DataFusionError {
+    fn from(value: UploadError) -> Self {
+        match value {
+            UploadError::Serialise(e) => {
+                Self::Context(String::from("serialize"), Box::new(e.into()))
+            }
+            UploadError::Metadata(e) => Self::External(Box::new(e)),
+            UploadError::Upload(e) => Self::ObjectStore(e),
+        }
+    }
+}
+
 /// ID for an object store hooked up into DataFusion.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct StorageId(&'static str);
@@ -121,10 +133,9 @@ impl ParquetExecInput {
             projection: None,
             limit: None,
             table_partition_cols: vec![],
-            // TODO avoid this `copied_config` when config_options are directly available on context
-            config_options: session_ctx.copied_config().config_options(),
             // Parquet files ARE actually sorted but we don't care here since we just construct a `collect` plan.
             output_ordering: None,
+            infinite_source: false,
         };
         let exec = ParquetExec::new(base_config, None, None);
         let exec_schema = exec.schema();
@@ -566,6 +577,7 @@ mod tests {
             max_sequence_number: SequenceNumber::new(11),
             compaction_level: CompactionLevel::FileNonOverlapped,
             sort_key: None,
+            max_l0_created_at: Time::from_timestamp_nanos(42),
         }
     }
 
