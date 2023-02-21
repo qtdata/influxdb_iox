@@ -70,16 +70,15 @@ mod tests {
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use schema::SchemaBuilder;
 
-    use crate::{
-        components::parquet_file_sink::mock::MockParquetFileSink, test_util::partition_info,
-    };
+    use crate::components::parquet_file_sink::mock::MockParquetFileSink;
+    use crate::test_utils::PartitionInfoBuilder;
 
     use super::*;
 
     #[test]
     fn test_display() {
         let sink = DedicatedExecParquetFileSinkWrapper::new(
-            MockParquetFileSink::new(),
+            MockParquetFileSink::new(true),
             Arc::new(Executor::new_testing()),
         );
         assert_eq!(sink.to_string(), "dedicated_exec(mock)",)
@@ -88,7 +87,7 @@ mod tests {
     #[tokio::test]
     async fn test_panic() {
         let sink = DedicatedExecParquetFileSinkWrapper::new(
-            MockParquetFileSink::new(),
+            MockParquetFileSink::new(true),
             Arc::new(Executor::new_testing()),
         );
         let schema = SchemaBuilder::new().build().unwrap().as_arrow();
@@ -96,7 +95,7 @@ mod tests {
             Arc::clone(&schema),
             futures::stream::once(async move { panic!("foo") }),
         ));
-        let partition = partition_info();
+        let partition = Arc::new(PartitionInfoBuilder::new().build());
         let level = CompactionLevel::FileNonOverlapped;
         let max_l0_created_at = Time::from_timestamp_nanos(0);
         let err = sink

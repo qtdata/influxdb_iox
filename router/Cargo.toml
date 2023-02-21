@@ -22,13 +22,13 @@ metric = { path = "../metric" }
 mutable_batch = { path = "../mutable_batch" }
 mutable_batch_lp = { path = "../mutable_batch_lp" }
 mutable_batch_pb = { version = "0.1.0", path = "../mutable_batch_pb" }
-object_store = "0.5.2"
+object_store = "0.5.4"
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 predicate = { path = "../predicate" }
 schema = { version = "0.1.0", path = "../schema" }
 serde = "1.0"
-serde_json = "1.0.91"
+serde_json = "1.0.93"
 serde_urlencoded = "0.7"
 service_grpc_catalog = { path = "../service_grpc_catalog"}
 service_grpc_namespace = { path = "../service_grpc_namespace"}

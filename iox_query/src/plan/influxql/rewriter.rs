@@ -24,7 +24,7 @@ use std::ops::{ControlFlow, Deref};
 fn parse_regex(re: &Regex) -> Result<regex::Regex> {
     let pattern = clean_non_meta_escapes(re.as_str());
     regex::Regex::new(&pattern).map_err(|e| {
-        DataFusionError::External(format!("invalid regular expression '{}': {}", re, e).into())
+        DataFusionError::External(format!("invalid regular expression '{re}': {e}").into())
     })
 }
 
@@ -359,7 +359,7 @@ fn rewrite_field_list(
                     match args.first() {
                         Some(Expr::Wildcard(Some(WildcardType::Tag))) => {
                             return Err(DataFusionError::External(
-                                format!("unable to use tag as wildcard in {}()", name).into(),
+                                format!("unable to use tag as wildcard in {name}()").into(),
                             ));
                         }
                         Some(Expr::Wildcard(_)) => {
@@ -471,7 +471,7 @@ fn rewrite_field_list_aliases(field_list: &mut FieldList) -> Result<()> {
                 Some(count) => {
                     let mut count = *count;
                     loop {
-                        let resolved_name = format!("{}_{}", name, count);
+                        let resolved_name = format!("{name}_{count}");
                         if column_aliases.contains_key(resolved_name.as_str()) {
                             count += 1;
                         } else {
@@ -625,6 +625,22 @@ mod test {
             "SELECT usage_idle::float AS usage_idle FROM cpu GROUP BY host, region"
         );
 
+        // Does not include tags in projection when expanded in GROUP BY
+        let stmt = parse_select("SELECT * FROM cpu GROUP BY *");
+        let stmt = rewrite_statement(&namespace, &stmt).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY host, region"
+        );
+
+        // Does include explicitly listed tags in projection
+        let stmt = parse_select("SELECT host, * FROM cpu GROUP BY *");
+        let stmt = rewrite_statement(&namespace, &stmt).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT host::tag AS host, usage_idle::float AS usage_idle, usage_system::float AS usage_system, usage_user::float AS usage_user FROM cpu GROUP BY host, region"
+        );
+
         // Fallible
 
         // Invalid regex
@@ -728,6 +744,20 @@ mod test {
         assert_eq!(
             stmt.to_string(),
             "SELECT SUM(field_f64::float) AS SUM_field_f64, SUM(field_i64::integer) AS SUM_field_i64, SUM(shared_field0::float) AS SUM_shared_field0 FROM temp_01"
+        );
+
+        let stmt = parse_select("SELECT * FROM merge_00, merge_01");
+        let stmt = rewrite_statement(&namespace, &stmt).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT col0::float AS col0, col0::tag AS col0_1, col1::float AS col1, col1::tag AS col1_1, col2::string AS col2, col3::string AS col3 FROM merge_00, merge_01"
+        );
+
+        let stmt = parse_select("SELECT /col0/ FROM merge_00, merge_01");
+        let stmt = rewrite_statement(&namespace, &stmt).unwrap();
+        assert_eq!(
+            stmt.to_string(),
+            "SELECT col0::float AS col0, col0::tag AS col0_1 FROM merge_00, merge_01"
         );
 
         // Fallible cases

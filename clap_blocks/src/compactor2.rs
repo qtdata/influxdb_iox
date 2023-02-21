@@ -1,13 +1,35 @@
 //! CLI config for compactor2-related commands
 
-use std::num::NonZeroUsize;
+use std::{fmt::Display, num::NonZeroUsize};
+
+use clap::ValueEnum;
+
+/// Algorithm version used by the compactor
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum)]
+pub enum CompactorAlgoVersion {
+    // Note: clap only keeps the first line for the help text, so try to be brief.
+    /// Compacts all files of a partition in single DataFusion job, prone to reject "too large" partitions. Default.
+    #[default]
+    AllAtOnce,
+
+    /// Repeat to compact to higher level until reaching the highest level. NOT yet ready for production
+    TargetLevel,
+}
+
+impl Display for CompactorAlgoVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
 
 /// CLI config for compactor2
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Compactor2Config {
     /// Number of partitions that should be compacted in parallel.
     ///
-    /// This should usually be larger than the compaction job concurrency since one partition can spawn multiple compaction jobs.
+    /// This should usually be larger than the compaction job
+    /// concurrency since one partition can spawn multiple compaction
+    /// jobs.
     #[clap(
         long = "compaction-partition-concurrency",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_CONCURRENCY",
@@ -18,7 +40,8 @@ pub struct Compactor2Config {
 
     /// Number of concurrent compaction jobs.
     ///
-    /// This should usually be smaller than the partition concurrency since one partition can spawn multiple compaction jobs.
+    /// This should usually be smaller than the partition concurrency
+    /// since one partition can spawn multiple compaction jobs.
     #[clap(
         long = "compaction-job-concurrency",
         env = "INFLUXDB_IOX_COMPACTION_JOB_CONCURRENCY",
@@ -27,7 +50,8 @@ pub struct Compactor2Config {
     )]
     pub compaction_job_concurrency: NonZeroUsize,
 
-    /// Number of jobs PER PARTITION that move files in and out of the scratchpad.
+    /// Number of jobs PER PARTITION that move files in and out of the
+    /// scratchpad.
     #[clap(
         long = "compaction-partition-scratchpad-concurrency",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_SCRATCHPAD_CONCURRENCY",
@@ -36,7 +60,8 @@ pub struct Compactor2Config {
     )]
     pub compaction_partition_scratchpad_concurrency: NonZeroUsize,
 
-    /// Partitions with recent created files these last minutes are selected for compaction.
+    /// The compactor will only consider compacting partitions that
+    /// have new parquet files created within this many minutes.
     #[clap(
         long = "compaction_partition_minute_threshold",
         env = "INFLUXDB_IOX_COMPACTION_PARTITION_MINUTE_THRESHOLD",
@@ -45,7 +70,8 @@ pub struct Compactor2Config {
     )]
     pub compaction_partition_minute_threshold: u64,
 
-    /// Number of threads to use for the compactor query execution, compaction and persistence.
+    /// Number of threads to use for the compactor query execution,
+    /// compaction and persistence.
     #[clap(
         long = "query-exec-thread-count",
         env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
@@ -54,10 +80,12 @@ pub struct Compactor2Config {
     )]
     pub query_exec_thread_count: usize,
 
-    /// Size of memory pool used during query exec, in bytes.
+    /// Size of memory pool used during compaction plan execution, in
+    /// bytes.
     ///
-    /// If queries attempt to allocate more than this many bytes
-    /// during execution, they will error with "ResourcesExhausted".
+    /// If compaction plans attempt to allocate more than this many
+    /// bytes during execution, they will error with
+    /// "ResourcesExhausted".
     #[clap(
         long = "exec-mem-pool-bytes",
         env = "INFLUXDB_IOX_EXEC_MEM_POOL_BYTES",
@@ -67,17 +95,19 @@ pub struct Compactor2Config {
     pub exec_mem_pool_bytes: usize,
 
     /// Desired max size of compacted parquet files.
-    /// It is a target desired value, rather than a guarantee.
-    /// 1024 * 1024 * 25 =  26,214,400 (25MB)
+    ///
+    /// Note this is a target desired value, rather than a guarantee.
+    /// 1024 * 1024 * 100 =  104,857,600
     #[clap(
         long = "compaction-max-desired-size-bytes",
         env = "INFLUXDB_IOX_COMPACTION_MAX_DESIRED_FILE_SIZE_BYTES",
-        default_value = "26214400",
+        default_value = "104857600",
         action
     )]
     pub max_desired_file_size_bytes: u64,
 
     /// Percentage of desired max file size.
+    ///
     /// If the estimated compacted result is too small, no need to split it.
     /// This percentage is to determine how small it is:
     ///    < percentage_max_file_size * max_desired_file_size_bytes:
@@ -149,18 +179,33 @@ pub struct Compactor2Config {
     )]
     pub ignore_partition_skip_marker: bool,
 
-    /// Maximum number of input files per partition. If there are more files, we ignore the partition (for now) as a
-    /// self-protection mechanism.
+    /// Maximum number of files that the compactor will try and
+    /// compact in a single plan.
+    ///
+    /// The higher this setting is the fewer compactor plans are run
+    /// and thus fewer resources over time are consumed by the
+    /// compactor. Increasing this setting also increases the peak
+    /// memory used for each compaction plan, and thus if it is set
+    /// too high, the compactor plans may exceed available memory.
     #[clap(
-        long = "compaction-max-input-files-per-partition",
-        env = "INFLUXDB_IOX_COMPACTION_MAX_INPUT_FILES_PER_PARTITION",
+        long = "compaction-max-num-files-per-plan",
+        env = "INFLUXDB_IOX_COMPACTION_MAX_NUM_FILES_PER_PLAN",
         default_value = "200",
         action
     )]
-    pub max_input_files_per_partition: usize,
+    pub max_num_files_per_plan: usize,
 
-    /// Maximum input bytes (in parquet) per partition. If there is more data, we ignore the partition (for now) as a
-    /// self-protection mechanism.
+    /// Maximum input bytes (in parquet) per partition that the
+    /// compactor will attempt to compact in any one plan.
+    ///
+    /// In the worst case, if the sum of the sizes of all parquet
+    /// files in a partition is greater than this value, the compactor
+    /// may not try to compact this partition. Under normal operation,
+    /// the compactor compacts a subset of files in a partition but in
+    /// some cases it may need to compact them all.
+    ///
+    /// This setting is a self protection mechanism, and it is
+    /// expected to be removed in future versions
     #[clap(
         long = "compaction-max-input-parquet-bytes-per-partition",
         env = "INFLUXDB_IOX_COMPACTION_MAX_INPUT_PARQUET_BYTES_PER_PARTITION",
@@ -190,4 +235,64 @@ pub struct Compactor2Config {
         action
     )]
     pub shard_id: Option<usize>,
+
+    /// Version of the compaction algorithm.
+    #[clap(
+        long = "compaction-compact-version",
+        env = "INFLUXDB_IOX_COMPACTION_COMPACT_VERSION",
+        default_value_t = CompactorAlgoVersion::default(),
+        value_enum
+    )]
+    pub compact_version: CompactorAlgoVersion,
+
+    /// Minimum number of L1 files to compact to L2.
+    ///
+    /// If there are more than this many L1 (by definition non
+    /// overlapping) files in a partition, the compactor will compact
+    /// them together into one or more larger L2 files.
+    ///
+    /// Setting this value higher in general results in fewer overall
+    /// resources spent on compaction but more files per partition (and
+    /// thus less optimal compression and query performance).
+    #[clap(
+        long = "compaction-min-num-l1-files-to-compact",
+        env = "INFLUXDB_IOX_COMPACTION_MIN_NUM_L1_FILES_TO_COMPACT",
+        default_value = "10",
+        action
+    )]
+    pub min_num_l1_files_to_compact: usize,
+
+    /// Only process all discovered partitions once.
+    ///
+    /// By default the compactor will continuously loop over all
+    /// partitions looking for work. Setting this option results in
+    /// exiting the loop after the one iteration.
+    #[clap(
+        long = "compaction-process-once",
+        env = "INFLUXDB_IOX_COMPACTION_PROCESS_ONCE",
+        action
+    )]
+    pub process_once: bool,
+
+    /// Compact all partitions found in the catalog, no matter if/when
+    /// they received writes.
+    #[clap(
+        long = "compaction-process-all-partitions",
+        env = "INFLUXDB_IOX_COMPACTION_PROCESS_ALL_PARTITIONS",
+        action
+    )]
+    pub process_all_partitions: bool,
+
+    /// Maximum number of columns in a table of a partition that
+    /// will be able to considered to get compacted
+    ///
+    /// If a table has more than this many columns, the compactor will
+    /// not compact it, to avoid large memory use.
+    #[clap(
+        long = "compaction-max-num-columns-per-table",
+        env = "INFLUXDB_IOX_COMPACTION_MAX_NUM_COLUMNS_PER_TABLE",
+        default_value = "10000",
+        action
+    )]
+    pub max_num_columns_per_table: usize,
 }

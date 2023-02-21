@@ -57,6 +57,16 @@ pub enum CompactionLevel {
     Final = 2,
 }
 
+impl Display for CompactionLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Initial => write!(f, "CompactionLevel::L0"),
+            Self::FileNonOverlapped => write!(f, "CompactionLevel::L1"),
+            Self::Final => write!(f, "CompactionLevel::L2"),
+        }
+    }
+}
+
 impl TryFrom<i32> for CompactionLevel {
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -77,7 +87,30 @@ impl CompactionLevel {
         match self {
             Self::Initial => Self::FileNonOverlapped,
             Self::FileNonOverlapped => Self::Final,
-            _ => Self::Final,
+            Self::Final => Self::Final,
+        }
+    }
+
+    /// Return previous level
+    pub fn prev(&self) -> Self {
+        match self {
+            Self::Initial => Self::Initial,
+            Self::FileNonOverlapped => Self::Initial,
+            Self::Final => Self::FileNonOverlapped,
+        }
+    }
+
+    /// Returns all levels
+    pub fn all() -> &'static [Self] {
+        &[Self::Initial, Self::FileNonOverlapped, Self::Final]
+    }
+
+    /// Static name
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Initial => "L0",
+            Self::FileNonOverlapped => "L1",
+            Self::Final => "L2",
         }
     }
 }
@@ -110,7 +143,7 @@ pub struct TopicId(i64);
 
 #[allow(missing_docs)]
 impl TopicId {
-    pub fn new(v: i64) -> Self {
+    pub const fn new(v: i64) -> Self {
         Self(v)
     }
     pub fn get(&self) -> i64 {
@@ -464,6 +497,8 @@ pub struct Namespace {
     pub max_tables: i32,
     /// The maximum number of columns per table in this namespace
     pub max_columns_per_table: i32,
+    /// When this file was marked for deletion.
+    pub deleted_at: Option<Timestamp>,
 }
 
 /// Schema collection for a namespace. This is an in-memory object useful for a schema
@@ -480,6 +515,8 @@ pub struct NamespaceSchema {
     pub tables: BTreeMap<String, TableSchema>,
     /// the number of columns per table this namespace allows
     pub max_columns_per_table: usize,
+    /// The maximum number of tables permitted in this namespace.
+    pub max_tables: usize,
     /// The retention period in ns.
     /// None represents infinite duration (i.e. never drop data).
     pub retention_period_ns: Option<i64>,
@@ -492,6 +529,7 @@ impl NamespaceSchema {
         topic_id: TopicId,
         query_pool_id: QueryPoolId,
         max_columns_per_table: i32,
+        max_tables: i32,
         retention_period_ns: Option<i64>,
     ) -> Self {
         Self {
@@ -500,6 +538,7 @@ impl NamespaceSchema {
             topic_id,
             query_pool_id,
             max_columns_per_table: max_columns_per_table as usize,
+            max_tables: max_tables as usize,
             retention_period_ns,
         }
     }
@@ -579,6 +618,11 @@ impl TableSchema {
     /// column names to determine whether a write would exceed the max allowed columns.
     pub fn column_names(&self) -> BTreeSet<&str> {
         self.columns.keys().map(|name| name.as_str()).collect()
+    }
+
+    /// Return number of columns of the table
+    pub fn column_count(&self) -> usize {
+        self.columns.len()
     }
 }
 
@@ -692,7 +736,7 @@ impl std::fmt::Display for ColumnType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = self.as_str();
 
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -835,11 +879,8 @@ impl From<&str> for PartitionKey {
     }
 }
 
-impl<DB> sqlx::Type<DB> for PartitionKey
-where
-    DB: sqlx::Database<TypeInfo = sqlx::postgres::PgTypeInfo>,
-{
-    fn type_info() -> DB::TypeInfo {
+impl sqlx::Type<sqlx::Postgres> for PartitionKey {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
         // Store this type as VARCHAR
         sqlx::postgres::PgTypeInfo::with_name("VARCHAR")
     }
@@ -860,6 +901,31 @@ impl sqlx::Decode<'_, sqlx::Postgres> for PartitionKey {
     ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
         Ok(Self(
             <String as sqlx::Decode<sqlx::Postgres>>::decode(value)?.into(),
+        ))
+    }
+}
+
+impl sqlx::Type<sqlx::Sqlite> for PartitionKey {
+    fn type_info() -> sqlx::sqlite::SqliteTypeInfo {
+        <String as sqlx::Type<sqlx::Sqlite>>::type_info()
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Sqlite> for PartitionKey {
+    fn encode_by_ref(
+        &self,
+        buf: &mut <sqlx::Sqlite as sqlx::database::HasArguments<'_>>::ArgumentBuffer,
+    ) -> sqlx::encode::IsNull {
+        <String as sqlx::Encode<sqlx::Sqlite>>::encode(self.0.to_string(), buf)
+    }
+}
+
+impl sqlx::Decode<'_, sqlx::Sqlite> for PartitionKey {
+    fn decode(
+        value: <sqlx::Sqlite as sqlx::database::HasValueRef<'_>>::ValueRef,
+    ) -> Result<Self, Box<dyn std::error::Error + 'static + Send + Sync>> {
+        Ok(Self(
+            <String as sqlx::Decode<sqlx::Sqlite>>::decode(value)?.into(),
         ))
     }
 }
@@ -1152,6 +1218,11 @@ impl ParquetFile {
         std::mem::size_of_val(self) + self.column_set.size()
             - std::mem::size_of_val(&self.column_set)
     }
+
+    /// Return true if the time range overlaps with the time range of the given file
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.min_time <= other.max_time && self.max_time >= other.min_time
+    }
 }
 
 /// Data for a parquet file to be inserted into the catalog.
@@ -1374,7 +1445,7 @@ impl DeletePredicate {
             if !out.is_empty() {
                 write!(&mut out, " AND ").expect("writing to a string shouldn't fail");
             }
-            write!(&mut out, "{}", expr).expect("writing to a string shouldn't fail");
+            write!(&mut out, "{expr}").expect("writing to a string shouldn't fail");
         }
         out
     }
@@ -1763,9 +1834,7 @@ impl ColumnSummary {
         let total_count = self.total_count();
         assert!(
             total_count <= len,
-            "trying to shrink column stats from {} to {}",
-            total_count,
-            len
+            "trying to shrink column stats from {total_count} to {len}"
         );
         let delta = len - total_count;
         self.stats.update_for_nulls(delta);
@@ -2363,7 +2432,7 @@ pub struct TimestampMinMax {
 impl TimestampMinMax {
     /// Create a new TimestampMinMax. Panics if min > max.
     pub fn new(min: i64, max: i64) -> Self {
-        assert!(min <= max, "expected min ({}) <= max ({})", min, max);
+        assert!(min <= max, "expected min ({min}) <= max ({max})");
         Self { min, max }
     }
 
@@ -2415,13 +2484,13 @@ mod tests {
         // Random chunk IDs use UUID-format
         let id_random = ChunkId::new();
         let inner: Uuid = id_random.get();
-        assert_eq!(format!("{:?}", id_random), format!("ChunkId({})", inner));
-        assert_eq!(format!("{}", id_random), format!("ChunkId({})", inner));
+        assert_eq!(format!("{id_random:?}"), format!("ChunkId({inner})"));
+        assert_eq!(format!("{id_random}"), format!("ChunkId({inner})"));
 
         // Deterministic IDs use integer format
         let id_test = ChunkId::new_test(42);
-        assert_eq!(format!("{:?}", id_test), "ChunkId(42)");
-        assert_eq!(format!("{}", id_test), "ChunkId(42)");
+        assert_eq!(format!("{id_test:?}"), "ChunkId(42)");
+        assert_eq!(format!("{id_test}"), "ChunkId(42)");
     }
 
     #[test]
@@ -3346,7 +3415,7 @@ mod tests {
         ];
 
         for (name, range) in cases {
-            println!("case: {}", name);
+            println!("case: {name}");
             assert!(!range.contains(i64::MIN));
             assert!(!range.contains(i64::MIN + 1));
             assert!(range.contains(MIN_NANO_TIME));
@@ -3457,6 +3526,7 @@ mod tests {
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([]),
             max_columns_per_table: 4,
+            max_tables: 42,
             retention_period_ns: None,
         };
         let schema2 = NamespaceSchema {
@@ -3465,6 +3535,7 @@ mod tests {
             query_pool_id: QueryPoolId::new(3),
             tables: BTreeMap::from([(String::from("foo"), TableSchema::new(TableId::new(1)))]),
             max_columns_per_table: 4,
+            max_tables: 42,
             retention_period_ns: None,
         };
         assert!(schema1.size() < schema2.size());

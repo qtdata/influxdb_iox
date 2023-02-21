@@ -318,21 +318,20 @@ async fn do_read_filter_test(
     let expected_frames: Vec<String> = expected_frames.into_iter().map(|s| s.to_string()).collect();
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     let line_protocol = input_lines.join("\n");
     StepTest::new(
         &mut cluster,
         vec![
             Step::WriteLineProtocol(line_protocol),
-            Step::WaitForReadable,
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 let request_builder = request_builder.clone();
                 let expected_frames = expected_frames.clone();
                 async move {
                     let mut storage_client = state.cluster().querier_storage_client();
 
-                    println!("Sending read_filter request with {:#?}", request_builder);
+                    println!("Sending read_filter request with {request_builder:#?}");
 
                     let read_filter_request =
                         request_builder.source(state.cluster()).build_read_filter();
@@ -342,8 +341,7 @@ async fn do_read_filter_test(
 
                     assert_eq!(
                         expected_frames, actual_frames,
-                        "\n\nExpected:\n{:#?}\n\nActual:\n{:#?}\n\n",
-                        expected_frames, actual_frames,
+                        "\n\nExpected:\n{expected_frames:#?}\n\nActual:\n{actual_frames:#?}\n\n",
                     );
                 }
                 .boxed()

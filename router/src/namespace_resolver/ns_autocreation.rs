@@ -149,7 +149,7 @@ mod tests {
 
     use assert_matches::assert_matches;
     use data_types::{Namespace, NamespaceId, NamespaceSchema};
-    use iox_catalog::mem::MemCatalog;
+    use iox_catalog::{interface::SoftDeletedRows, mem::MemCatalog};
 
     use super::*;
     use crate::{
@@ -176,6 +176,7 @@ mod tests {
                 query_pool_id: QueryPoolId::new(3),
                 tables: Default::default(),
                 max_columns_per_table: 4,
+                max_tables: 42,
                 retention_period_ns: None,
             },
         );
@@ -205,7 +206,7 @@ mod tests {
         assert!(
             repos
                 .namespaces()
-                .get_by_name(ns.as_str())
+                .get_by_name(ns.as_str(), SoftDeletedRows::ExcludeDeleted)
                 .await
                 .expect("lookup should not error")
                 .is_none(),
@@ -240,7 +241,7 @@ mod tests {
         let mut repos = catalog.repositories().await;
         let got = repos
             .namespaces()
-            .get_by_name(ns.as_str())
+            .get_by_name(ns.as_str(), SoftDeletedRows::ExcludeDeleted)
             .await
             .expect("lookup should not error")
             .expect("creation request should be sent to catalog");
@@ -256,6 +257,7 @@ mod tests {
                 max_tables: iox_catalog::DEFAULT_MAX_TABLES,
                 max_columns_per_table: iox_catalog::DEFAULT_MAX_COLUMNS_PER_TABLE,
                 retention_period_ns: TEST_RETENTION_PERIOD_NS,
+                deleted_at: None,
             }
         );
     }
@@ -287,7 +289,13 @@ mod tests {
 
         // Make double-sure it wasn't created in the catalog
         let mut repos = catalog.repositories().await;
-        assert_matches!(repos.namespaces().get_by_name(ns.as_str()).await, Ok(None));
+        assert_matches!(
+            repos
+                .namespaces()
+                .get_by_name(ns.as_str(), SoftDeletedRows::ExcludeDeleted)
+                .await,
+            Ok(None)
+        );
     }
 
     #[tokio::test]

@@ -15,7 +15,8 @@
 
 use crate::interface::{ColumnTypeMismatchSnafu, Error, RepoCollection, Result, Transaction};
 use data_types::{
-    ColumnType, NamespaceSchema, QueryPool, Shard, ShardId, ShardIndex, TableSchema, TopicMetadata,
+    ColumnType, NamespaceSchema, QueryPool, Shard, ShardId, ShardIndex, TableSchema, TopicId,
+    TopicMetadata,
 };
 use mutable_batch::MutableBatch;
 use std::{
@@ -25,11 +26,12 @@ use std::{
 use thiserror::Error;
 
 const SHARED_TOPIC_NAME: &str = "iox-shared";
+const SHARED_TOPIC_ID: TopicId = TopicId::new(1);
 const SHARED_QUERY_POOL: &str = SHARED_TOPIC_NAME;
 const TIME_COLUMN: &str = "time";
 
 /// Default per-namespace table count service protection limit.
-pub const DEFAULT_MAX_TABLES: i32 = 10_000;
+pub const DEFAULT_MAX_TABLES: i32 = 500;
 /// Default per-table column count service protection limit.
 pub const DEFAULT_MAX_COLUMNS_PER_TABLE: i32 = 200;
 /// Default retention period for data in the catalog.
@@ -40,6 +42,7 @@ pub mod interface;
 pub mod mem;
 pub mod metrics;
 pub mod postgres;
+pub mod sqlite;
 
 /// An [`crate::interface::Error`] scoped to a single table for schema validation errors.
 #[derive(Debug, Error)]
@@ -236,7 +239,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::interface::get_schema_by_name;
+    use crate::interface::{get_schema_by_name, SoftDeletedRows};
     use crate::mem::MemCatalog;
 
     // Generate a test that simulates multiple, sequential writes in `lp` and
@@ -279,6 +282,7 @@ mod tests {
                         namespace.topic_id,
                         namespace.query_pool_id,
                         namespace.max_columns_per_table,
+                        namespace.max_tables,
                         namespace.retention_period_ns,
                     );
 
@@ -313,7 +317,7 @@ mod tests {
                     // Invariant: in absence of concurrency, the schema within
                     // the database must always match the incrementally built
                     // cached schema.
-                    let db_schema = get_schema_by_name(NAMESPACE_NAME, txn.deref_mut())
+                    let db_schema = get_schema_by_name(NAMESPACE_NAME, txn.deref_mut(), SoftDeletedRows::ExcludeDeleted)
                         .await
                         .expect("database failed to query for namespace schema");
                     assert_eq!(schema, db_schema, "schema in DB and cached schema differ");

@@ -129,7 +129,7 @@ impl IoxHttpError {
 
 impl Display for IoxHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -214,7 +214,7 @@ pub async fn create_querier_server_type(
             }
             Some(create_ingester_connections(
                 None,
-                Some(list),
+                Some(list.iter().map(|addr| addr.to_string().into()).collect()),
                 Arc::clone(&catalog_cache),
                 args.querier_config.ingester_circuit_breaker_threshold,
             ))

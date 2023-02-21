@@ -216,8 +216,7 @@ impl SortKey {
             .collect();
         if !missing_from_catalog_key.is_empty() {
             panic!(
-                "Primary key column(s) found that don't appear in the catalog sort key [{:?}] of partition: {}. Sort key: {:?}",
-                missing_from_catalog_key, partition_id, self
+                "Primary key column(s) found that don't appear in the catalog sort key [{missing_from_catalog_key:?}] of partition: {partition_id}. Sort key: {self:?}"
             )
         }
 
@@ -344,7 +343,7 @@ impl SortKey {
 impl Display for SortKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         for (i, (name, options)) in self.columns.iter().enumerate() {
-            write!(f, "{}", name)?;
+            write!(f, "{name}")?;
             if options.descending {
                 write!(f, " DESC")?;
             }
@@ -845,7 +844,7 @@ mod tests {
         let rb = Arc::new(
             RecordBatch::try_from_iter(vec![
                 ("x", to_string_array(vec!["a", "b"])),
-                ("y", to_string_array(vec![None, None])),
+                ("y", to_string_array(vec![None::<&str>, None])),
                 ("z", to_string_array(vec!["c", "c"])),
             ])
             .unwrap(),

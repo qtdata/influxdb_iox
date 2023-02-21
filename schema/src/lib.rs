@@ -648,7 +648,7 @@ impl From<&InfluxColumnType> for &'static str {
 impl std::fmt::Display for InfluxColumnType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s: &str = self.into();
-        write!(f, "{}", s)
+        write!(f, "{s}")
     }
 }
 
@@ -665,7 +665,7 @@ impl TryFrom<&str> for InfluxColumnType {
             "iox::column_type::field::string" => Ok(Self::Field(InfluxFieldType::String)),
             "iox::column_type::field::boolean" => Ok(Self::Field(InfluxFieldType::Boolean)),
             "iox::column_type::timestamp" => Ok(Self::Timestamp),
-            _ => Err(format!("Unknown column type in metadata: {:?}", s)),
+            _ => Err(format!("Unknown column type in metadata: {s:?}")),
         }
     }
 }
@@ -1180,8 +1180,7 @@ mod test {
 
         assert_eq!(
             schema, sorted_schema,
-            "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            schema, sorted_schema
+            "\nExpected:\n{schema:#?}\nActual:\n{sorted_schema:#?}"
         );
     }
 
@@ -1211,8 +1210,7 @@ mod test {
 
         assert_eq!(
             expected_schema, sorted_schema,
-            "\nExpected:\n{:#?}\nActual:\n{:#?}",
-            expected_schema, sorted_schema
+            "\nExpected:\n{expected_schema:#?}\nActual:\n{sorted_schema:#?}"
         );
     }
 

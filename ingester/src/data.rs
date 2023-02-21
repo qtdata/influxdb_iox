@@ -621,7 +621,7 @@ impl Persister for IngesterData {
             .expect("retry forever");
 
         // Record metrics
-        let attributes = Attributes::from([("shard_id", format!("{}", shard_id).into())]);
+        let attributes = Attributes::from([("shard_id", format!("{shard_id}").into())]);
         self.persisted_file_size_bytes
             .recorder(attributes)
             .record(file_size as u64);
@@ -752,7 +752,8 @@ mod tests {
                     .await
                     .unwrap();
 
-                let schema = NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100, None);
+                let schema =
+                    NamespaceSchema::new(namespace.id, topic.id, query_pool.id, 100, 42, None);
 
                 let shard_index = ShardIndex::new(0);
                 let shard1 = repos
@@ -1122,7 +1123,7 @@ mod tests {
         // different, the file may change slightly from time to time
         //
         // https://github.com/influxdata/influxdb_iox/issues/5434
-        let expected_size = 1265;
+        let expected_size = 1345;
         let allowable_delta = 10;
         let size_delta = (pf.file_size_bytes - expected_size).abs();
         assert!(

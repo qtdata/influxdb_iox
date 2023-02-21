@@ -92,7 +92,7 @@ impl std::fmt::Display for StorageId {
 /// create one [`ParquetExec`] and put each file into its own "file group".
 ///
 /// [`ParquetExec`]: datafusion::physical_plan::file_format::ParquetExec
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParquetExecInput {
     /// Store where the file is located.
     pub object_store_url: ObjectStoreUrl,
@@ -436,7 +436,7 @@ mod tests {
         assert_schema_check_fail(
             other_batch,
             schema,
-            "Arrow error: External error: Execution error: Failed to map column projection for field a. Incompatible data types Int64 and Utf8",
+            "Execution error: Failed to map column projection for field a. Incompatible data types Int64 and Utf8",
         ).await;
     }
 

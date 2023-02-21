@@ -28,6 +28,7 @@ use std::{any::Any, collections::BTreeSet, fmt::Debug, iter::FromIterator, sync:
 pub mod exec;
 pub mod frontend;
 pub mod logical_optimizer;
+pub mod physical_optimizer;
 pub mod plan;
 pub mod provider;
 pub mod pruning;
@@ -174,7 +175,7 @@ pub trait QueryNamespace: QueryNamespaceMeta + Debug + Send + Sync {
 }
 
 /// Raw data of a [`QueryChunk`].
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum QueryChunkData {
     /// In-memory record batches.
     ///
@@ -200,6 +201,14 @@ impl QueryChunkData {
                 .read_to_batches(schema.as_arrow(), Projection::All, session_ctx)
                 .await
                 .unwrap(),
+        }
+    }
+
+    /// Extract [record batches](Self::RecordBatches) variant.
+    pub fn into_record_batches(self) -> Option<Vec<RecordBatch>> {
+        match self {
+            Self::RecordBatches(batches) => Some(batches),
+            Self::Parquet(_) => None,
         }
     }
 }

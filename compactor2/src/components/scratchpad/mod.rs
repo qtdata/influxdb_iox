@@ -4,13 +4,14 @@ use async_trait::async_trait;
 use parquet_file::ParquetFilePath;
 use uuid::Uuid;
 
-pub mod ignore_writes_object_store;
+pub mod noop;
 pub mod prod;
 mod util;
 
 #[cfg(test)]
 mod test_util;
 
+/// Create a [`Scratchpad`] for use as intermediate storage
 pub trait ScratchpadGen: Debug + Display + Send + Sync {
     fn pad(&self) -> Box<dyn Scratchpad>;
 }

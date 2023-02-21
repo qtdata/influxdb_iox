@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 use backoff::BackoffConfig;
-use clap_blocks::compactor2::Compactor2Config;
+use clap_blocks::compactor2::{Compactor2Config, CompactorAlgoVersion};
 use compactor2::{
     compactor::Compactor2,
-    config::{Config, ShardConfig},
+    config::{AlgoVersion, Config, PartitionsSourceConfig, ShardConfig},
 };
 use data_types::{PartitionId, TRANSITION_SHARD_NUMBER};
 use hyper::{Body, Request, Response};
@@ -116,7 +116,7 @@ impl IoxHttpError {
 
 impl Display for IoxHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -158,6 +158,25 @@ pub async fn create_compactor2_server_type(
         n_shards: compactor_config.shard_count.expect("just checked"),
     });
 
+    let compact_version = match compactor_config.compact_version {
+        CompactorAlgoVersion::AllAtOnce => AlgoVersion::AllAtOnce,
+        CompactorAlgoVersion::TargetLevel => AlgoVersion::TargetLevel,
+    };
+
+    let partitions_source = match (
+        compactor_config.partition_filter,
+        compactor_config.process_all_partitions,
+    ) {
+        (None, false) => PartitionsSourceConfig::CatalogRecentWrites,
+        (None, true) => PartitionsSourceConfig::CatalogAll,
+        (Some(ids), false) => {
+            PartitionsSourceConfig::Fixed(ids.into_iter().map(PartitionId::new).collect())
+        }
+        (Some(_), true) => panic!(
+            "provided partition ID filter and specific 'process all', this does not make sense"
+        ),
+    };
+
     let compactor = Compactor2::start(Config {
         shard_id,
         metric_registry: Arc::clone(&metric_registry),
@@ -178,15 +197,20 @@ pub async fn create_compactor2_server_type(
         percentage_max_file_size: compactor_config.percentage_max_file_size,
         split_percentage: compactor_config.split_percentage,
         partition_timeout: Duration::from_secs(compactor_config.partition_timeout_secs),
-        partition_filter: compactor_config
-            .partition_filter
-            .map(|parts| parts.into_iter().map(PartitionId::new).collect()),
+        partitions_source,
         shadow_mode: compactor_config.shadow_mode,
         ignore_partition_skip_marker: compactor_config.ignore_partition_skip_marker,
-        max_input_files_per_partition: compactor_config.max_input_files_per_partition,
         max_input_parquet_bytes_per_partition: compactor_config
             .max_input_parquet_bytes_per_partition,
         shard_config,
+        compact_version,
+        min_num_l1_files_to_compact: compactor_config.min_num_l1_files_to_compact,
+        process_once: compactor_config.process_once,
+        simulate_without_object_store: false,
+        parquet_files_sink_override: None,
+        all_errors_are_fatal: false,
+        max_num_columns_per_table: compactor_config.max_num_columns_per_table,
+        max_num_files_per_plan: compactor_config.max_num_files_per_plan,
     });
 
     Arc::new(Compactor2ServerType::new(

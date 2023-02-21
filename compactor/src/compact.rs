@@ -6,7 +6,7 @@ use data_types::{
     ColumnType, ColumnTypeCount, Namespace, NamespaceId, PartitionId, PartitionKey, PartitionParam,
     ShardId, Table, TableId, TableSchema, Timestamp,
 };
-use iox_catalog::interface::{get_schema_by_id, Catalog};
+use iox_catalog::interface::{get_schema_by_id, Catalog, SoftDeletedRows};
 use iox_query::exec::Executor;
 use iox_time::TimeProvider;
 use metric::{
@@ -419,11 +419,11 @@ impl Compactor {
         for id in namespace_ids {
             let namespace = repos
                 .namespaces()
-                .get_by_id(id)
+                .get_by_id(id, SoftDeletedRows::AllRows)
                 .await
                 .context(QueryingNamespaceSnafu)?
                 .context(NamespaceNotFoundSnafu { namespace_id: id })?;
-            let schema = get_schema_by_id(namespace.id, repos.as_mut())
+            let schema = get_schema_by_id(namespace.id, repos.as_mut(), SoftDeletedRows::AllRows)
                 .await
                 .context(QueryingNamespaceSnafu)?;
             namespaces.insert(id, (Arc::new(namespace), schema));
@@ -602,7 +602,7 @@ pub mod tests {
         ColumnId, ColumnSet, CompactionLevel, ParquetFileParams, SequenceNumber, ShardIndex,
         Timestamp,
     };
-    use iox_tests::util::{TestCatalog, TestPartition};
+    use iox_tests::{TestCatalog, TestPartition};
     use iox_time::SystemProvider;
     use parquet_file::storage::StorageId;
     use uuid::Uuid;

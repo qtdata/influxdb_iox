@@ -13,9 +13,9 @@
 //! ```
 //! Possibly helpful commands:
 //!   # See diff
-//!   diff -du "cases/in/pushdown.expected" "cases/out/pushdown.out"
+//!   diff -du "cases/in/pushdown.sql.expected" "cases/out/pushdown.sql.out"
 //!   # Update expected
-//!   cp -f "cases/in/pushdown.out" "cases/out/pushdown.expected"
+//!   cp -f "cases/in/pushdown.sql.out" "cases/out/pushdown.sql.expected"
 //! ```
 //!
 //! # Cookbook: Adding a new test scenario
@@ -104,6 +104,18 @@ async fn duplicates_parquet_many() {
     TestCase {
         input: "cases/in/duplicates_parquet_many.sql",
         chunk_stage: ChunkStage::Parquet,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn gapfill() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/gapfill.sql",
+        chunk_stage: ChunkStage::Ingester,
     }
     .run()
     .await;
@@ -227,4 +239,92 @@ async fn two_chunks_missing_columns() {
     }
     .run()
     .await;
+}
+
+#[tokio::test]
+async fn schema_merge() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/schema_merge.sql",
+        chunk_stage: ChunkStage::Ingester,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn restaurant() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/restaurant.sql",
+        chunk_stage: ChunkStage::All,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn union_all() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/union_all.sql",
+        chunk_stage: ChunkStage::All,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn aggregates() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/aggregates.sql",
+        chunk_stage: ChunkStage::All,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn aggregates_with_nulls() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/aggregates_with_nulls.sql",
+        chunk_stage: ChunkStage::Ingester,
+    }
+    .run()
+    .await;
+}
+
+#[tokio::test]
+async fn different_tag_sets() {
+    test_helpers::maybe_start_logging();
+
+    TestCase {
+        input: "cases/in/different_tag_sets.sql",
+        chunk_stage: ChunkStage::Ingester,
+    }
+    .run()
+    .await;
+}
+
+mod influxql {
+    use super::*;
+
+    #[tokio::test]
+    async fn issue_6112() {
+        test_helpers::maybe_start_logging();
+
+        TestCase {
+            input: "cases/in/issue_6112.influxql",
+            chunk_stage: ChunkStage::Ingester,
+        }
+        .run()
+        .await;
+    }
 }

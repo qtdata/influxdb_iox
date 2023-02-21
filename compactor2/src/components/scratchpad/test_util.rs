@@ -5,7 +5,7 @@ use object_store::{memory::InMemory, DynObjectStore};
 use parquet_file::ParquetFilePath;
 use uuid::Uuid;
 
-use crate::test_util::list_object_store;
+use compactor2_test_utils::list_object_store;
 
 pub fn stores() -> (
     Arc<DynObjectStore>,
@@ -29,7 +29,6 @@ pub fn file_path(i: u128) -> ParquetFilePath {
     )
 }
 
-#[track_caller]
 pub async fn assert_content<const N: usize>(
     store: &Arc<DynObjectStore>,
     files: [&ParquetFilePath; N],

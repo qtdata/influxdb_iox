@@ -33,8 +33,11 @@ impl Client {
 
     /// Create a namespace
     ///
-    /// `retention_period_ns` is the the retention period in nanoseconds, measured from `now()`.
-    /// `None` represents infinite retention (i.e. never drop data).
+    /// `retention_period_ns` is the the retention period in nanoseconds,
+    /// measured from `now()`. `None` represents infinite retention (i.e. never
+    /// drop data), and 0 is also mapped to `None` on the server side.
+    ///
+    /// Negative retention periods are rejected, returning an error.
     pub async fn create_namespace(
         &mut self,
         namespace: &str,
@@ -53,8 +56,11 @@ impl Client {
 
     /// Update retention for a namespace
     ///
-    /// `retention_period_ns` is the the retention period in nanoseconds, measured from `now()`.
-    /// `None` represents infinite retention (i.e. never drop data).
+    /// `retention_period_ns` is the the retention period in nanoseconds,
+    /// measured from `now()`. `None` represents infinite retention (i.e. never
+    /// drop data), and 0 is also mapped to `None` on the server side.
+    ///
+    /// Negative retention periods are rejected, returning an error.
     pub async fn update_namespace_retention(
         &mut self,
         namespace: &str,
@@ -69,5 +75,16 @@ impl Client {
             .await?;
 
         Ok(response.into_inner().namespace.unwrap_field("namespace")?)
+    }
+
+    /// Delete a namespace
+    pub async fn delete_namespace(&mut self, namespace: &str) -> Result<(), Error> {
+        self.inner
+            .delete_namespace(DeleteNamespaceRequest {
+                name: namespace.to_string(),
+            })
+            .await?;
+
+        Ok(())
     }
 }

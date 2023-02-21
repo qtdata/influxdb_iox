@@ -57,7 +57,6 @@ use arrow::{
     array::{as_boolean_array, Array, ArrayRef, BooleanArray},
     compute::{self, filter_record_batch},
     datatypes::SchemaRef,
-    error::{ArrowError, Result as ArrowResult},
     record_batch::RecordBatch,
 };
 use datafusion::{
@@ -252,7 +251,7 @@ impl ExecutionPlan for StreamSplitExec {
             State::Running { streams } => {
                 assert!(partition < streams.len());
                 let stream = streams[partition].take().unwrap_or_else(|| {
-                    panic!("Error executing stream #{} of StreamSplitExec", partition);
+                    panic!("Error executing stream #{partition} of StreamSplitExec");
                 });
                 trace!(partition, "End SplitExec::execute");
                 Ok(stream)
@@ -336,9 +335,9 @@ impl StreamSplitExec {
 async fn split_the_stream(
     mut input_stream: SendableRecordBatchStream,
     split_exprs: Vec<Arc<dyn PhysicalExpr>>,
-    tx: Vec<Sender<ArrowResult<RecordBatch>>>,
+    tx: Vec<Sender<Result<RecordBatch, DataFusionError>>>,
     baseline_metrics: Vec<BaselineMetrics>,
-) -> std::result::Result<(), ArrowError> {
+) -> std::result::Result<(), DataFusionError> {
     assert_eq!(split_exprs.len() + 1, tx.len());
     assert_eq!(tx.len(), baseline_metrics.len());
 
@@ -449,7 +448,7 @@ fn compute_batch(
             match val {
                 Some(true) => input_batch.clone(),
                 Some(false) => empty_record_batch,
-                _ => panic!("mismatched boolean values: {:?}", val),
+                _ => panic!("mismatched boolean values: {val:?}"),
             }
         }
         _ => {

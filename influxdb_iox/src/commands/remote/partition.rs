@@ -18,7 +18,7 @@ use influxdb_iox_client::{
     schema::{self, generated_types::NamespaceSchema},
     store,
 };
-use iox_catalog::interface::{get_schema_by_name, Catalog};
+use iox_catalog::interface::{get_schema_by_name, Catalog, SoftDeletedRows};
 use parquet_file::ParquetFilePath;
 use std::sync::Arc;
 use thiserror::Error;
@@ -254,7 +254,7 @@ async fn load_schema(
         Ok(n) => n,
         Err(iox_catalog::interface::Error::NameExists { .. }) => repos
             .namespaces()
-            .get_by_name(namespace)
+            .get_by_name(namespace, SoftDeletedRows::ExcludeDeleted)
             .await?
             .ok_or(Error::NamespaceNotFound)?,
         e => e?,
@@ -282,13 +282,15 @@ async fn load_schema(
             .map(|k| k.to_string())
             .collect::<Vec<_>>()
             .join(", ");
-        println!(
-            "table {} with columns {} loaded into local catalog",
-            table_name, column_names
-        );
+        println!("table {table_name} with columns {column_names} loaded into local catalog");
     }
 
-    let full_inserted_schema = get_schema_by_name(&namespace.name, repos.as_mut()).await?;
+    let full_inserted_schema = get_schema_by_name(
+        &namespace.name,
+        repos.as_mut(),
+        SoftDeletedRows::ExcludeDeleted,
+    )
+    .await?;
 
     Ok(full_inserted_schema)
 }
@@ -343,11 +345,11 @@ async fn load_parquet_files(
         let uuid = Uuid::parse_str(&p.object_store_id).expect("object store id should be valid");
         let parquet_file = match repos.parquet_files().get_by_object_store_id(uuid).await? {
             Some(f) => {
-                println!("found file {} in catalog", uuid);
+                println!("found file {uuid} in catalog");
                 f
             }
             None => {
-                println!("creating file {} in catalog", uuid);
+                println!("creating file {uuid} in catalog");
                 let params = ParquetFileParams {
                     shard_id: partition_mapping.shard_id,
                     namespace_id,

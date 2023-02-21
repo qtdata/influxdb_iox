@@ -20,12 +20,11 @@ pub mod metadata;
 pub mod serialize;
 pub mod storage;
 
-use data_types::{NamespaceId, ParquetFile, ParquetFileParams, PartitionId, ShardId, TableId};
+use data_types::{
+    NamespaceId, ParquetFile, ParquetFileParams, PartitionId, ShardId, TableId, TRANSITION_SHARD_ID,
+};
 use object_store::path::Path;
 use uuid::Uuid;
-
-// Ingester2 creates partitions in this shard.
-const TRANSITION_SHARD_ID: ShardId = ShardId::new(1234);
 
 /// Location of a Parquet file within a namespace's object store.
 /// The exact format is an implementation detail and is subject to change.
@@ -70,7 +69,7 @@ impl ParquetFilePath {
                 namespace_id.to_string().as_str(),
                 table_id.to_string().as_str(),
                 partition_id.to_string().as_str(),
-                &format!("{}.parquet", object_store_id),
+                &format!("{object_store_id}.parquet"),
             ])
         } else {
             Path::from_iter([
@@ -78,7 +77,7 @@ impl ParquetFilePath {
                 table_id.to_string().as_str(),
                 shard_id.to_string().as_str(),
                 partition_id.to_string().as_str(),
-                &format!("{}.parquet", object_store_id),
+                &format!("{object_store_id}.parquet"),
             ])
         }
     }

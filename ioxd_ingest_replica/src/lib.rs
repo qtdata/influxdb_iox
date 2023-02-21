@@ -123,7 +123,7 @@ impl IoxHttpError {
 
 impl Display for IoxHttpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -145,7 +145,11 @@ pub async fn create_ingest_replica_server_type(
 ) -> Result<Arc<dyn ServerType>> {
     let grpc = ingest_replica::new(
         catalog,
-        ingest_replica_config.ingester_addresses.clone(),
+        ingest_replica_config
+            .ingester_addresses
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         exec,
         Arc::clone(&metrics),
     )

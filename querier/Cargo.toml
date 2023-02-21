@@ -23,7 +23,7 @@ iox_catalog = { path = "../iox_catalog" }
 iox_query = { path = "../iox_query" }
 iox_time = { path = "../iox_time" }
 metric = { path = "../metric" }
-object_store = "0.5.2"
+object_store = "0.5.4"
 observability_deps = { path = "../observability_deps" }
 parking_lot = "0.12"
 parquet_file = { path = "../parquet_file" }
@@ -40,7 +40,7 @@ sharder = { path = "../sharder" }
 snafu = "0.7"
 thiserror = "1.0"
 tokio = { version = "1.25", features = ["macros", "parking_lot", "rt-multi-thread", "sync", "time"] }
-tokio-util = { version = "0.7.4" }
+tokio-util = { version = "0.7.7" }
 tonic = { version = "0.8" }
 trace = { path = "../trace" }
 trace_exporters = { path = "../trace_exporters" }

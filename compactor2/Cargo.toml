@@ -15,8 +15,9 @@ futures = "0.3"
 iox_catalog = { path = "../iox_catalog" }
 iox_query = { path = "../iox_query" }
 iox_time = { path = "../iox_time" }
+itertools = "0.10.5"
 metric = { path = "../metric" }
-object_store = "0.5.2"
+object_store = "0.5.4"
 observability_deps = { path = "../observability_deps" }
 parquet_file = { path = "../parquet_file" }
 predicate = { path = "../predicate" }
@@ -25,12 +26,14 @@ schema = { path = "../schema" }
 sharder = { path = "../sharder" }
 snafu = "0.7"
 tokio = { version = "1", features = ["macros", "rt", "sync"] }
-tokio-util = { version = "0.7.4" }
+tokio-util = { version = "0.7.7" }
 tracker = { path = "../tracker" }
 uuid = { version = "1", features = ["v4"] }
 workspace-hack = { path = "../workspace-hack"}
 
 [dev-dependencies]
 arrow_util = { path = "../arrow_util" }
+compactor2_test_utils = { path = "../compactor2_test_utils" }
 iox_tests = { path = "../iox_tests" }
 test_helpers = { path = "../test_helpers"}
+insta = { version = "1.28.0", features = ["yaml"] }

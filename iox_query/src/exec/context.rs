@@ -21,7 +21,8 @@ use crate::{
         split::StreamSplitExec,
         stringset::{IntoStringSet, StringSetRef},
     },
-    logical_optimizer::register_iox_optimizers,
+    logical_optimizer::register_iox_logical_optimizers,
+    physical_optimizer::register_iox_physical_optimizers,
     plan::{
         fieldlist::FieldListPlan,
         seriesset::{SeriesSetPlan, SeriesSetPlans},
@@ -231,7 +232,8 @@ impl IOxSessionConfig {
 
         let state = SessionState::with_config_rt(session_config, self.runtime)
             .with_query_planner(Arc::new(IOxQueryPlanner {}));
-        let state = register_iox_optimizers(state);
+        let state = register_iox_physical_optimizers(state);
+        let state = register_iox_logical_optimizers(state);
 
         let inner = SessionContext::with_state(state);
         register_selector_aggregates(&inner);
@@ -435,7 +437,7 @@ impl IOxSessionContext {
         // dedicated executor because otherwise this may block the top-level tokio/tonic runtime which may lead to
         // requests timetouts (either for new requests, metrics or even for HTTP2 pings on the active connection).
         let schema = stream.schema();
-        let stream = CrossRtStream::new_with_arrow_error_stream(stream, self.exec.clone());
+        let stream = CrossRtStream::new_with_df_error_stream(stream, self.exec.clone());
         let stream = RecordBatchStreamAdapter::new(schema, stream);
         Ok(Box::pin(stream))
     }
@@ -505,7 +507,7 @@ impl IOxSessionContext {
 
                 let series: Vec<Series> = series_set
                     .try_into()
-                    .map_err(|e| Error::Execution(format!("Error converting to series: {}", e)))?;
+                    .map_err(|e| Error::Execution(format!("Error converting to series: {e}")))?;
                 Ok(Some(futures::stream::iter(series).map(Ok)))
             })
             .try_flatten();

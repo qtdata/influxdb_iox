@@ -26,7 +26,7 @@ async fn default_mode_is_run_all_in_one() {
         // Without this, we have errors about writing read-only root filesystem on macos.
         .env("HOME", tmpdir.path())
         .add_addr_env(ServerType::AllInOne, &addrs)
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .assert()
         .failure()
         .stdout(predicate::str::contains("starting all in one server"));
@@ -46,7 +46,7 @@ async fn default_run_mode_is_all_in_one() {
         .env_clear()
         .env("HOME", tmpdir.path())
         .add_addr_env(ServerType::AllInOne, &addrs)
-        .timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
         .assert()
         .failure()
         .stdout(predicate::str::contains("starting all in one server"));
@@ -60,16 +60,19 @@ async fn parquet_to_lp() {
     // The test below assumes a specific partition id, so use a
     // non-shared one here so concurrent tests don't interfere with
     // each other
-    let mut cluster = MiniCluster::create_non_shared_standard(database_url).await;
+    let mut cluster = MiniCluster::create_non_shared2(database_url).await;
 
     let line_protocol = "my_awesome_table,tag1=A,tag2=B val=42i 123456";
 
     StepTest::new(
         &mut cluster,
         vec![
+            Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(String::from(line_protocol)),
             // wait for partitions to be persisted
-            Step::WaitForPersisted,
+            Step::WaitForPersisted2 {
+                expected_increase: 1,
+            },
             // Run the 'remote partition' command
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 async move {
@@ -141,13 +144,13 @@ async fn parquet_to_lp() {
                         .stdout
                         .clone();
 
-                    println!("Got output  {:?}", output);
+                    println!("Got output  {output:?}");
 
                     // test writing to output file as well
                     // Ensure files are actually wrote to the filesystem
                     let output_file =
                         tempfile::NamedTempFile::new().expect("Error making temp file");
-                    println!("Writing to  {:?}", output_file);
+                    println!("Writing to  {output_file:?}");
 
                     // convert to line protocol (to a file)
                     Command::cargo_bin("influxdb_iox")
@@ -165,150 +168,8 @@ async fn parquet_to_lp() {
                     let file_contents = String::from_utf8_lossy(&file_contents);
                     assert!(
                         predicate::str::contains(line_protocol).eval(&file_contents),
-                        "Could not file {} in {}",
-                        line_protocol,
-                        file_contents
+                        "Could not file {line_protocol} in {file_contents}"
                     );
-                }
-                .boxed()
-            })),
-        ],
-    )
-    .run()
-    .await
-}
-
-/// Write, compact, then use the remote partition command
-#[tokio::test]
-async fn compact_and_get_remote_partition() {
-    test_helpers::maybe_start_logging();
-    let database_url = maybe_skip_integration!();
-
-    // The test below assumes a specific partition id, so use a
-    // non-shared one here so concurrent tests don't interfere with
-    // each other
-    let mut cluster = MiniCluster::create_non_shared_standard(database_url).await;
-
-    StepTest::new(
-        &mut cluster,
-        vec![
-            Step::WriteLineProtocol(String::from(
-                "my_awesome_table,tag1=A,tag2=B val=42i 123456",
-            )),
-            // wait for partitions to be persisted
-            Step::WaitForPersisted,
-            // Run the compactor
-            Step::Compact,
-            // Run the 'remote partition' command
-            Step::Custom(Box::new(|state: &mut StepTestState| {
-                async {
-                    let router_addr = state.cluster().router().router_grpc_base().to_string();
-                    let namespace = state.cluster().namespace().to_string();
-
-                    // Validate the output of the remote partition CLI command
-                    //
-                    // Looks like:
-                    // {
-                    //     "id": "1",
-                    //     "shardId": 1,
-                    //     "namespaceId": 1,
-                    //     "tableId": 1,
-                    //     "partitionId": "1",
-                    //     "objectStoreId": "fa6cdcd1-cbc2-4fb7-8b51-4773079124dd",
-                    //     "minTime": "123456",
-                    //     "maxTime": "123456",
-                    //     "fileSizeBytes": "2029",
-                    //     "rowCount": "1",
-                    //     "compactionLevel": "2",
-                    //     "createdAt": "1650019674289347000"
-                    // }
-
-                    let out = Command::cargo_bin("influxdb_iox")
-                        .unwrap()
-                        .arg("-h")
-                        .arg(&router_addr)
-                        .arg("remote")
-                        .arg("partition")
-                        .arg("show")
-                        .arg("1")
-                        .assert()
-                        .success()
-                        .stdout(
-                            predicate::str::contains(r#""id": "1""#)
-                                .and(predicate::str::contains(r#""shardId": "1","#))
-                                .and(predicate::str::contains(r#""partitionId": "1","#))
-                                .and(predicate::str::contains(r#""compactionLevel": 2"#)),
-                        )
-                        .get_output()
-                        .stdout
-                        .clone();
-
-                    let object_store_id = get_object_store_id(&out);
-                    let dir = tempdir().unwrap();
-                    let f = dir.path().join("tmp.parquet");
-                    let filename = f.as_os_str().to_str().unwrap();
-
-                    Command::cargo_bin("influxdb_iox")
-                        .unwrap()
-                        .arg("-h")
-                        .arg(&router_addr)
-                        .arg("remote")
-                        .arg("store")
-                        .arg("get")
-                        .arg(&object_store_id)
-                        .arg(filename)
-                        .assert()
-                        .success()
-                        .stdout(
-                            predicate::str::contains("wrote")
-                                .and(predicate::str::contains(filename)),
-                        );
-
-                    // Ensure a warning is emitted when specifying (or
-                    // defaulting to) in-memory file storage.
-                    Command::cargo_bin("influxdb_iox")
-                        .unwrap()
-                        .arg("-h")
-                        .arg(&router_addr)
-                        .arg("remote")
-                        .arg("partition")
-                        .arg("pull")
-                        .arg("--catalog")
-                        .arg("memory")
-                        .arg("--object-store")
-                        .arg("memory")
-                        .arg(&namespace)
-                        .arg("my_awesome_table")
-                        .arg("1970-01-01")
-                        .assert()
-                        .failure()
-                        .stderr(predicate::str::contains("try passing --object-store=file"));
-
-                    // Ensure files are actually wrote to the filesystem
-                    let dir = tempfile::tempdir().expect("could not get temporary directory");
-
-                    Command::cargo_bin("influxdb_iox")
-                        .unwrap()
-                        .arg("-h")
-                        .arg(&router_addr)
-                        .arg("remote")
-                        .arg("partition")
-                        .arg("pull")
-                        .arg("--catalog")
-                        .arg("memory")
-                        .arg("--object-store")
-                        .arg("file")
-                        .arg("--data-dir")
-                        .arg(dir.path().to_str().unwrap())
-                        .arg(&namespace)
-                        .arg("my_awesome_table")
-                        .arg("1970-01-01")
-                        .assert()
-                        .success()
-                        .stdout(
-                            predicate::str::contains("wrote file")
-                                .and(predicate::str::contains(object_store_id)),
-                        );
                 }
                 .boxed()
             })),
@@ -324,14 +185,18 @@ async fn schema_cli() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
         vec![
+            Step::RecordNumParquetFiles,
             Step::WriteLineProtocol(String::from(
                 "my_awesome_table2,tag1=A,tag2=B val=42i 123456",
             )),
+            Step::WaitForPersisted2 {
+                expected_increase: 1,
+            },
             Step::Custom(Box::new(|state: &mut StepTestState| {
                 async {
                     // should be able to query both router and querier for the schema
@@ -347,7 +212,7 @@ async fn schema_cli() {
                     ];
 
                     for (addr_type, addr) in addrs {
-                        println!("Trying address {}: {}", addr_type, addr);
+                        println!("Trying address {addr_type}: {addr}");
 
                         // Validate the output of the schema CLI command
                         Command::cargo_bin("influxdb_iox")
@@ -381,7 +246,7 @@ async fn write_and_query() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -456,7 +321,7 @@ async fn query_error_handling() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -495,7 +360,7 @@ async fn influxql_error_handling() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -588,7 +453,7 @@ async fn wait_for_query_result(
 
         let assert = match assert.try_success() {
             Err(e) => {
-                println!("Got err running command: {}, retrying", e);
+                println!("Got err running command: {e}, retrying");
                 continue;
             }
             Ok(a) => a,
@@ -596,20 +461,17 @@ async fn wait_for_query_result(
 
         match assert.try_stdout(predicate::str::contains(expected)) {
             Err(e) => {
-                println!("No match: {}, retrying", e);
+                println!("No match: {e}, retrying");
             }
             Ok(r) => {
-                println!("Success: {:?}", r);
+                println!("Success: {r:?}");
                 return;
             }
         }
         // sleep and try again
         tokio::time::sleep(Duration::from_secs(1)).await
     }
-    panic!(
-        "Did not find expected output {} within {:?}",
-        expected, max_wait_time
-    );
+    panic!("Did not find expected output {expected} within {max_wait_time:?}");
 }
 
 /// Test the namespace cli command
@@ -618,7 +480,7 @@ async fn namespaces_cli() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -654,7 +516,7 @@ async fn namespaces_cli() {
 async fn namespace_retention() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -835,7 +697,7 @@ async fn query_ingester() {
     test_helpers::maybe_start_logging();
     let database_url = maybe_skip_integration!();
 
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
@@ -843,7 +705,6 @@ async fn query_ingester() {
             Step::WriteLineProtocol(String::from(
                 "my_awesome_table2,tag1=A,tag2=B val=42i 123456",
             )),
-            Step::WaitForReadable,
             Step::Custom(Box::new(|state: &mut StepTestState| {
                 async {
                     let ingester_addr = state.cluster().ingester().ingester_grpc_base().to_string();

@@ -220,8 +220,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
 
         // expect same even if the timestamp order is different
@@ -236,8 +235,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
     }
 
@@ -275,8 +273,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
     }
 
@@ -288,7 +285,8 @@ mod tests {
         ]));
 
         // string array has no actual values, so should not be returned as a field
-        let string_array: ArrayRef = Arc::new(StringArray::from(vec![None, None, None, None]));
+        let string_array: ArrayRef =
+            Arc::new(StringArray::from(vec![None::<&str>, None, None, None]));
         let timestamp_array: ArrayRef = Arc::new(TimestampNanosecondArray::from_iter_values(vec![
             1000, 2000, 3000, 4000,
         ]));
@@ -300,8 +298,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
     }
 
@@ -341,8 +338,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
     }
 
@@ -378,8 +374,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
 
         let field1_later = Field {
@@ -400,8 +395,7 @@ mod tests {
 
         assert_eq!(
             expected, actual,
-            "Expected:\n{:#?}\nActual:\n{:#?}",
-            expected, actual
+            "Expected:\n{expected:#?}\nActual:\n{actual:#?}"
         );
 
         // Now, try to add a field that has a different type
@@ -425,9 +419,7 @@ mod tests {
 
         assert!(
             actual_error.contains(expected_error),
-            "Can not find expected '{}' in actual '{}'",
-            expected_error,
-            actual_error
+            "Can not find expected '{expected_error}' in actual '{actual_error}'"
         );
     }
 }

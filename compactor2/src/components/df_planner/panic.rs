@@ -1,7 +1,6 @@
 use std::{any::Any, fmt::Display, sync::Arc};
 
 use async_trait::async_trait;
-use data_types::{CompactionLevel, ParquetFile};
 use datafusion::{
     arrow::datatypes::SchemaRef,
     error::DataFusionError,
@@ -14,15 +13,16 @@ use datafusion::{
 };
 use schema::SchemaBuilder;
 
-use crate::partition_info::PartitionInfo;
+use crate::{partition_info::PartitionInfo, plan_ir::PlanIR};
 
 use super::DataFusionPlanner;
 
-#[derive(Debug, Default)]
+/// A planner that always generates a panic
+#[derive(Debug, Default, Clone, Copy)]
 pub struct PanicDataFusionPlanner;
 
 impl PanicDataFusionPlanner {
-    #[allow(dead_code)] // not used anywhere
+    /// Create a new planner
     pub fn new() -> Self {
         Self::default()
     }
@@ -38,9 +38,8 @@ impl Display for PanicDataFusionPlanner {
 impl DataFusionPlanner for PanicDataFusionPlanner {
     async fn plan(
         &self,
-        _files: Vec<ParquetFile>,
+        _ir: &PlanIR,
         _partition: Arc<PartitionInfo>,
-        _compaction_level: CompactionLevel,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         Ok(Arc::new(PanicPlan))
     }
@@ -98,7 +97,7 @@ impl ExecutionPlan for PanicPlan {
 mod tests {
     use datafusion::{physical_plan::collect, prelude::SessionContext};
 
-    use crate::test_util::partition_info;
+    use crate::test_utils::PartitionInfoBuilder;
 
     use super::*;
 
@@ -111,9 +110,9 @@ mod tests {
     #[should_panic(expected = "foo")]
     async fn test_panic() {
         let planner = PanicDataFusionPlanner::new();
-        let partition = partition_info();
+        let partition = Arc::new(PartitionInfoBuilder::new().build());
         let plan = planner
-            .plan(vec![], partition, CompactionLevel::FileNonOverlapped)
+            .plan(&PlanIR::Compact { files: vec![] }, partition)
             .await
             .unwrap();
 

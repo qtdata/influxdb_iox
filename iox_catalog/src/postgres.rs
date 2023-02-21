@@ -4,11 +4,11 @@ use crate::{
     interface::{
         self, sealed::TransactionFinalize, CasFailure, Catalog, ColumnRepo,
         ColumnTypeMismatchSnafu, Error, NamespaceRepo, ParquetFileRepo, PartitionRepo,
-        ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result, ShardRepo, TableRepo,
-        TombstoneRepo, TopicMetadataRepo, Transaction,
+        ProcessedTombstoneRepo, QueryPoolRepo, RepoCollection, Result, ShardRepo, SoftDeletedRows,
+        TableRepo, TombstoneRepo, TopicMetadataRepo, Transaction,
     },
     metrics::MetricDecorator,
-    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES,
+    DEFAULT_MAX_COLUMNS_PER_TABLE, DEFAULT_MAX_TABLES, SHARED_TOPIC_ID, SHARED_TOPIC_NAME,
 };
 use async_trait::async_trait;
 use data_types::{
@@ -16,7 +16,7 @@ use data_types::{
     ParquetFileId, ParquetFileParams, Partition, PartitionId, PartitionKey, PartitionParam,
     ProcessedTombstone, QueryPool, QueryPoolId, SequenceNumber, Shard, ShardId, ShardIndex,
     SkippedCompaction, Table, TableId, TablePartition, Timestamp, Tombstone, TombstoneId, TopicId,
-    TopicMetadata,
+    TopicMetadata, TRANSITION_SHARD_ID, TRANSITION_SHARD_INDEX,
 };
 use iox_time::{SystemProvider, TimeProvider};
 use observability_deps::tracing::{debug, info, warn};
@@ -292,6 +292,39 @@ impl Catalog for PostgresCatalog {
             .await
             .map_err(|e| Error::Setup { source: e.into() })?;
 
+        if std::env::var("INFLUXDB_IOX_RPC_MODE").is_ok() {
+            // We need to manually insert the topic here so that we can create the transition shard below.
+            sqlx::query(
+                r#"
+INSERT INTO topic (name)
+VALUES ($1)
+ON CONFLICT ON CONSTRAINT topic_name_unique
+DO NOTHING;
+            "#,
+            )
+            .bind(SHARED_TOPIC_NAME)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Setup { source: e })?;
+
+            // The transition shard must exist and must have magic ID and INDEX.
+            sqlx::query(
+                r#"
+INSERT INTO shard (id, topic_id, shard_index, min_unpersisted_sequence_number)
+OVERRIDING SYSTEM VALUE
+VALUES ($1, $2, $3, 0)
+ON CONFLICT ON CONSTRAINT shard_unique
+DO NOTHING;
+            "#,
+            )
+            .bind(TRANSITION_SHARD_ID)
+            .bind(SHARED_TOPIC_ID)
+            .bind(TRANSITION_SHARD_INDEX)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| Error::Setup { source: e })?;
+        }
+
         Ok(())
     }
 
@@ -370,8 +403,12 @@ async fn new_raw_pool(
                         .execute(&mut *c)
                         .await?;
                 }
-                let search_path_query = format!("SET search_path TO {},public;", schema_name);
+                let search_path_query = format!("SET search_path TO {schema_name},public;");
                 c.execute(sqlx::query(&search_path_query)).await?;
+
+                // Ensure explicit timezone selection, instead of deferring to
+                // the server value.
+                c.execute("SET timezone = 'UTC';").await?;
                 Ok(())
             })
         })
@@ -595,15 +632,16 @@ impl NamespaceRepo for PostgresTxn {
     ) -> Result<Namespace> {
         let rec = sqlx::query_as::<_, Namespace>(
             r#"
-                INSERT INTO namespace ( name, topic_id, query_pool_id, retention_period_ns )
-                VALUES ( $1, $2, $3, $4 )
+                INSERT INTO namespace ( name, topic_id, query_pool_id, retention_period_ns, max_tables )
+                VALUES ( $1, $2, $3, $4, $5 )
                 RETURNING *;
             "#,
         )
         .bind(name) // $1
         .bind(topic_id) // $2
         .bind(query_pool_id) // $3
-        .bind(retention_period_ns); // $4
+        .bind(retention_period_ns) // $4
+        .bind(DEFAULT_MAX_TABLES); // $5
 
         let rec = rec.fetch_one(&mut self.inner).await.map_err(|e| {
             if is_unique_violation(&e) {
@@ -624,12 +662,13 @@ impl NamespaceRepo for PostgresTxn {
         Ok(rec)
     }
 
-    async fn list(&mut self) -> Result<Vec<Namespace>> {
+    async fn list(&mut self, deleted: SoftDeletedRows) -> Result<Vec<Namespace>> {
         let rec = sqlx::query_as::<_, Namespace>(
-            r#"
-SELECT *
-FROM namespace;
-            "#,
+            format!(
+                r#"SELECT * FROM namespace WHERE {v};"#,
+                v = deleted.as_sql_predicate()
+            )
+            .as_str(),
         )
         .fetch_all(&mut self.inner)
         .await
@@ -638,13 +677,17 @@ FROM namespace;
         Ok(rec)
     }
 
-    async fn get_by_id(&mut self, id: NamespaceId) -> Result<Option<Namespace>> {
+    async fn get_by_id(
+        &mut self,
+        id: NamespaceId,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<Namespace>> {
         let rec = sqlx::query_as::<_, Namespace>(
-            r#"
-SELECT *
-FROM namespace
-WHERE id = $1;
-        "#,
+            format!(
+                r#"SELECT * FROM namespace WHERE id=$1 AND {v};"#,
+                v = deleted.as_sql_predicate()
+            )
+            .as_str(),
         )
         .bind(id) // $1
         .fetch_one(&mut self.inner)
@@ -659,13 +702,17 @@ WHERE id = $1;
         Ok(Some(namespace))
     }
 
-    async fn get_by_name(&mut self, name: &str) -> Result<Option<Namespace>> {
+    async fn get_by_name(
+        &mut self,
+        name: &str,
+        deleted: SoftDeletedRows,
+    ) -> Result<Option<Namespace>> {
         let rec = sqlx::query_as::<_, Namespace>(
-            r#"
-SELECT *
-FROM namespace
-WHERE name = $1;
-        "#,
+            format!(
+                r#"SELECT * FROM namespace WHERE name=$1 AND {v};"#,
+                v = deleted.as_sql_predicate()
+            )
+            .as_str(),
         )
         .bind(name) // $1
         .fetch_one(&mut self.inner)
@@ -680,19 +727,17 @@ WHERE name = $1;
         Ok(Some(namespace))
     }
 
-    async fn delete(&mut self, name: &str) -> Result<()> {
+    async fn soft_delete(&mut self, name: &str) -> Result<()> {
+        let flagged_at = Timestamp::from(self.time_provider.now());
+
         // note that there is a uniqueness constraint on the name column in the DB
-        sqlx::query(
-            r#"
-DELETE FROM namespace
-WHERE name = $1;
-        "#,
-        )
-        .bind(name)
-        .execute(&mut self.inner)
-        .await
-        .context(interface::CouldNotDeleteNamespaceSnafu)
-        .map(|_| ())
+        sqlx::query(r#"UPDATE namespace SET deleted_at=$1 WHERE name = $2;"#)
+            .bind(flagged_at) // $1
+            .bind(name) // $2
+            .execute(&mut self.inner)
+            .await
+            .context(interface::CouldNotDeleteNamespaceSnafu)
+            .map(|_| ())
     }
 
     async fn update_table_limit(&mut self, name: &str, new_max: i32) -> Result<Namespace> {
@@ -1244,6 +1289,18 @@ WHERE table_id = $1;
             "#,
         )
         .bind(table_id) // $1
+        .fetch_all(&mut self.inner)
+        .await
+        .map_err(|e| Error::SqlxError { source: e })
+    }
+
+    async fn list_ids(&mut self) -> Result<Vec<PartitionId>> {
+        sqlx::query_as(
+            r#"
+            SELECT p.id as partition_id
+            FROM partition p
+            "#,
+        )
         .fetch_all(&mut self.inner)
         .await
         .map_err(|e| Error::SqlxError { source: e })
@@ -2494,7 +2551,7 @@ mod tests {
 
         // Create the test schema
         pg.pool
-            .execute(format!("CREATE SCHEMA {};", schema_name).as_str())
+            .execute(format!("CREATE SCHEMA {schema_name};").as_str())
             .await
             .expect("failed to create test schema");
 
@@ -2502,8 +2559,7 @@ mod tests {
         pg.pool
             .execute(
                 format!(
-                    "GRANT USAGE ON SCHEMA {} TO public; GRANT CREATE ON SCHEMA {} TO public;",
-                    schema_name, schema_name
+                    "GRANT USAGE ON SCHEMA {schema_name} TO public; GRANT CREATE ON SCHEMA {schema_name} TO public;"
                 )
                 .as_str(),
             )
@@ -2523,9 +2579,49 @@ mod tests {
         maybe_skip_integration!();
 
         let postgres = setup_db().await;
+
+        // Validate the connection time zone is the expected UTC value.
+        let tz: String = sqlx::query_scalar("SHOW TIME ZONE;")
+            .fetch_one(&postgres.pool)
+            .await
+            .expect("read time zone");
+        assert_eq!(tz, "UTC");
+
+        let pool = postgres.pool.clone();
+        let schema_name = postgres.schema_name.clone();
+
         let postgres: Arc<dyn Catalog> = Arc::new(postgres);
 
-        crate::interface::test_helpers::test_catalog(postgres).await;
+        crate::interface::test_helpers::test_catalog(|| async {
+            // Clean the schema.
+            pool
+                .execute(format!("DROP SCHEMA {schema_name} CASCADE").as_str())
+                .await
+                .expect("failed to clean schema between tests");
+
+            // Recreate the test schema
+            pool
+                .execute(format!("CREATE SCHEMA {schema_name};").as_str())
+                .await
+                .expect("failed to create test schema");
+
+            // Ensure the test user has permission to interact with the test schema.
+            pool
+                .execute(
+                    format!(
+                        "GRANT USAGE ON SCHEMA {schema_name} TO public; GRANT CREATE ON SCHEMA {schema_name} TO public;"
+                    )
+                    .as_str(),
+                )
+                .await
+                .expect("failed to grant privileges to schema");
+
+            // Run the migrations against this random schema.
+            postgres.setup().await.expect("failed to initialise database");
+
+            Arc::clone(&postgres)
+        })
+        .await;
     }
 
     #[tokio::test]
@@ -2834,7 +2930,7 @@ mod tests {
         // fetch dsn from envvar
         let test_dsn = std::env::var("TEST_INFLUXDB_IOX_CATALOG_DSN").unwrap();
         create_db(&test_dsn).await;
-        eprintln!("TEST_DSN={}", test_dsn);
+        eprintln!("TEST_DSN={test_dsn}");
 
         // create a temp file to store the initial dsn
         let mut dsn_file = NamedTempFile::new().expect("create temp file");
@@ -2844,7 +2940,7 @@ mod tests {
 
         const TEST_APPLICATION_NAME: &str = "test_application_name";
         let dsn_good = format!("dsn-file://{}", dsn_file.path().display());
-        eprintln!("dsn_good={}", dsn_good);
+        eprintln!("dsn_good={dsn_good}");
 
         // create a hot swap pool with test application name and dsn file pointing to tmp file.
         // we will later update this file and the pool should be replaced.
@@ -2874,7 +2970,7 @@ mod tests {
             .write_all(test_dsn.as_bytes())
             .expect("write temp file");
         new_dsn_file
-            .write_all(format!("?application_name={}", TEST_APPLICATION_NAME_NEW).as_bytes())
+            .write_all(format!("?application_name={TEST_APPLICATION_NAME_NEW}").as_bytes())
             .expect("write temp file");
         new_dsn_file
             .persist(dsn_file.path())

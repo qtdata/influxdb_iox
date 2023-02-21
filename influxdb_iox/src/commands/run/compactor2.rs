@@ -1,5 +1,6 @@
 //! Command line options for running compactor2 in RPC write mode
 
+use compactor2::object_store::metrics::MetricsStore;
 use iox_query::exec::{Executor, ExecutorConfig};
 use iox_time::{SystemProvider, TimeProvider};
 use object_store::DynObjectStore;
@@ -97,7 +98,11 @@ pub async fn command(config: Config) -> Result<(), Error> {
 
     let parquet_store_real = ParquetStorage::new(object_store, StorageId::from("iox"));
     let parquet_store_scratchpad = ParquetStorage::new(
-        Arc::new(object_store::memory::InMemory::new()),
+        Arc::new(MetricsStore::new(
+            Arc::new(object_store::memory::InMemory::new()),
+            &metric_registry,
+            "scratchpad",
+        )),
         StorageId::from("iox_scratchpad"),
     );
 
@@ -112,6 +117,7 @@ pub async fn command(config: Config) -> Result<(), Error> {
     }));
     let time_provider = Arc::new(SystemProvider::new());
 
+    let process_once = config.compactor_config.process_once;
     let server_type = create_compactor2_server_type(
         &common_state,
         Arc::clone(&metric_registry),
@@ -127,5 +133,14 @@ pub async fn command(config: Config) -> Result<(), Error> {
     info!("starting compactor");
 
     let services = vec![Service::create(server_type, common_state.run_config())];
-    Ok(main::main(common_state, services, metric_registry).await?)
+
+    let res = main::main(common_state, services, metric_registry).await;
+    match res {
+        Ok(()) => Ok(()),
+        // compactor2 is allowed to shut itself down
+        Err(main::Error::Wrapper {
+            source: _source @ ioxd_common::Error::LostServer,
+        }) if process_once => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }

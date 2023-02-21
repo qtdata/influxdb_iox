@@ -12,7 +12,11 @@ use ingester::{
     lifecycle::LifecycleConfig,
     querier_handler::IngesterQueryResponse,
 };
-use iox_catalog::{interface::Catalog, mem::MemCatalog, validate_or_insert_schema};
+use iox_catalog::{
+    interface::{Catalog, SoftDeletedRows},
+    mem::MemCatalog,
+    validate_or_insert_schema,
+};
 use iox_query::exec::Executor;
 use iox_time::TimeProvider;
 use metric::{Attributes, Metric, MetricObserver};
@@ -174,7 +178,6 @@ impl TestContext {
     /// # Panics
     ///
     /// Must not be called twice with the same `name`.
-    #[track_caller]
     pub async fn ensure_namespace(
         &mut self,
         name: &str,
@@ -198,6 +201,7 @@ impl TestContext {
                         self.topic_id,
                         self.query_id,
                         iox_catalog::DEFAULT_MAX_COLUMNS_PER_TABLE,
+                        iox_catalog::DEFAULT_MAX_TABLES,
                         retention_period_ns,
                     ),
                 )
@@ -211,7 +215,6 @@ impl TestContext {
     }
 
     /// A helper wrapper over [`Self::enqueue_write()`] for line-protocol.
-    #[track_caller]
     pub async fn write_lp(
         &mut self,
         namespace: &str,
@@ -225,7 +228,7 @@ impl TestContext {
             .repositories()
             .await
             .namespaces()
-            .get_by_name(namespace)
+            .get_by_name(namespace, SoftDeletedRows::AllRows)
             .await
             .expect("should be able to get namespace by name")
             .expect("namespace does not exist")
@@ -305,7 +308,7 @@ impl TestContext {
             .repositories()
             .await
             .namespaces()
-            .get_by_name(namespace)
+            .get_by_name(namespace, SoftDeletedRows::AllRows)
             .await
             .expect("should be able to get namespace by name")
             .expect("namespace does not exist")
@@ -374,7 +377,7 @@ impl TestContext {
 
         self.metrics
             .get_instrument::<Metric<T>>(name)
-            .unwrap_or_else(|| panic!("failed to find metric {}", name))
+            .unwrap_or_else(|| panic!("failed to find metric {name}"))
             .get_observer(&attrs)
             .unwrap_or_else(|| {
                 panic!(

@@ -9,7 +9,6 @@ use clap::Parser;
 use clap_blocks::{
     catalog_dsn::CatalogDsnConfig,
     object_store::{make_object_store, ObjectStoreConfig},
-    write_buffer::WriteBufferConfig,
 };
 use influxdb_iox_client::connection::Connection;
 use iox_time::{SystemProvider, TimeProvider};
@@ -66,7 +65,7 @@ pub struct ValidationErrors(Vec<ValidationError>);
 impl Display for ValidationErrors {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         self.0.iter().fold(Ok(()), |result, e| {
-            result.and_then(|_| writeln!(f, "- {}", e))
+            result.and_then(|_| writeln!(f, "- {e}"))
         })
     }
 }
@@ -86,12 +85,25 @@ pub struct MergeConfig {
     #[clap(flatten)]
     catalog_dsn: CatalogDsnConfig,
 
-    #[clap(flatten)]
-    write_buffer_config: WriteBufferConfig,
+    /// Write buffer topic/database that should be used.
+    // This isn't really relevant to the RPC write path and will be removed eventually.
+    #[clap(
+        long = "write-buffer-topic",
+        env = "INFLUXDB_IOX_WRITE_BUFFER_TOPIC",
+        default_value = "iox-shared",
+        action
+    )]
+    pub topic: String,
 
-    #[clap(long)]
-    /// Name of the query pool (used only if we need to create the namespace)
-    query_pool_name: Option<String>,
+    /// Query pool name to dispatch writes to.
+    // This isn't really relevant to the RPC write path and will be removed eventually.
+    #[clap(
+        long = "query-pool",
+        env = "INFLUXDB_IOX_QUERY_POOL_NAME",
+        default_value = "iox-shared",
+        action
+    )]
+    pub query_pool_name: String,
 
     #[clap(long)]
     /// Retention setting setting (used only if we need to create the namespace)
@@ -167,7 +179,7 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Schem
             // note that this will also apply the schema override, if the user provided one
             let merged_tsm_schema = merger.merge().map_err(SchemaCommandError::Merging)?;
             // just print the merged schema for now; we'll do more with this in future PRs
-            println!("Merged schema:\n{:?}", merged_tsm_schema);
+            println!("Merged schema:\n{merged_tsm_schema:?}");
 
             // don't proceed unless we produce a valid merged schema
             if let Err(errors) = validate_schema(&merged_tsm_schema) {
@@ -183,8 +195,8 @@ pub async fn command(connection: Connection, config: Config) -> Result<(), Schem
             // the IOx catalog, if it exists, and update it with our aggregate schema
             update_iox_catalog(
                 &merged_tsm_schema,
-                merge_config.write_buffer_config.topic(),
-                merge_config.query_pool_name.as_deref(),
+                &merge_config.topic,
+                &merge_config.query_pool_name,
                 Arc::clone(&catalog),
                 connection.clone(),
             )

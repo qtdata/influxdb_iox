@@ -8,17 +8,15 @@ async fn influxql_returns_error() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
         vec![
             Step::WriteLineProtocol(format!(
-                "{},tag1=A,tag2=B val=42i 123456\n\
-                 {},tag1=A,tag2=C val=43i 123457",
-                table_name, table_name
+                "{table_name},tag1=A,tag2=B val=42i 123456\n\
+                 {table_name},tag1=A,tag2=C val=43i 123457"
             )),
-            Step::WaitForReadable,
             Step::InfluxQLExpectingError {
                 query: "SHOW TAG KEYS".into(),
                 expected_error_code: tonic::Code::InvalidArgument,
@@ -40,19 +38,17 @@ async fn influxql_select_returns_results() {
     let table_name = "the_table";
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     StepTest::new(
         &mut cluster,
         vec![
             Step::WriteLineProtocol(format!(
-                "{},tag1=A,tag2=B val=42i 123456\n\
-                 {},tag1=A,tag2=C val=43i 123457",
-                table_name, table_name
+                "{table_name},tag1=A,tag2=B val=42i 123456\n\
+                 {table_name},tag1=A,tag2=C val=43i 123457"
             )),
-            Step::WaitForReadable,
             Step::InfluxQLQuery {
-                query: format!("select tag1, val from {}", table_name),
+                query: format!("select tag1, val from {table_name}"),
                 expected: vec![
                     "+--------------------------------+------+-----+",
                     "| time                           | tag1 | val |",

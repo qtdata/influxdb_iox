@@ -6,7 +6,9 @@ use data_types::{
     Partition, PartitionKey, QueryPoolId, ShardId, TableSchema, TopicId,
 };
 use influxdb_iox_client::connection::{Connection, GrpcConnection};
-use iox_catalog::interface::{get_schema_by_name, CasFailure, Catalog, RepoCollection};
+use iox_catalog::interface::{
+    get_schema_by_name, CasFailure, Catalog, RepoCollection, SoftDeletedRows,
+};
 use schema::{
     sort::{adjust_sort_key_columns, SortKey, SortKeyBuilder},
     InfluxColumnType, InfluxFieldType, TIME_COLUMN_NAME,
@@ -57,7 +59,7 @@ pub enum UpdateCatalogError {
 pub async fn update_iox_catalog<'a>(
     merged_tsm_schema: &'a AggregateTSMSchema,
     topic: &'a str,
-    query_pool_name: Option<&'a str>,
+    query_pool_name: &'a str,
     catalog: Arc<dyn Catalog>,
     connection: Connection,
 ) -> Result<(), UpdateCatalogError> {
@@ -65,16 +67,15 @@ pub async fn update_iox_catalog<'a>(
         org_and_bucket_to_namespace(&merged_tsm_schema.org_id, &merged_tsm_schema.bucket_id)
             .map_err(UpdateCatalogError::InvalidOrgBucket)?;
     let mut repos = catalog.repositories().await;
-    let iox_schema = match get_schema_by_name(namespace_name.as_str(), repos.deref_mut()).await {
+    let iox_schema = match get_schema_by_name(
+        namespace_name.as_str(),
+        repos.deref_mut(),
+        SoftDeletedRows::AllRows,
+    )
+    .await
+    {
         Ok(iox_schema) => iox_schema,
         Err(iox_catalog::interface::Error::NamespaceNotFoundByName { .. }) => {
-            // Namespace has to be created; ensure the user provided the required parameters
-            let query_pool_name = match query_pool_name {
-                Some(query_pool_name) => query_pool_name,
-                _ => {
-                    return Err(UpdateCatalogError::NamespaceCreationError("in order to create the namespace you must provide query_pool_name and retention args".to_string()));
-                }
-            };
             // create the namespace
             let (topic_id, query_id) =
                 get_topic_id_and_query_id(repos.deref_mut(), topic, query_pool_name).await?;
@@ -87,7 +88,13 @@ pub async fn update_iox_catalog<'a>(
             .await?;
             // fetch the newly-created schema (which will be empty except for the time column,
             // which won't impact the merge we're about to do)
-            match get_schema_by_name(namespace_name.as_str(), repos.deref_mut()).await {
+            match get_schema_by_name(
+                namespace_name.as_str(),
+                repos.deref_mut(),
+                SoftDeletedRows::AllRows,
+            )
+            .await
+            {
                 Ok(iox_schema) => iox_schema,
                 Err(e) => return Err(UpdateCatalogError::CatalogError(e)),
             }
@@ -156,7 +163,7 @@ where
             // presumably it got created in the meantime?
             repos
                 .namespaces()
-                .get_by_name(name)
+                .get_by_name(name, SoftDeletedRows::ExcludeDeleted)
                 .await
                 .map_err(UpdateCatalogError::CatalogError)?
                 .ok_or_else(|| UpdateCatalogError::NamespaceNotFound(name.to_string()))
@@ -488,7 +495,7 @@ mod tests {
         };
         let join_handle = tokio::task::spawn(server);
         let connection = Builder::default()
-            .build(format!("http://{}", bind_addr))
+            .build(format!("http://{bind_addr}"))
             .await
             .expect("failed to connect to server");
         (connection, join_handle, requests)
@@ -534,16 +541,20 @@ mod tests {
         update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            Some("iox-shared"),
+            "iox-shared",
             Arc::clone(&catalog),
             connection,
         )
         .await
         .expect("schema update worked");
         let mut repos = catalog.repositories().await;
-        let iox_schema = get_schema_by_name("1234_5678", repos.deref_mut())
-            .await
-            .expect("got schema");
+        let iox_schema = get_schema_by_name(
+            "1234_5678",
+            repos.deref_mut(),
+            SoftDeletedRows::ExcludeDeleted,
+        )
+        .await
+        .expect("got schema");
         assert_eq!(iox_schema.tables.len(), 1);
         let table = iox_schema.tables.get("cpu").expect("got table");
         assert_eq!(table.columns.len(), 3); // one tag & one field, plus time
@@ -653,16 +664,20 @@ mod tests {
         update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            Some("iox-shared"),
+            "iox-shared",
             Arc::clone(&catalog),
             connection,
         )
         .await
         .expect("schema update worked");
         let mut repos = catalog.repositories().await;
-        let iox_schema = get_schema_by_name("1234_5678", repos.deref_mut())
-            .await
-            .expect("got schema");
+        let iox_schema = get_schema_by_name(
+            "1234_5678",
+            repos.deref_mut(),
+            SoftDeletedRows::ExcludeDeleted,
+        )
+        .await
+        .expect("got schema");
         assert_eq!(iox_schema.tables.len(), 1);
         let table = iox_schema.tables.get("weather").expect("got table");
         assert_eq!(table.columns.len(), 5); // two tags, two fields, plus time
@@ -750,7 +765,7 @@ mod tests {
         let err = update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            Some("iox-shared"),
+            "iox-shared",
             Arc::clone(&catalog),
             connection,
         )
@@ -829,7 +844,7 @@ mod tests {
         let err = update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            Some("iox-shared"),
+            "iox-shared",
             Arc::clone(&catalog),
             connection,
         )
@@ -839,55 +854,6 @@ mod tests {
         assert!(err.to_string().ends_with(
             "a column with name temperature already exists in the schema with a different type"
         ));
-    }
-
-    #[tokio::test]
-    async fn needs_creating_but_missing_query_pool() {
-        // init a test catalog stack
-        let metrics = Arc::new(metric::Registry::default());
-        let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-        catalog
-            .repositories()
-            .await
-            .topics()
-            .create_or_get("iox-shared")
-            .await
-            .expect("topic created");
-        let (connection, _join_handle, _requests) = create_test_shard_service(MapToShardResponse {
-            shard_id: 0,
-            shard_index: 0,
-        })
-        .await;
-
-        let json = r#"
-        {
-          "org_id": "1234",
-          "bucket_id": "5678",
-          "measurements": {
-            "cpu": {
-              "tags": [
-                { "name": "host", "values": ["server", "desktop"] }
-              ],
-             "fields": [
-                { "name": "usage", "types": ["Float"] }
-              ],
-              "earliest_time": "2022-01-01T00:00:00.00Z",
-              "latest_time": "2022-07-07T06:00:00.00Z"
-            }
-          }
-        }
-        "#;
-        let agg_schema: AggregateTSMSchema = json.try_into().unwrap();
-        let err = update_iox_catalog(
-            &agg_schema,
-            "iox-shared",
-            None,
-            Arc::clone(&catalog),
-            connection,
-        )
-        .await
-        .expect_err("should fail namespace creation");
-        assert_matches!(err, UpdateCatalogError::NamespaceCreationError(_));
     }
 
     #[tokio::test]
@@ -939,7 +905,7 @@ mod tests {
         update_iox_catalog(
             &agg_schema,
             "iox-shared",
-            Some("iox-shared"),
+            "iox-shared",
             Arc::clone(&catalog),
             connection,
         )

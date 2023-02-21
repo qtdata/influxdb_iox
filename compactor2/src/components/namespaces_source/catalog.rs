@@ -3,7 +3,7 @@ use std::{fmt::Display, sync::Arc};
 use async_trait::async_trait;
 use backoff::{Backoff, BackoffConfig};
 use data_types::{Namespace, NamespaceId, NamespaceSchema};
-use iox_catalog::interface::{get_schema_by_id, Catalog};
+use iox_catalog::interface::{get_schema_by_id, Catalog, SoftDeletedRows};
 
 use super::NamespacesSource;
 
@@ -37,7 +37,7 @@ impl NamespacesSource for CatalogNamespacesSource {
                     .repositories()
                     .await
                     .namespaces()
-                    .get_by_id(ns)
+                    .get_by_id(ns, SoftDeletedRows::AllRows)
                     .await
             })
             .await
@@ -45,14 +45,17 @@ impl NamespacesSource for CatalogNamespacesSource {
     }
 
     async fn fetch_schema_by_id(&self, ns: NamespaceId) -> Option<NamespaceSchema> {
-        let mut repos = self.catalog.repositories().await;
-
-        // todos:
-        //   1. Make this method perform retries.
-        //   2. If we do not plan to cache all table of a namespace, we should remove this function
-        //      and instead read and build TableSchema for a given TableId.
-        let ns = get_schema_by_id(ns, repos.as_mut()).await;
-
-        ns.ok()
+        Backoff::new(&self.backoff_config)
+            .retry_all_errors("namespace_of_given_namespace_id", || async {
+                let mut repos = self.catalog.repositories().await;
+                let res = get_schema_by_id(ns, repos.as_mut(), SoftDeletedRows::AllRows).await;
+                match res {
+                    Ok(schema) => Ok(Some(schema)),
+                    Err(iox_catalog::interface::Error::NamespaceNotFoundById { .. }) => Ok(None),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
+            .expect("retry forever")
     }
 }

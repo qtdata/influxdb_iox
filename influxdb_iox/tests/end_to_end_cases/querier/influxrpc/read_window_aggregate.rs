@@ -80,14 +80,13 @@ async fn do_read_window_aggregate_test(
     let expected_frames: Vec<String> = expected_frames.into_iter().map(|s| s.to_string()).collect();
 
     // Set up the cluster  ====================================
-    let mut cluster = MiniCluster::create_shared(database_url).await;
+    let mut cluster = MiniCluster::create_shared2(database_url).await;
 
     let line_protocol = input_lines.join("\n");
     StepTest::new(
         &mut cluster,
         vec![
             Step::WriteLineProtocol(line_protocol),
-            Step::WaitForReadable,
             Step::Custom(Box::new(move |state: &mut StepTestState| {
                 let request_builder = request_builder.clone();
                 let expected_frames = expected_frames.clone();
@@ -98,7 +97,7 @@ async fn do_read_window_aggregate_test(
                         .source(state.cluster())
                         .build_read_window_aggregate();
 
-                    println!("Sending read_window_aggregate request {:#?}", request);
+                    println!("Sending read_window_aggregate request {request:#?}");
 
                     let response = storage_client.read_window_aggregate(request).await.unwrap();
                     let responses: Vec<_> = response.into_inner().try_collect().await.unwrap();
@@ -112,8 +111,7 @@ async fn do_read_window_aggregate_test(
 
                     assert_eq!(
                         expected_frames, actual_frames,
-                        "\n\nExpected:\n{:#?}\nActual:\n{:#?}",
-                        expected_frames, actual_frames,
+                        "\n\nExpected:\n{expected_frames:#?}\nActual:\n{actual_frames:#?}",
                     );
                 }
                 .boxed()

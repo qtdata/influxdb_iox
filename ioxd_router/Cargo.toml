@@ -13,7 +13,7 @@ iox_catalog = { path = "../iox_catalog" }
 ioxd_common = { path = "../ioxd_common" }
 metric = { path = "../metric" }
 mutable_batch = { path = "../mutable_batch" }
-object_store = "0.5.2"
+object_store = "0.5.4"
 observability_deps = { path = "../observability_deps" }
 router = { path = "../router" }
 sharder = { path = "../sharder" }
@@ -27,5 +27,5 @@ hashbrown = { workspace = true }
 hyper = "0.14"
 thiserror = "1.0.38"
 tokio = { version = "1.25", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.4" }
+tokio-util = { version = "0.7.7" }
 workspace-hack = { path = "../workspace-hack"}

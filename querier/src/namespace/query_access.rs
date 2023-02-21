@@ -203,7 +203,7 @@ mod tests {
     use data_types::ColumnType;
     use datafusion::common::DataFusionError;
     use iox_query::frontend::sql::SqlQueryPlanner;
-    use iox_tests::util::{TestCatalog, TestParquetFileBuilder};
+    use iox_tests::{TestCatalog, TestParquetFileBuilder};
     use metric::{Observation, RawReporter};
     use regex::Regex;
     use snafu::{ResultExt, Snafu};
@@ -514,7 +514,7 @@ mod tests {
                 "| logical_plan  | Sort: mem.host ASC NULLS LAST, mem.time ASC NULLS LAST                                                                                             |",
                 "|               |   Projection: mem.host, mem.perc, mem.time                                                                                                         |",
                 "|               |     TableScan: mem projection=[host, perc, time]                                                                                                   |",
-                "| physical_plan | SortExec: [host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]                                                                                            |",
+                "| physical_plan | SortExec: expr=[host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]                                                                                       |",
                 "|               |   CoalescePartitionsExec                                                                                                                           |",
                 "|               |     ProjectionExec: expr=[host@0 as host, perc@1 as perc, time@2 as time]                                                                          |",
                 "|               |       UnionExec                                                                                                                                    |",
@@ -623,8 +623,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             expected_lines, actual_lines,
-            "\n\nexpected:\n\n{:#?}\nactual:\n\n{:#?}\n\n",
-            expected_lines, actual_lines
+            "\n\nexpected:\n\n{expected_lines:#?}\nactual:\n\n{actual_lines:#?}\n\n"
         );
     }
 

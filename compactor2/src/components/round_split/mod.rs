@@ -2,7 +2,9 @@ use std::fmt::{Debug, Display};
 
 use data_types::ParquetFile;
 
-pub mod all_now;
+use crate::RoundInfo;
+
+pub mod many_files;
 
 pub trait RoundSplit: Debug + Display + Send + Sync {
     /// Split files into two buckets "now" and "later".
@@ -11,5 +13,9 @@ pub trait RoundSplit: Debug + Display + Send + Sync {
     ///
     /// - **now:** will be processed in this round
     /// - **later:** will be processed in the next round
-    fn split(&self, files: Vec<ParquetFile>) -> (Vec<ParquetFile>, Vec<ParquetFile>);
+    fn split(
+        &self,
+        files: Vec<ParquetFile>,
+        round_info: &RoundInfo,
+    ) -> (Vec<ParquetFile>, Vec<ParquetFile>);
 }

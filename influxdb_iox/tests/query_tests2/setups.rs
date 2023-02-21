@@ -367,6 +367,18 @@ pub static SETUPS: Lazy<HashMap<SetupName, SetupSteps>> = Lazy::new(|| {
             ],
         ),
         (
+            "OneMeasurementWithTags",
+            vec![Step::WriteLineProtocol(
+                [
+                    "cpu,foo=me bar=1 10",
+                    "cpu,foo=you bar=2 20",
+                    "cpu,foo=me bar=1 30",
+                    "cpu,foo=me bar=1 40",
+                ]
+                .join("\n"),
+            )],
+        ),
+        (
             "PeriodsInNames",
             vec![Step::WriteLineProtocol(
                 [
@@ -516,6 +528,25 @@ pub static SETUPS: Lazy<HashMap<SetupName, SetupSteps>> = Lazy::new(|| {
                     [
                         "cpu,region=west user=23.2 1626809330000000000",
                         "cpu,region=west user=21.0 1626809430000000000",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+            ],
+        ),
+        (
+            "OneMeasurementTwoSeries",
+            vec![
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        "cpu,region=a user=23.2 957529200000000000", // 2000-05-05T12:20:00Z
+                        "cpu,region=a user=21.0 957530400000000000", // 2000-05-05T12:40:00Z
+                        "cpu,region=b user=25.2 957529860000000000", // 2000-05-05T12:31:00Z
+                        "cpu,region=b user=28.9 957530340000000000", // 2000-05-05T12:39:00Z
                     ]
                     .join("\n"),
                 ),
@@ -1099,6 +1130,115 @@ pub static SETUPS: Lazy<HashMap<SetupName, SetupSteps>> = Lazy::new(|| {
                 Step::Persist,
                 Step::WaitForPersisted2 {
                     expected_increase: 1,
+                },
+            ],
+        ),
+        (
+            // Single measurement that has several different chunks with different (but
+            // compatible) schemas
+            "MultiChunkSchemaMerge",
+            vec![
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        "cpu,region=west user=23.2,system=5.0 100",
+                        "cpu,region=west user=21.0,system=6.0 150",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        "cpu,region=east,host=foo user=23.2 100",
+                        "cpu,region=west,host=bar user=21.0 250",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+            ],
+        ),
+        (
+            "TwoMeasurementsUnsignedType",
+            vec![
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        "restaurant,town=andover count=40000u 100",
+                        "restaurant,town=reading count=632u 120",
+                        "school,town=reading count=17u 150",
+                        "school,town=andover count=25u 160",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+            ],
+        ),
+        (
+            // This has two chunks with different tag/key sets for queries whose columns do not
+            // include keys
+            "OneMeasurementTwoChunksDifferentTagSet",
+            vec![
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        // tag: state
+                        "h2o,state=MA temp=70.4 50",
+                        "h2o,state=MA other_temp=70.4 250",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    [
+                        // tag: city
+                        "h2o,city=Boston other_temp=72.4 350",
+                        "h2o,city=Boston temp=53.4,reading=51 50",
+                    ]
+                    .join("\n"),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 1,
+                },
+            ],
+        ),
+        (
+            // This is the dataset defined by https://github.com/influxdata/influxdb_iox/issues/6112
+            "InfluxQLSelectSupport",
+            vec![
+                Step::RecordNumParquetFiles,
+                Step::WriteLineProtocol(
+                    r#"
+                    m0,tag0=val00 f64=10.1,i64=101i,str="hi" 1667181600000000000
+                    m0,tag0=val00 f64=21.2,i64=211i,str="hi" 1667181610000000000
+                    m0,tag0=val00 f64=11.2,i64=191i,str="lo" 1667181620000000000
+                    m0,tag0=val00 f64=19.2,i64=392i,str="lo" 1667181630000000000
+                    m0,tag0=val01 f64=11.3,i64=211i,str="lo" 1667181600000000000
+                    m0,tag0=val02 f64=10.4,i64=101i,str="lo" 1667181600000000000
+                    m0,tag0=val00,tag1=val10 f64=18.9,i64=211i,str="lo" 1667181610000000000
+                    m1,tag0=val00 f64=100.5,i64=1001i,str="hi" 1667181600000000000
+                    m1,tag0=val00 f64=200.6,i64=2001i,str="lo" 1667181610000000000
+                    m1,tag0=val01 f64=101.7,i64=1011i,str="lo" 1667181600000000000
+                    "#
+                    .to_string(),
+                ),
+                Step::Persist,
+                Step::WaitForPersisted2 {
+                    expected_increase: 2,
                 },
             ],
         ),

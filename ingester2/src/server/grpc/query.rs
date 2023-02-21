@@ -161,7 +161,7 @@ where
                 self.query_request_limit_rejected.inc(1);
                 return Err(Error::RequestLimit)?;
             }
-            Err(e) => panic!("request limiter error: {}", e),
+            Err(e) => panic!("request limiter error: {e}"),
         };
 
         let ticket = request.into_inner();
@@ -318,7 +318,7 @@ fn encode_response(
 
             match partition.into_record_batch_stream() {
                 Some(stream) => {
-                    let stream = stream.map_err(FlightError::Arrow);
+                    let stream = stream.map_err(|e| FlightError::ExternalError(Box::new(e)));
 
                     let tail = FlightDataEncoderBuilder::new().build(stream);
 

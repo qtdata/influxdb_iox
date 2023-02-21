@@ -8,6 +8,7 @@ members = [
     "client_util",
     "compactor",
     "compactor2",
+    "compactor2_test_utils",
     "data_types",
     "datafusion_util",
     "dml",
@@ -58,7 +59,6 @@ members = [
     "predicate",
     "querier",
     "query_functions",
-    "query_tests",
     "router",
     "schema",
     "service_common",
@@ -115,12 +115,12 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "31.0.0" }
-arrow-flight = { version = "31.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="9c8bdfed1a51fd17e28dc1d7eb494844551a204b", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="9c8bdfed1a51fd17e28dc1d7eb494844551a204b" }
+arrow = { version = "32.0.0" }
+arrow-flight = { version = "32.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="253550c6c936f75f654dcdc9480025a9ef55d9fd", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="253550c6c936f75f654dcdc9480025a9ef55d9fd" }
 hashbrown = { version = "0.13.2" }
-parquet = { version = "31.0.0" }
+parquet = { version = "32.0.0" }
 
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.
