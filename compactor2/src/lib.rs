@@ -135,10 +135,6 @@
 //! - **behavior switches:** Switches like "ignore that partitions where flagged", "run once and exit", or "use this
 //!   pre-defined set of partitions" change the behavior of the system. This may be used for emergency situations or to
 //!   debug / develop the compactor.
-//! - **algorithm versions:** This sets [`AlgoVersion`] and fundamentally changes the behavior, e.g. from a simple demo
-//!   approach to some experimental new system. Note that this only changes the setup of the components, it does NOT
-//!   change the driver.
-//!
 //!
 //! [^duplicates_within_files]: The compactor design would not fundamentally change if the ingester would produce output
 //!     that contains duplicates within in single file. The current implementation however assumes that this is NOT the case.
@@ -183,8 +179,12 @@ mod round_info;
 
 // publically expose items needed for testing
 pub use components::{
-    df_planner::panic::PanicDataFusionPlanner, hardcoded::hardcoded_components,
-    namespaces_source::mock::NamespaceWrapper, parquet_files_sink::ParquetFilesSink, Components,
+    commit::{Commit, CommitWrapper},
+    df_planner::panic::PanicDataFusionPlanner,
+    hardcoded::hardcoded_components,
+    namespaces_source::mock::NamespaceWrapper,
+    parquet_files_sink::ParquetFilesSink,
+    Components,
 };
 pub use driver::compact;
 pub use error::DynError;

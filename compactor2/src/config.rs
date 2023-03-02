@@ -8,7 +8,7 @@ use iox_query::exec::Executor;
 use iox_time::TimeProvider;
 use parquet_file::storage::ParquetStorage;
 
-use crate::components::parquet_files_sink::ParquetFilesSink;
+use crate::components::{commit::CommitWrapper, parquet_files_sink::ParquetFilesSink};
 
 /// Config to set up a compactor.
 #[derive(Debug, Clone)]
@@ -98,9 +98,6 @@ pub struct Config {
     /// Shard config (if sharding should be enabled).
     pub shard_config: Option<ShardConfig>,
 
-    /// Version of the compaction algorithm.
-    pub compact_version: AlgoVersion,
-
     /// Minimum number of L1 files to compact to L2
     /// This is to prevent too many small files
     pub min_num_l1_files_to_compact: usize,
@@ -116,8 +113,14 @@ pub struct Config {
     /// This is useful for testing.
     pub simulate_without_object_store: bool,
 
-    /// Use the provided [`ParquetFilesSink`] to create parquet files (used for testing)
+    /// Use the provided [`ParquetFilesSink`] to create parquet files
+    /// (used for testing)
     pub parquet_files_sink_override: Option<Arc<dyn ParquetFilesSink>>,
+
+    /// Optionally wrap the `Commit` instance
+    ///
+    /// This is mostly used for testing
+    pub commit_wrapper: Option<Arc<dyn CommitWrapper>>,
 
     /// Ensure that ALL errors (including object store errors) result in "skipped" partitions.
     ///
@@ -195,21 +198,6 @@ pub struct ShardConfig {
     ///
     /// Starts as 0 and must be smaller than the number of shards.
     pub shard_id: usize,
-}
-
-/// Algorithm version used by the compactor
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum AlgoVersion {
-    /// Compact all files of a partition in a single DataFusion job that
-    /// prone to reject "too large" partitions.
-    AllAtOnce,
-
-    /// Repeat compacting files to higher levels until reaching the highest level.
-    /// Each compact job also ignores eligible  non-overlapping files and
-    /// upgrades upgradable files which make a single Datafusion job a lot smaller.
-    ///
-    /// NOT yet ready for production.
-    TargetLevel,
 }
 
 /// Partitions source config.

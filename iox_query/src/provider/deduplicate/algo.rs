@@ -391,7 +391,7 @@ impl RecordBatchDeduplicator {
 
 /// Get column name out of the `expr`. TODO use
 /// schema::SortKey instead.
-fn get_col_name(expr: &dyn PhysicalExpr) -> &str {
+pub(crate) fn get_col_name(expr: &dyn PhysicalExpr) -> &str {
     expr.as_any()
         .downcast_ref::<datafusion::physical_plan::expressions::Column>()
         .expect("expected column reference")
@@ -480,11 +480,11 @@ mod test {
             .unwrap();
 
         let expected = vec![
-            "+----+----+----+----+",
-            "| t1 | t2 | f1 | f2 |",
-            "+----+----+----+----+",
-            "| a  | c  | 4  | 2  |",
-            "+----+----+----+----+",
+            "+----+----+-----+-----+",
+            "| t1 | t2 | f1  | f2  |",
+            "+----+----+-----+-----+",
+            "| a  | c  | 4.0 | 2.0 |",
+            "+----+----+-----+-----+",
         ];
         assert_batches_eq!(&expected, &[results]);
     }
@@ -563,11 +563,11 @@ mod test {
             .unwrap();
 
         let expected = vec![
-            "+----+----+----+----+",
-            "| t1 | t2 | f1 | f2 |",
-            "+----+----+----+----+",
-            "| a  | c  | 4  | 5  |",
-            "+----+----+----+----+",
+            "+----+----+-----+-----+",
+            "| t1 | t2 | f1  | f2  |",
+            "+----+----+-----+-----+",
+            "| a  | c  | 4.0 | 5.0 |",
+            "+----+----+-----+-----+",
         ];
         assert_batches_eq!(&expected, &[results]);
     }

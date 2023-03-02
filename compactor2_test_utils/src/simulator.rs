@@ -1,12 +1,14 @@
 use std::{
     collections::BTreeSet,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use async_trait::async_trait;
 use data_types::{
-    ColumnSet, CompactionLevel, ParquetFile, ParquetFileId, ParquetFileParams, SequenceNumber,
-    ShardId, Timestamp,
+    ColumnSet, CompactionLevel, ParquetFile, ParquetFileParams, SequenceNumber, ShardId, Timestamp,
 };
 use datafusion::physical_plan::SendableRecordBatchStream;
 use iox_time::Time;
@@ -15,7 +17,7 @@ use uuid::Uuid;
 
 use compactor2::{DynError, ParquetFilesSink, PartitionInfo, PlanIR};
 
-use crate::{display_size, format_files};
+use crate::{display::total_size, display_size, format_files};
 
 /// Simulates the result of running a compaction plan that
 /// produces multiple parquet files.
@@ -45,7 +47,10 @@ use crate::{display_size, format_files};
 /// uniform distribution.
 #[derive(Debug, Default)]
 pub struct ParquetFileSimulator {
-    runs: Arc<Mutex<Vec<SimulatedRun>>>,
+    /// entries that are added to while running
+    run_log: Arc<Mutex<Vec<String>>>,
+    /// Used to generate run ids for display
+    run_id_generator: AtomicUsize,
 }
 
 impl std::fmt::Display for ParquetFileSimulator {
@@ -55,63 +60,18 @@ impl std::fmt::Display for ParquetFileSimulator {
 }
 
 impl ParquetFileSimulator {
-    /// Create a new simulator for creating parquet files
-    pub fn new() -> Self {
+    /// Create a new simulator for creating parquet files, which
+    /// appends its output to `run_log`
+    pub fn new(run_log: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
-            runs: Arc::new(Mutex::new(vec![])),
+            run_log,
+            run_id_generator: AtomicUsize::new(0),
         }
     }
 
-    /// Get a visual display of the simulated runs this simulator
-    /// has performed, for use in tests
-    pub fn runs(&self) -> Vec<String> {
-        let runs = (*self.runs.lock().unwrap()).clone();
-
-        runs.into_iter()
-            .enumerate()
-            .flat_map(|(i, run)| {
-                let SimulatedRun {
-                    plan_type,
-                    input_parquet_files,
-                    output_params,
-                } = run;
-
-                let input_title = format!(
-                    "**** Simulation run {}, type={}. {} Input Files, {} total:",
-                    i,
-                    plan_type,
-                    input_parquet_files.len(),
-                    display_size(total_size(input_parquet_files.iter()))
-                );
-
-                // display the files created by this run
-                let output_parquet_files: Vec<_> = output_params
-                    .into_iter()
-                    .map(|params| {
-                        // Use file id 0 as they haven't been
-                        // assigned an id in the catalog yet
-                        ParquetFile::from_params(params, ParquetFileId::new(0))
-                    })
-                    .collect();
-
-                let output_title = format!(
-                    "**** {} Output Files (parquet_file_id not yet assigned), {} total:",
-                    output_parquet_files.len(),
-                    display_size(total_size(output_parquet_files.iter()))
-                );
-
-                // hook up inputs and outputs
-                format_files(input_title, &input_parquet_files)
-                    .into_iter()
-                    .chain(format_files(output_title, &output_parquet_files).into_iter())
-            })
-            .collect()
+    fn next_run_id(&self) -> usize {
+        self.run_id_generator.fetch_add(1, Ordering::SeqCst)
     }
-}
-
-/// return the total file size of all the parquet files
-fn total_size<'a>(parquet_files: impl IntoIterator<Item = &'a ParquetFile>) -> i64 {
-    parquet_files.into_iter().map(|f| f.file_size_bytes).sum()
 }
 
 #[async_trait]
@@ -169,11 +129,13 @@ impl ParquetFilesSink for ParquetFileSimulator {
             .collect();
 
         // record what the simulator did
-        self.runs.lock().unwrap().push(SimulatedRun {
+        let run = SimulatedRun {
+            run_id: self.next_run_id(),
             plan_type,
             input_parquet_files,
             output_params: output_params.clone(),
-        });
+        };
+        self.run_log.lock().unwrap().extend(run.into_strings());
 
         Ok(output_params)
     }
@@ -254,10 +216,42 @@ impl SimulatedFile {
 /// purposes
 #[derive(Debug, Clone)]
 pub struct SimulatedRun {
+    run_id: usize,
     // fields are used in testing
     plan_type: String,
     input_parquet_files: Vec<ParquetFile>,
     output_params: Vec<ParquetFileParams>,
+}
+
+impl SimulatedRun {
+    /// Convert this simulated run into a set of human readable strings
+    fn into_strings(self) -> impl Iterator<Item = String> {
+        let Self {
+            run_id,
+            plan_type,
+            input_parquet_files,
+            output_params,
+        } = self;
+
+        let input_title = format!(
+            "**** Simulation run {}, type={}. {} Input Files, {} total:",
+            run_id,
+            plan_type,
+            input_parquet_files.len(),
+            display_size(total_size(&input_parquet_files))
+        );
+
+        let output_title = format!(
+            "**** {} Output Files (parquet_file_id not yet assigned), {} total:",
+            output_params.len(),
+            display_size(total_size(&output_params))
+        );
+
+        // hook up inputs and outputs
+        format_files(input_title, &input_parquet_files)
+            .into_iter()
+            .chain(format_files(output_title, &output_params).into_iter())
+    }
 }
 
 fn overall_column_set<'a>(files: impl IntoIterator<Item = &'a ParquetFile>) -> ColumnSet {

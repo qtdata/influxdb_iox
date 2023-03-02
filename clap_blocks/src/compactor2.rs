@@ -1,26 +1,6 @@
 //! CLI config for compactor2-related commands
 
-use std::{fmt::Display, num::NonZeroUsize};
-
-use clap::ValueEnum;
-
-/// Algorithm version used by the compactor
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Default, ValueEnum)]
-pub enum CompactorAlgoVersion {
-    // Note: clap only keeps the first line for the help text, so try to be brief.
-    /// Compacts all files of a partition in single DataFusion job, prone to reject "too large" partitions. Default.
-    #[default]
-    AllAtOnce,
-
-    /// Repeat to compact to higher level until reaching the highest level. NOT yet ready for production
-    TargetLevel,
-}
-
-impl Display for CompactorAlgoVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
+use std::num::NonZeroUsize;
 
 /// CLI config for compactor2
 #[derive(Debug, Clone, clap::Parser)]
@@ -72,13 +52,13 @@ pub struct Compactor2Config {
 
     /// Number of threads to use for the compactor query execution,
     /// compaction and persistence.
+    /// If not specified, defaults to one less than the number of cores on the system
     #[clap(
         long = "query-exec-thread-count",
         env = "INFLUXDB_IOX_QUERY_EXEC_THREAD_COUNT",
-        default_value = "4",
         action
     )]
-    pub query_exec_thread_count: usize,
+    pub query_exec_thread_count: Option<NonZeroUsize>,
 
     /// Size of memory pool used during compaction plan execution, in
     /// bytes.
@@ -106,12 +86,20 @@ pub struct Compactor2Config {
     )]
     pub max_desired_file_size_bytes: u64,
 
-    /// Percentage of desired max file size.
+    /// Percentage of desired max file size for "leading edge split"
+    /// optimization.
     ///
-    /// If the estimated compacted result is too small, no need to split it.
-    /// This percentage is to determine how small it is:
-    ///    < percentage_max_file_size * max_desired_file_size_bytes:
+    /// This setting controls the estimated output file size at which
+    /// the compactor will apply the "leading edge" optimization.
+    ///
+    /// When compacting files together, if the output size is
+    /// estimated to be greater than the following quantity, the
+    /// "leading edge split" optimization will be applied:
+    ///
+    /// percentage_max_file_size * max_desired_file_size_bytes
+    ///
     /// This value must be between (0, 100)
+    ///
     /// Default is 20
     #[clap(
         long = "compaction-percentage-max-file_size",
@@ -121,15 +109,33 @@ pub struct Compactor2Config {
     )]
     pub percentage_max_file_size: u16,
 
-    /// Split file percentage
-    /// If the estimated compacted result is neither too small nor too large, it will be
-    /// split into 2 files determined by this percentage.
-    ///    . Too small means: < percentage_max_file_size * max_desired_file_size_bytes
-    ///    . Too large means: > max_desired_file_size_bytes
-    ///    . Any size in the middle will be considered neither too small nor too large
+    /// Split file percentage for "leading edge split"
+    ///
+    /// To reduce the likelihood of recompacting the same data too many
+    /// times, the compactor uses the "leading edge split"
+    /// optimization for the common case where the new data written
+    /// into a partition also has the most recent timestamps.
+    ///
+    /// When compacting multiple files together, if the compactor
+    /// estimates the resulting file will be large enough (see
+    /// `percentage_max_file_size`) it creates two output files
+    /// rather than one, split by time, like this:
+    ///
+    /// `|-------------- older_data -----------------||---- newer_data ----|`
+    ///
+    /// In the common case, the file containing `older_data` is less
+    /// likely to overlap with new data written in.
+    ///
+    /// This setting controls what percentage of data is placed into
+    /// the `older_data` portion.
+    ///
+    /// Increasing this value increases the average size of compacted
+    /// files after the first round of compaction. However, doing so
+    /// also increase the likelihood that late arriving data will
+    /// overlap with larger existing files, necessitating additional
+    /// compaction rounds.
     ///
     /// This value must be between (0, 100)
-    /// Default is 80
     #[clap(
         long = "compaction-split-percentage",
         env = "INFLUXDB_IOX_COMPACTION_SPLIT_PERCENTAGE",
@@ -235,15 +241,6 @@ pub struct Compactor2Config {
         action
     )]
     pub shard_id: Option<usize>,
-
-    /// Version of the compaction algorithm.
-    #[clap(
-        long = "compaction-compact-version",
-        env = "INFLUXDB_IOX_COMPACTION_COMPACT_VERSION",
-        default_value_t = CompactorAlgoVersion::default(),
-        value_enum
-    )]
-    pub compact_version: CompactorAlgoVersion,
 
     /// Minimum number of L1 files to compact to L2.
     ///

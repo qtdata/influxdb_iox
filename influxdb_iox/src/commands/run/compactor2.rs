@@ -7,6 +7,7 @@ use object_store::DynObjectStore;
 use object_store_metrics::ObjectStoreMetrics;
 use observability_deps::tracing::*;
 use parquet_file::storage::{ParquetStorage, StorageId};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -106,9 +107,18 @@ pub async fn command(config: Config) -> Result<(), Error> {
         StorageId::from("iox_scratchpad"),
     );
 
+    let num_threads = config
+        .compactor_config
+        .query_exec_thread_count
+        .unwrap_or_else(|| {
+            NonZeroUsize::new(num_cpus::get().saturating_sub(1))
+                .unwrap_or_else(|| NonZeroUsize::new(1).unwrap())
+        });
+    info!(%num_threads, "using specified number of threads");
+
     let exec = Arc::new(Executor::new_with_config(ExecutorConfig {
-        num_threads: config.compactor_config.query_exec_thread_count,
-        target_query_partitions: config.compactor_config.query_exec_thread_count,
+        num_threads,
+        target_query_partitions: num_threads,
         object_stores: [&parquet_store_real, &parquet_store_scratchpad]
             .into_iter()
             .map(|store| (store.id(), Arc::clone(store.object_store())))

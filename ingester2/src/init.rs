@@ -37,7 +37,10 @@ use crate::{
         completion_observer::NopObserver, handle::PersistHandle,
         hot_partitions::HotPartitionPersister,
     },
-    query::{instrumentation::QueryExecInstrumentation, tracing::QueryExecTracing},
+    query::{
+        exec_instrumentation::QueryExecInstrumentation,
+        result_instrumentation::QueryResultInstrumentation, tracing::QueryExecTracing,
+    },
     server::grpc::GrpcDelegate,
     timestamp_oracle::TimestampOracle,
     wal::{rotate_task::periodic_rotation, wal_sink::WalSink},
@@ -245,8 +248,7 @@ where
         BackoffConfig::default(),
     ));
 
-    // Read the most recently created partitions for the shards this ingester
-    // instance will be consuming from.
+    // Read the most recently created partitions.
     //
     // By caching these hot partitions overall catalog load after an ingester
     // starts up is reduced, and the associated query latency is removed from
@@ -255,7 +257,7 @@ where
         .repositories()
         .await
         .partitions()
-        .most_recent_n(40_000, &[transition_shard.id])
+        .most_recent_n(40_000)
         .await
         .map_err(InitError::PreWarmPartitions)?;
 
@@ -340,9 +342,10 @@ where
     );
 
     // And the chain of QueryExec that forms the read path.
+    let read_path = QueryResultInstrumentation::new(Arc::clone(&buffer), &metrics);
     let read_path = QueryExecInstrumentation::new(
         "buffer",
-        QueryExecTracing::new(Arc::clone(&buffer), "buffer"),
+        QueryExecTracing::new(read_path, "buffer"),
         &metrics,
     );
 
