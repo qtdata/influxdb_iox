@@ -1,4 +1,4 @@
-use arrow::buffer::Buffer;
+use arrow::buffer::{BooleanBuffer, Buffer};
 use std::ops::Range;
 
 /// An arrow-compatible mutable bitset implementation
@@ -173,8 +173,9 @@ impl BitSet {
     }
 
     /// Converts this BitSet to a buffer compatible with arrows boolean encoding
-    pub fn to_arrow(&self) -> Buffer {
-        Buffer::from(&self.buffer)
+    pub fn to_arrow(&self) -> BooleanBuffer {
+        let offset = 0;
+        BooleanBuffer::new(Buffer::from(&self.buffer), offset, self.len)
     }
 
     /// Returns the number of values stored in the bitset
@@ -329,7 +330,7 @@ mod tests {
     }
 
     fn make_rng() -> StdRng {
-        let seed = OsRng::default().next_u64();
+        let seed = OsRng.next_u64();
         println!("Seed: {seed}");
         StdRng::seed_from_u64(seed)
     }
@@ -494,8 +495,8 @@ mod tests {
         mask.append_bits(bools.len(), &collected);
         let mask_buffer = mask.to_arrow();
 
-        assert_eq!(collected.as_slice(), buffer.as_slice());
-        assert_eq!(buffer.as_slice(), mask_buffer.as_slice());
+        assert_eq!(collected.as_slice(), buffer.values());
+        assert_eq!(buffer.values(), mask_buffer.into_inner().as_slice());
     }
 
     #[test]

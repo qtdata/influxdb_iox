@@ -1,10 +1,12 @@
 //! Write payload abstractions derived from [`MutableBatch`]
 
 use crate::{column::ColumnData, MutableBatch, Result};
-use data_types::{PartitionKey, PartitionTemplate};
+use data_types::{partition_template::TablePartitionTemplateOverride, PartitionKey};
 use hashbrown::HashMap;
 use schema::TIME_COLUMN_NAME;
 use std::{num::NonZeroUsize, ops::Range};
+
+pub use self::partition::PartitionKeyError;
 
 mod filter;
 mod partition;
@@ -97,22 +99,20 @@ impl<'a> PartitionWrite<'a> {
     }
 
     /// Create a collection of [`PartitionWrite`] indexed by partition key
-    /// from a [`MutableBatch`] and [`PartitionTemplate`]
+    /// from a [`MutableBatch`] and [`TablePartitionTemplateOverride`]
     pub fn partition(
-        table_name: &str,
         batch: &'a MutableBatch,
-        partition_template: &PartitionTemplate,
-    ) -> HashMap<PartitionKey, Self> {
+        partition_template: &TablePartitionTemplateOverride,
+    ) -> Result<HashMap<PartitionKey, Self>, PartitionKeyError> {
         use hashbrown::hash_map::Entry;
         let time = get_time_column(batch);
 
         let mut partition_ranges = HashMap::new();
-        for (partition, range) in partition::partition_batch(batch, table_name, partition_template)
-        {
+        for (partition, range) in partition::partition_batch(batch, partition_template) {
             let row_count = NonZeroUsize::new(range.end - range.start).unwrap();
             let (min_timestamp, max_timestamp) = min_max_time(&time[range.clone()]);
 
-            match partition_ranges.entry(PartitionKey::from(partition)) {
+            match partition_ranges.entry(PartitionKey::from(partition?)) {
                 Entry::Vacant(v) => {
                     v.insert(PartitionWrite {
                         batch,
@@ -131,7 +131,7 @@ impl<'a> PartitionWrite<'a> {
                 }
             }
         }
-        partition_ranges
+        Ok(partition_ranges)
     }
 }
 

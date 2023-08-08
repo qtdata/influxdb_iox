@@ -1,4 +1,4 @@
-//! An abstract resolver of [`PartitionData`] for a given shard & table.
+//! An abstract resolver of [`PartitionData`] for a given table.
 //!
 //! [`PartitionData`]: crate::buffer_tree::partition::PartitionData
 
@@ -14,7 +14,10 @@ pub(crate) use catalog::*;
 mod sort_key;
 pub(crate) use sort_key::*;
 
+mod coalesce;
+pub(crate) use coalesce::*;
+
+pub mod old_filter;
+
 #[cfg(test)]
-mod mock;
-#[cfg(test)]
-pub(crate) use mock::*;
+pub(crate) mod mock;

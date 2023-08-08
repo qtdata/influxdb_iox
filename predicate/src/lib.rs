@@ -3,44 +3,38 @@
     missing_copy_implementations,
     missing_debug_implementations,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 pub mod delete_expr;
 pub mod delete_predicate;
 pub mod rpc_predicate;
 
-use arrow::{
-    array::{
-        BooleanArray, Float64Array, Int64Array, StringArray, TimestampNanosecondArray, UInt64Array,
-    },
-    datatypes::SchemaRef,
-};
-use data_types::{InfluxDbType, TableSummary, TimestampRange};
+use data_types::TimestampRange;
 use datafusion::{
+    common::tree_node::{TreeNode, TreeNodeVisitor, VisitRecursion},
     error::DataFusionError,
-    logical_expr::{
-        binary_expr,
-        expr_visitor::{ExprVisitable, ExpressionVisitor, Recursion},
-        utils::expr_to_columns,
-        BinaryExpr,
-    },
+    logical_expr::{binary_expr, utils::expr_to_columns, BinaryExpr},
     optimizer::utils::split_conjunction,
-    physical_optimizer::pruning::{PruningPredicate, PruningStatistics},
     prelude::{col, lit_timestamp_nano, Expr},
 };
-use datafusion_util::{make_range_expr, nullable_schema, AsExpr};
+use datafusion_util::{make_range_expr, AsExpr};
 use observability_deps::tracing::debug;
 use rpc_predicate::VALUE_COLUMN_NAME;
 use schema::TIME_COLUMN_NAME;
 use std::{
     collections::{BTreeSet, HashSet},
     fmt,
-    sync::Arc,
+    ops::Not,
 };
 
 /// This `Predicate` represents the empty predicate (aka that evaluates to true for all rows).
@@ -245,123 +239,6 @@ impl Predicate {
 
         self
     }
-
-    /// Apply predicate to given table summary and avoid having to
-    /// look at actual data.
-    pub fn apply_to_table_summary(
-        &self,
-        table_summary: &TableSummary,
-        schema: SchemaRef,
-    ) -> PredicateMatch {
-        let summary = SummaryWrapper {
-            summary: table_summary,
-        };
-
-        // If we don't have statistics for a particular column, its
-        // value will be null, so we need to ensure the schema we used
-        // in pruning predicates allows for null.
-        let schema = nullable_schema(schema);
-
-        if let Some(expr) = self.filter_expr() {
-            match PruningPredicate::try_new(expr.clone(), Arc::clone(&schema)) {
-                Ok(pp) => {
-                    match pp.prune(&summary) {
-                        Ok(matched) => {
-                            assert_eq!(matched.len(), 1);
-                            if matched[0] {
-                                // might match
-                                return PredicateMatch::Unknown;
-                            } else {
-                                // does not match => since expressions are `AND`ed, we know that we will have zero matches
-                                return PredicateMatch::Zero;
-                            }
-                        }
-                        Err(e) => {
-                            debug!(
-                                %e,
-                                %expr,
-                                "cannot prune summary with PruningPredicate",
-                            );
-                            return PredicateMatch::Unknown;
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        %e,
-                        %expr,
-                        "cannot create PruningPredicate from expression",
-                    );
-                    return PredicateMatch::Unknown;
-                }
-            }
-        }
-
-        PredicateMatch::Unknown
-    }
-}
-
-struct SummaryWrapper<'a> {
-    summary: &'a TableSummary,
-}
-
-impl<'a> PruningStatistics for SummaryWrapper<'a> {
-    fn min_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let col = self.summary.column(&column.name)?;
-        let stats = &col.stats;
-
-        // special handling for timestamps
-        if col.influxdb_type == InfluxDbType::Timestamp {
-            let val = stats.as_i64()?;
-            return Some(Arc::new(TimestampNanosecondArray::from(vec![val.min])));
-        }
-
-        let array = match stats {
-            data_types::Statistics::I64(val) => Arc::new(Int64Array::from(vec![val.min])) as _,
-            data_types::Statistics::U64(val) => Arc::new(UInt64Array::from(vec![val.min])) as _,
-            data_types::Statistics::F64(val) => Arc::new(Float64Array::from(vec![val.min])) as _,
-            data_types::Statistics::Bool(val) => Arc::new(BooleanArray::from(vec![val.min])) as _,
-            data_types::Statistics::String(val) => {
-                Arc::new(StringArray::from(vec![val.min.as_deref()])) as _
-            }
-        };
-
-        Some(array)
-    }
-
-    fn max_values(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let col = self.summary.column(&column.name)?;
-        let stats = &col.stats;
-
-        // special handling for timestamps
-        if col.influxdb_type == InfluxDbType::Timestamp {
-            let val = stats.as_i64()?;
-            return Some(Arc::new(TimestampNanosecondArray::from(vec![val.max])));
-        }
-
-        let array = match stats {
-            data_types::Statistics::I64(val) => Arc::new(Int64Array::from(vec![val.max])) as _,
-            data_types::Statistics::U64(val) => Arc::new(UInt64Array::from(vec![val.max])) as _,
-            data_types::Statistics::F64(val) => Arc::new(Float64Array::from(vec![val.max])) as _,
-            data_types::Statistics::Bool(val) => Arc::new(BooleanArray::from(vec![val.max])) as _,
-            data_types::Statistics::String(val) => {
-                Arc::new(StringArray::from(vec![val.max.as_deref()])) as _
-            }
-        };
-
-        Some(array)
-    }
-
-    fn num_containers(&self) -> usize {
-        // the summary represents a single virtual container
-        1
-    }
-
-    fn null_counts(&self, column: &datafusion::prelude::Column) -> Option<arrow::array::ArrayRef> {
-        let null_count = self.summary.column(&column.name)?.stats.null_count();
-
-        Some(Arc::new(UInt64Array::from(vec![null_count])))
-    }
 }
 
 impl fmt::Display for Predicate {
@@ -401,21 +278,6 @@ impl fmt::Display for Predicate {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-/// The result of evaluating a predicate on a set of rows
-pub enum PredicateMatch {
-    /// There is at least one row that matches the predicate that has
-    /// at least one non null value in each field of the predicate
-    AtLeastOneNonNullField,
-
-    /// There are exactly zero rows that match the predicate
-    Zero,
-
-    /// There *may* be rows that match, OR there *may* be no rows that
-    /// match
-    Unknown,
-}
-
 impl Predicate {
     /// Sets the timestamp range
     pub fn with_range(mut self, start: i64, end: i64) -> Self {
@@ -444,7 +306,7 @@ impl Predicate {
 
     /// Add an  exprestion "time >= retention_time"
     pub fn with_retention(mut self, retention_time: i64) -> Self {
-        let expr = col(TIME_COLUMN_NAME).gt_eq(lit_timestamp_nano(retention_time));
+        let expr = col(TIME_COLUMN_NAME).gt(lit_timestamp_nano(retention_time));
         self.exprs.push(expr);
         self
     }
@@ -533,9 +395,10 @@ impl Predicate {
                     return false;
                 }
 
-                expr.accept(RowBasedVisitor::default())
-                    .expect("never fails")
-                    .row_based
+                let mut visitor = RowBasedVisitor::default();
+                expr.visit(&mut visitor).expect("never fails");
+
+                visitor.row_based
             })
             .cloned()
             .collect();
@@ -598,7 +461,18 @@ impl From<ValueExpr> for Expr {
     }
 }
 
-/// Recursively walk an expression tree, checking if the expression is row-based.
+/// Recursively walk an expression tree, checking if the expression is
+/// row-based.
+///
+/// A row-based function takes one row in and produces
+/// one value as output.
+///
+/// Note that even though a predicate expression  like `col < 5` can be used to
+/// filter rows, the expression itself is row-based (produces a single boolean).
+///
+/// Examples of non row based expressions are Aggregate and
+/// Window function which produce different cardinality than their
+/// input.
 struct RowBasedVisitor {
     row_based: bool,
 }
@@ -609,10 +483,12 @@ impl Default for RowBasedVisitor {
     }
 }
 
-impl ExpressionVisitor for RowBasedVisitor {
-    fn pre_visit(mut self, expr: &Expr) -> Result<Recursion<Self>, DataFusionError> {
+impl TreeNodeVisitor for RowBasedVisitor {
+    type N = Expr;
+
+    fn pre_visit(&mut self, expr: &Expr) -> Result<VisitRecursion, DataFusionError> {
         match expr {
-            Expr::Alias(_, _)
+            Expr::Alias(_)
             | Expr::Between { .. }
             | Expr::BinaryExpr { .. }
             | Expr::Case { .. }
@@ -620,7 +496,6 @@ impl ExpressionVisitor for RowBasedVisitor {
             | Expr::Column(_)
             | Expr::Exists { .. }
             | Expr::GetIndexedField { .. }
-            | Expr::ILike { .. }
             | Expr::InList { .. }
             | Expr::InSubquery { .. }
             | Expr::IsFalse(_)
@@ -635,6 +510,7 @@ impl ExpressionVisitor for RowBasedVisitor {
             | Expr::Literal(_)
             | Expr::Negative(_)
             | Expr::Not(_)
+            | Expr::OuterReferenceColumn(_, _)
             | Expr::Placeholder { .. }
             | Expr::QualifiedWildcard { .. }
             | Expr::ScalarFunction { .. }
@@ -644,13 +520,13 @@ impl ExpressionVisitor for RowBasedVisitor {
             | Expr::SimilarTo { .. }
             | Expr::Sort { .. }
             | Expr::TryCast { .. }
-            | Expr::Wildcard => Ok(Recursion::Continue(self)),
+            | Expr::Wildcard => Ok(VisitRecursion::Continue),
             Expr::AggregateFunction { .. }
             | Expr::AggregateUDF { .. }
             | Expr::GroupingSet(_)
             | Expr::WindowFunction { .. } => {
                 self.row_based = false;
-                Ok(Recursion::Stop(self))
+                Ok(VisitRecursion::Stop)
             }
         }
     }
@@ -660,10 +536,9 @@ impl ExpressionVisitor for RowBasedVisitor {
 mod tests {
     use super::*;
     use arrow::datatypes::DataType as ArrowDataType;
-    use data_types::{ColumnSummary, InfluxDbType, StatValues, MAX_NANO_TIME, MIN_NANO_TIME};
+    use data_types::{MAX_NANO_TIME, MIN_NANO_TIME};
     use datafusion::prelude::{col, cube, lit};
     use schema::builder::SchemaBuilder;
-    use test_helpers::maybe_start_logging;
 
     #[test]
     fn test_default_predicate_is_empty() {
@@ -771,164 +646,6 @@ mod tests {
         let expected = Predicate::new().with_expr(col("foo").eq(lit(42)));
         // rewrite
         assert_eq!(p.with_clear_timestamp_if_max_range(), expected);
-    }
-
-    #[test]
-    fn test_apply_to_table_summary() {
-        maybe_start_logging();
-
-        let p = Predicate::new()
-            .with_range(100, 200)
-            .with_expr(col("foo").eq(lit(42i64)))
-            .with_expr(col("bar").eq(lit(42i64)))
-            .with_expr(col(TIME_COLUMN_NAME).gt(lit_timestamp_nano(120i64)));
-
-        let schema = SchemaBuilder::new()
-            .field("foo", ArrowDataType::Int64)
-            .unwrap()
-            .field("bar", ArrowDataType::Int64)
-            .unwrap()
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: "foo".to_owned(),
-                influxdb_type: InfluxDbType::Field,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(10),
-                    max: Some(20),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: "foo".to_owned(),
-                influxdb_type: InfluxDbType::Field,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(10),
-                    max: Some(50),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Unknown,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(115),
-                    max: Some(115),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(300),
-                    max: Some(300),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
-
-        let summary = TableSummary {
-            columns: vec![ColumnSummary {
-                name: TIME_COLUMN_NAME.to_owned(),
-                influxdb_type: InfluxDbType::Timestamp,
-                stats: data_types::Statistics::I64(StatValues {
-                    min: Some(150),
-                    max: Some(300),
-                    null_count: Some(0),
-                    total_count: 1_000,
-                    distinct_count: None,
-                }),
-            }],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Unknown,
-        )
-    }
-
-    /// Test that pruning works even when some expressions within the predicate cannot be evaluated by DataFusion
-    #[test]
-    fn test_apply_to_table_summary_partially_unsupported() {
-        maybe_start_logging();
-
-        let p = Predicate::new()
-            .with_range(100, 200)
-            .with_expr(col("foo").eq(lit(42i64)).not()); // NOT expressions are currently mostly unsupported by DataFusion
-
-        let schema = SchemaBuilder::new()
-            .field("foo", ArrowDataType::Int64)
-            .unwrap()
-            .timestamp()
-            .build()
-            .unwrap();
-
-        let summary = TableSummary {
-            columns: vec![
-                ColumnSummary {
-                    name: TIME_COLUMN_NAME.to_owned(),
-                    influxdb_type: InfluxDbType::Timestamp,
-                    stats: data_types::Statistics::I64(StatValues {
-                        min: Some(10),
-                        max: Some(20),
-                        null_count: Some(0),
-                        total_count: 1_000,
-                        distinct_count: None,
-                    }),
-                },
-                ColumnSummary {
-                    name: "foo".to_owned(),
-                    influxdb_type: InfluxDbType::Field,
-                    stats: data_types::Statistics::I64(StatValues {
-                        min: Some(10),
-                        max: Some(20),
-                        null_count: Some(0),
-                        total_count: 1_000,
-                        distinct_count: None,
-                    }),
-                },
-            ],
-        };
-        assert_eq!(
-            p.apply_to_table_summary(&summary, schema.as_arrow()),
-            PredicateMatch::Zero,
-        );
     }
 
     #[test]

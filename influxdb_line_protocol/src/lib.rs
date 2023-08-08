@@ -1,12 +1,60 @@
-//! This module contains a pure rust implementation of a parser for InfluxDB
-//! Line Protocol <https://v2.docs.influxdata.com/v2.0/reference/syntax/line-protocol>
+//! This crate contains pure Rust implementations of
 //!
-//! This implementation is intended to be compatible with the Go implementation,
-//! <https://github.com/influxdata/influxdb/blob/217eddc87e14a79b01d0c22994fc139f530094a2/models/points_parser.go>
+//! 1. A [parser](crate::parse_lines) for [InfluxDB Line Protocol] developed as part of the
+//! [InfluxDB IOx] project.  This implementation is intended to be
+//! compatible with the [Go implementation], however, this
+//! implementation uses a [nom] combinator-based parser rather than
+//! attempting to port the imperative Go logic so there are likely
+//! some small differences.
 //!
-//! However, this implementation uses a nom combinator based parser
-//! rather than attempting to port the imperative Go logic.
-
+//! 2. A [builder](crate::builder::LineProtocolBuilder) to construct valid [InfluxDB Line Protocol]
+//!
+//! # Example
+//!
+//! Here is an example of how to parse the following line
+//! protocol data into a `ParsedLine`:
+//!
+//! ```text
+//!cpu,host=A,region=west usage_system=64.2 1590488773254420000
+//!```
+//!
+//! ```
+//! use influxdb_line_protocol::{ParsedLine, FieldValue};
+//!
+//! let mut parsed_lines =
+//!     influxdb_line_protocol::parse_lines(
+//!         "cpu,host=A,region=west usage_system=64i 1590488773254420000"
+//!     );
+//! let parsed_line = parsed_lines
+//!     .next()
+//!     .expect("Should have at least one line")
+//!     .expect("Should parse successfully");
+//!
+//! let ParsedLine {
+//!     series,
+//!     field_set,
+//!     timestamp,
+//! } = parsed_line;
+//!
+//! assert_eq!(series.measurement, "cpu");
+//!
+//! let tags = series.tag_set.unwrap();
+//! assert_eq!(tags[0].0, "host");
+//! assert_eq!(tags[0].1, "A");
+//! assert_eq!(tags[1].0, "region");
+//! assert_eq!(tags[1].1, "west");
+//!
+//! let field = &field_set[0];
+//! assert_eq!(field.0, "usage_system");
+//! assert_eq!(field.1, FieldValue::I64(64));
+//!
+//! assert_eq!(timestamp, Some(1590488773254420000));
+//! ```
+//!
+//! [InfluxDB Line Protocol]: https://v2.docs.influxdata.com/v2.0/reference/syntax/line-protocol
+//! [Go implementation]: https://github.com/influxdata/influxdb/blob/217eddc87e14a79b01d0c22994fc139f530094a2/models/points_parser.go
+//! [InfluxDB IOx]: https://github.com/influxdata/influxdb_iox
+//! [nom]: https://crates.io/crates/nom
 #![deny(rustdoc::broken_intra_doc_links, rustdoc::bare_urls, rust_2018_idioms)]
 #![warn(
     missing_copy_implementations,
@@ -15,13 +63,15 @@
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
 
 pub mod builder;
 pub use builder::LineProtocolBuilder;
 
 use fmt::Display;
+use log::debug;
 use nom::{
     branch::alt,
     bytes::complete::{tag, take_while1},
@@ -30,7 +80,6 @@ use nom::{
     multi::many0,
     sequence::{preceded, separated_pair, terminated, tuple},
 };
-use observability_deps::tracing::debug;
 use smallvec::SmallVec;
 use snafu::{ResultExt, Snafu};
 use std::cmp::Ordering;
@@ -42,13 +91,15 @@ use std::{
     ops::Deref,
 };
 
-#[cfg(feature = "ffi")]
-pub mod ffi;
-
+/// Parsing errors that describe how a particular line is invalid line protocol.
 #[derive(Debug, Snafu)]
+#[non_exhaustive]
 pub enum Error {
     #[snafu(display(r#"Must not contain duplicate tags, but "{}" was repeated"#, tag_key))]
     DuplicateTag { tag_key: String },
+
+    #[snafu(display(r#"Invalid measurement was provided"#))]
+    MeasurementValueInvalid,
 
     #[snafu(display(r#"No fields were provided"#))]
     FieldSetMissing,
@@ -89,6 +140,9 @@ pub enum Error {
     ))]
     CannotParseEntireLine { trailing_content: String },
 
+    #[snafu(display(r#"Tag Set Malformed"#))]
+    TagSetMalformed,
+
     // TODO: Replace this with specific failures.
     #[snafu(display(r#"A generic parsing error occurred: {:?}"#, kind))]
     GenericParsingError {
@@ -97,6 +151,9 @@ pub enum Error {
     },
 }
 
+/// A specialized [`Result`] type with a default error type of [`Error`].
+///
+/// [`Result`]: std::result::Result
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 type IResult<I, T, E = Error> = nom::IResult<I, T, E>;
 
@@ -118,44 +175,8 @@ impl nom::error::ParseError<&str> for Error {
     }
 }
 
-/// Represents a single parsed line of line protocol data
-///
-/// Here is an example of how to parse the line protocol data
-/// `cpu,host=A,region=west usage_system=64.2 1590488773254420000`
-/// into a `ParsedLine`:
-///
-/// ```
-/// use influxdb_line_protocol::{ParsedLine, FieldValue};
-///
-/// let mut parsed_lines =
-///     influxdb_line_protocol::parse_lines(
-///         "cpu,host=A,region=west usage_system=64i 1590488773254420000"
-///     );
-/// let parsed_line = parsed_lines
-///     .next()
-///     .expect("Should have at least one line")
-///     .expect("Should parse successfully");
-///
-/// let ParsedLine {
-///     series,
-///     field_set,
-///     timestamp,
-/// } = parsed_line;
-///
-/// assert_eq!(series.measurement, "cpu");
-///
-/// let tags = series.tag_set.unwrap();
-/// assert_eq!(tags[0].0, "host");
-/// assert_eq!(tags[0].1, "A");
-/// assert_eq!(tags[1].0, "region");
-/// assert_eq!(tags[1].1, "west");
-///
-/// let field = &field_set[0];
-/// assert_eq!(field.0, "usage_system");
-/// assert_eq!(field.1, FieldValue::I64(64));
-///
-/// assert_eq!(timestamp, Some(1590488773254420000));
-/// ```
+/// Represents a single parsed line of line protocol data. See the [crate-level documentation](self)
+/// for more information and examples.
 #[derive(Debug)]
 pub struct ParsedLine<'a> {
     pub series: Series<'a>,
@@ -164,8 +185,8 @@ pub struct ParsedLine<'a> {
 }
 
 impl<'a> ParsedLine<'a> {
-    /// Total number of columns on this line, including fields, tags, and
-    /// timestamp (which is always present).
+    /// Total number of columns in this line, including fields, tags, and
+    /// timestamp (timestamp is always present).
     ///
     /// ```
     /// use influxdb_line_protocol::{ParsedLine, FieldValue};
@@ -185,7 +206,7 @@ impl<'a> ParsedLine<'a> {
         1 + self.field_set.len() + self.series.tag_set.as_ref().map_or(0, |t| t.len())
     }
 
-    /// Returns the value of the passed in tag, if present.
+    /// Returns the value of the passed-in tag, if present.
     pub fn tag_value(&self, tag_key: &str) -> Option<&EscapedStr<'a>> {
         match &self.series.tag_set {
             Some(t) => {
@@ -196,20 +217,20 @@ impl<'a> ParsedLine<'a> {
         }
     }
 
-    /// Returns the value of the passed in field, if present.
+    /// Returns the value of the passed-in field, if present.
     pub fn field_value(&self, field_key: &str) -> Option<&FieldValue<'a>> {
         let f = self.field_set.iter().find(|(f, _)| *f == field_key);
         f.map(|(_, val)| val)
     }
 }
 
-/// Converts from a ParsedLine back to (canonical) LineProtocol
+/// Converts from a `ParsedLine` back to (canonical) line protocol
 ///
-/// A note on validity: This code does not errors or panics if the
-/// `ParsedLine` represents invalid LineProtocol (for example, if it
+/// A note on validity: This code does not error or panic if the
+/// `ParsedLine` represents invalid line protocol (for example, if it
 /// has 0 fields).
 ///
-/// Thus, if the ParsedLine represents invalid LineProtocol, then
+/// Thus, if the `ParsedLine` represents invalid line protocol, then
 /// the result of `Display` / `to_string()` will also be invalid.
 impl<'a> Display for ParsedLine<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -241,11 +262,11 @@ impl<'a> Display for ParsedLine<'a> {
 #[derive(Debug)]
 pub struct Series<'a> {
     raw_input: &'a str,
-    pub measurement: EscapedStr<'a>,
+    pub measurement: Measurement<'a>,
     pub tag_set: Option<TagSet<'a>>,
 }
 
-/// Converts Series back to LineProtocol
+/// Converts `Series` back to line protocol
 impl<'a> Display for Series<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         escape_and_write_value(f, self.measurement.as_str(), MEASUREMENT_DELIMITERS)?;
@@ -334,11 +355,22 @@ impl<'a> Series<'a> {
     }
 }
 
+pub type Measurement<'a> = EscapedStr<'a>;
+
+/// The [field] keys and values that appear in the line of line protocol.
+///
+/// [field]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#field-set
 pub type FieldSet<'a> = SmallVec<[(EscapedStr<'a>, FieldValue<'a>); 4]>;
+
+/// The [tag] keys and values that appear in the line of line protocol.
+///
+/// [tag]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#tag-set
 pub type TagSet<'a> = SmallVec<[(EscapedStr<'a>, EscapedStr<'a>); 8]>;
 
-/// Allowed types of Fields in a `ParsedLine`. One of the types described in
-/// <https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format>
+/// Allowed types of fields in a `ParsedLine`. One of the types described in [the line protocol
+/// reference].
+///
+/// [the line protocol reference]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue<'a> {
     I64(i64),
@@ -355,9 +387,10 @@ impl<'a> FieldValue<'a> {
     }
 }
 
-/// Converts FieldValue back to LineProtocol
-/// See <https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/>
-/// for more detail.
+/// Converts `FieldValue` back to line protocol.
+/// See [the line protocol reference] for more detail.
+///
+/// [the line protocol reference]: https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format
 impl<'a> Display for FieldValue<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -370,17 +403,17 @@ impl<'a> Display for FieldValue<'a> {
     }
 }
 
-/// Represents single logical string in the input.
+/// Represents a single logical string in the input.
 ///
 /// We do not use `&str` directly here because the actual input may be
 /// escaped, in which case the data in the input buffer is not
 /// contiguous. This enum provides an interface to access all such
 /// strings as contiguous string slices for compatibility with other
 /// code, and is optimized for the common case where the
-/// input was all in a contiguous string slice.
+/// input is all in a contiguous string slice.
 ///
-/// For example the 8 character string `Foo\\Bar` (note the double
-/// `\\`) is parsed into the logical 7 character string `Foo\Bar`
+/// For example, the 8-character string `Foo\\Bar` (note the double
+/// `\\`) is parsed into the logical 7-character string `Foo\Bar`
 /// (note the single `\`)
 #[derive(Debug, Clone, Eq, Hash)]
 pub enum EscapedStr<'a> {
@@ -414,8 +447,8 @@ impl<'a> EscapedStr<'a> {
         }
     }
 
-    /// Return the logical representation for the EscapedStr as a
-    /// single slice. The slice may not point into the original
+    /// Return the logical representation for the `EscapedStr` as a
+    /// single slice. The slice might not point into the original
     /// buffer.
     pub fn as_str(&self) -> &str {
         self
@@ -484,6 +517,9 @@ impl PartialEq<String> for EscapedStr<'_> {
     }
 }
 
+/// Parses a new line-delimited string into an iterator of
+/// [`ParsedLine`]. See the [crate-level documentation](self) for more
+/// information and examples.
 pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> {
     split_lines(input).filter_map(|line| {
         let i = trim_leading(line);
@@ -494,9 +530,9 @@ pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> 
 
         let res = match parse_line(i) {
             Ok((remaining, line)) => {
-                // should have parsed the whole input line, if any
-                // data remains it is a parse error for this line
-                // corresponding Go logic:
+                // should have parsed the whole input line; if any
+                // data remains it is a parse error for this line.
+                // Corresponding Go logic:
                 // https://github.com/influxdata/influxdb/blob/217eddc87e14a79b01d0c22994fc139f530094a2/models/points_parser.go#L259-L266
                 if !remaining.is_empty() {
                     Some(Err(Error::CannotParseEntireLine {
@@ -518,17 +554,17 @@ pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> 
 }
 
 /// Split `input` into individual lines to be parsed, based on the
-/// rules of the Line Protocol format.
+/// rules of the line protocol format.
 ///
 /// This code is more or less a direct port of the [Go implementation of
 /// `scanLine`](https://github.com/influxdata/influxdb/blob/217eddc87e14a79b01d0c22994fc139f530094a2/models/points.go#L1078)
 ///
 /// While this choice of implementation definitely means there is
 /// logic duplication for scanning fields, duplicating it also means
-/// we can be more sure of the compatibility of the rust parser and
+/// we can be more sure of the compatibility of the Rust parser and
 /// the canonical Go parser.
 pub fn split_lines(input: &str) -> impl Iterator<Item = &str> {
-    // NB: This is ported as closely as possibly from the original Go code:
+    // NB: This is ported as closely as possible from the original Go code:
     let mut quoted = false;
     let mut fields = false;
 
@@ -598,9 +634,7 @@ fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
 }
 
 fn series(i: &str) -> IResult<&str, Series<'_>> {
-    let tag_set = preceded(tag(","), tag_set);
-    let series = tuple((measurement, opt(tag_set)));
-
+    let series = tuple((measurement, maybe_tagset));
     let series_and_raw_input = parse_and_recognize(series);
 
     map(
@@ -613,16 +647,43 @@ fn series(i: &str) -> IResult<&str, Series<'_>> {
     )(i)
 }
 
-fn measurement(i: &str) -> IResult<&str, EscapedStr<'_>> {
-    let normal_char = take_while1(|c| !is_whitespace_boundary_char(c) && c != ',' && c != '\\');
+/// Tagsets are optional, but if a comma follows the measurement, then we must have at least one tag=value pair.
+/// anything else is an error
+fn maybe_tagset(i: &str) -> IResult<&str, Option<TagSet<'_>>, Error> {
+    match tag::<&str, &str, Error>(",")(i) {
+        Err(nom::Err::Error(_)) => Ok((i, None)),
+        Ok((remainder, _)) => {
+            match tag_set(remainder) {
+                Ok((i, ts)) => {
+                    // reaching here, we must find a tagset, which is at least one tag=value pair.
+                    if ts.is_empty() {
+                        return Err(nom::Err::Error(Error::TagSetMalformed));
+                    }
+                    Ok((i, Some(ts)))
+                }
+                Err(nom::Err::Error(_)) => TagSetMalformedSnafu.fail().map_err(nom::Err::Error),
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn measurement(i: &str) -> IResult<&str, Measurement<'_>, Error> {
+    let normal_char = take_while1(|c| {
+        !is_whitespace_boundary_char(c) && !is_null_char(c) && c != ',' && c != '\\'
+    });
 
     let space = map(tag(" "), |_| " ");
     let comma = map(tag(","), |_| ",");
     let backslash = map(tag("\\"), |_| "\\");
 
-    let escaped = alt((space, comma, backslash));
+    let escaped = alt((comma, space, backslash));
 
-    escape_or_fallback(normal_char, "\\", escaped)(i)
+    match escape_or_fallback(normal_char, "\\", escaped)(i) {
+        Err(nom::Err::Error(_)) => MeasurementValueInvalidSnafu.fail().map_err(nom::Err::Error),
+        other => other,
+    }
 }
 
 fn tag_set(i: &str) -> IResult<&str, TagSet<'_>> {
@@ -724,7 +785,7 @@ fn integral_value_signed(i: &str) -> IResult<&str, &str> {
     recognize(preceded(opt(tag("-")), digit1))(i)
 }
 
-pub fn timestamp(i: &str) -> IResult<&str, i64> {
+fn timestamp(i: &str) -> IResult<&str, i64> {
     map_fail(integral_value_signed, |value| {
         value.parse().context(TimestampValueInvalidSnafu { value })
     })(i)
@@ -732,7 +793,7 @@ pub fn timestamp(i: &str) -> IResult<&str, i64> {
 
 fn field_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
     // https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format
-    // For string field values, backslash is only used to escape itself(\) or double
+    // For string field values, backslash is only used to escape itself (`\`) or double
     // quotes.
     let string_data = alt((
         map(tag(r#"\""#), |_| r#"""#), // escaped double quote -> double quote
@@ -741,7 +802,7 @@ fn field_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
         take_while1(|c| c != '\\' && c != '"'), // anything else w/ no special handling
     ));
 
-    // NB: many0 doesn't allow combinators that match the empty string so
+    // NB: `many0` doesn't allow combinators that match the empty string so
     // we need to special case a pair of double quotes.
     let empty_str = map(tag(r#""""#), |_| Vec::new());
 
@@ -756,7 +817,7 @@ fn field_string_value(i: &str) -> IResult<&str, EscapedStr<'_>> {
 fn field_bool_value(i: &str) -> IResult<&str, bool> {
     // https://docs.influxdata.com/influxdb/v2.0/reference/syntax/line-protocol/#data-types-and-format
     // "specify TRUE with t, T, true, True, or TRUE. Specify FALSE with f, F, false,
-    // False, or FALSE
+    // False, or FALSE"
     alt((
         map(tag("true"), |_| true),
         map(tag("True"), |_| true),
@@ -795,6 +856,10 @@ fn whitespace(i: &str) -> IResult<&str, &str> {
 
 fn is_whitespace_boundary_char(c: char) -> bool {
     c == ' ' || c == '\t' || c == '\n'
+}
+
+fn is_null_char(c: char) -> bool {
+    c == '\0'
 }
 
 /// While not all of these escape characters are required to be
@@ -899,7 +964,7 @@ where
 
 /// This is a copied version of nom's `separated_list` that allows
 /// parameterizing the created collection via closures.
-pub fn parameterized_separated_list<I, O, O2, E, F, G, Ret>(
+fn parameterized_separated_list<I, O, O2, E, F, G, Ret>(
     mut sep: G,
     mut f: F,
     cre: impl FnOnce() -> Ret,
@@ -963,7 +1028,7 @@ where
     }
 }
 
-pub fn parameterized_separated_list1<I, O, O2, E, F, G, Ret>(
+fn parameterized_separated_list1<I, O, O2, E, F, G, Ret>(
     mut sep: G,
     mut f: F,
     cre: impl FnOnce() -> Ret,
@@ -991,7 +1056,7 @@ where
 
 /// This is a copied version of nom's `recognize` that runs the parser
 /// **and** returns the entire matched input.
-pub fn parse_and_recognize<
+fn parse_and_recognize<
     I: Clone + nom::Offset + nom::Slice<std::ops::RangeTo<usize>>,
     O,
     E: nom::error::ParseError<I>,
@@ -1047,10 +1112,10 @@ const FIELD_KEY_DELIMITERS: &[char] = TAG_KEY_DELIMITERS;
 /// Characters to escape when writing string values in fields
 const FIELD_VALUE_STRING_DELIMITERS: &[char] = &['"']; // " Close quotes for buggy editor
 
-/// Writes a str value to f, escaping all caracters in
-/// escaping_escaping specificiation.
+/// Writes a `&str` value to `f`, escaping all characters in
+/// `escaping_specificiation`.
 ///
-/// Use the constants defined in this module
+/// Use the constants defined in this module.
 fn escape_and_write_value(
     f: &mut fmt::Formatter<'_>,
     value: &str,
@@ -1133,7 +1198,7 @@ mod test {
         assert_eq!(es, EscapedStr::from_slices(&["Foo", "\\", "a", "Bar"]));
         assert!(es.is_escaped());
 
-        // Test ends with across boundaries
+        // Test `ends_with` across boundaries
         assert!(es.ends_with("Bar"));
 
         // Test PartialEq implementation for escaped str
@@ -1219,12 +1284,82 @@ mod test {
         assert_eq!(vals.unwrap().len(), 0);
     }
 
+    // tests that an incomplete tag=value pair returns an error about a malformed tagset
+    #[test]
+    fn parse_tag_no_value() {
+        let input = "testmeasure,foo= bar=1i";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+    }
+
+    // tests that just a comma after the measurement is an error
+    #[test]
+    fn parse_no_tagset() {
+        let input = "testmeasure, bar=1i";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::TagSetMalformed)));
+    }
+
+    #[test]
+    fn parse_no_measurement() {
+        let input = ",tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+
+        // accepts `field=1` as measurement, and errors on missing field
+        let input = "field=1 1234";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::FieldSetMissing)));
+    }
+
+    // matches behavior in influxdb golang parser
+    #[test]
+    fn parse_measurement_with_eq() {
+        let input = "tag1=1 field=1 1234";
+        let vals = parse(input);
+        assert!(matches!(vals, Ok(_)));
+
+        let input = "tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(matches!(vals, Ok(_)));
+    }
+
+    #[test]
+    fn parse_null_measurement() {
+        let input = "\0 field=1 1234";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+
+        let input = "\0,tag1=1,tag2=2 value=1 123";
+        let vals = parse(input);
+        assert!(matches!(vals, Err(Error::MeasurementValueInvalid)));
+    }
+
+    #[test]
+    fn parse_where_nulls_accepted() {
+        let input = "m,tag\x001=one,tag2=2 value=1 123
+            m,tag1=o\0ne,tag2=2 value=1 123
+            m,tag1=one,tag2=\0 value=1 123
+            m,tag1=one,tag2=2 val\0ue=1 123
+            m,tag1=one,tag2=2 value=\"v\0\" 123";
+        let vals = parse(input);
+        assert!(vals.is_ok());
+        assert_eq!(vals.unwrap().len(), 5);
+    }
+
     #[test]
     fn parse_no_fields() {
         let input = "foo 1234";
         let vals = parse(input);
 
         assert!(matches!(vals, Err(super::Error::FieldSetMissing)));
+    }
+
+    #[test]
+    fn parse_null_in_field_value() {
+        let input = "m,tag1=one,tag2=2 value=\0 123";
+        let vals = parse(input);
+        assert!(vals.is_err());
     }
 
     #[test]
@@ -2005,7 +2140,7 @@ her"#,
 
     #[test]
     fn parse_advance_after_error() {
-        // Note that the first line has an error (23.1.22 is not a number)
+        // Note that the first line has an error (23.1.22 is not a number),
         // but there is valid data afterwrds,
         let input = "foo,tag0=value1 asdf=23.1.22,jkl=4\n\
                      foo,tag0=value2 asdf=22.1,jkl=5";

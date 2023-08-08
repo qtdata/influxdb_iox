@@ -1,16 +1,15 @@
 use std::sync::Arc;
 
 use datafusion::{
-    datasource::provider_as_source,
-    logical_expr::{expr_rewriter::ExprRewritable, LogicalPlanBuilder},
+    catalog::TableReference, common::tree_node::TreeNode, datasource::provider_as_source,
+    logical_expr::LogicalPlanBuilder,
 };
 use observability_deps::tracing::trace;
 use predicate::Predicate;
-use schema::{sort::SortKey, Schema};
+use schema::Schema;
 use snafu::{ResultExt, Snafu};
 
 use crate::{
-    exec::IOxSessionContext,
     provider::{ChunkTableProvider, ProviderBuilder},
     util::MissingColumnsToNull,
     QueryChunk,
@@ -86,27 +85,22 @@ impl ScanPlan {
 
 #[derive(Debug)]
 pub struct ScanPlanBuilder<'a> {
-    ctx: IOxSessionContext,
     table_name: Arc<str>,
     /// The schema of the resulting table (any chunks that don't have
     /// all the necessary columns will be extended appropriately)
     table_schema: &'a Schema,
     chunks: Vec<Arc<dyn QueryChunk>>,
-    /// The sort key that describes the desired output sort order
-    output_sort_key: Option<SortKey>,
     predicate: Option<&'a Predicate>,
     /// Do deduplication
     deduplication: bool,
 }
 
 impl<'a> ScanPlanBuilder<'a> {
-    pub fn new(table_name: Arc<str>, table_schema: &'a Schema, ctx: IOxSessionContext) -> Self {
+    pub fn new(table_name: Arc<str>, table_schema: &'a Schema) -> Self {
         Self {
-            ctx,
             table_name,
             table_schema,
             chunks: vec![],
-            output_sort_key: None,
             predicate: None,
             // always do deduplication in query
             deduplication: true,
@@ -116,15 +110,6 @@ impl<'a> ScanPlanBuilder<'a> {
     /// Adds `chunks` to the list of Chunks to scan
     pub fn with_chunks(mut self, chunks: impl IntoIterator<Item = Arc<dyn QueryChunk>>) -> Self {
         self.chunks.extend(chunks.into_iter());
-        self
-    }
-
-    /// Sets the desired output sort key. If the output of this plan
-    /// is not already sorted this way, it will be re-sorted to conform
-    /// to this key
-    pub fn with_output_sort_key(mut self, output_sort_key: SortKey) -> Self {
-        assert!(self.output_sort_key.is_none());
-        self.output_sort_key = Some(output_sort_key);
         self
     }
 
@@ -144,10 +129,8 @@ impl<'a> ScanPlanBuilder<'a> {
     /// Creates a `ScanPlan` from the specified chunks
     pub fn build(self) -> Result<ScanPlan> {
         let Self {
-            ctx,
             table_name,
             chunks,
-            output_sort_key,
             table_schema,
             predicate,
             deduplication,
@@ -156,17 +139,8 @@ impl<'a> ScanPlanBuilder<'a> {
         assert!(!chunks.is_empty(), "no chunks provided");
 
         // Prepare the plan for the table
-        let mut builder = ProviderBuilder::new(
-            Arc::clone(&table_name),
-            table_schema.clone(),
-            ctx.child_ctx("provider_builder"),
-        )
-        .with_enable_deduplication(deduplication);
-
-        if let Some(output_sort_key) = output_sort_key {
-            // Tell the scan of this provider to sort its output on the given sort_key
-            builder = builder.with_output_sort_key(output_sort_key);
-        }
+        let mut builder = ProviderBuilder::new(Arc::clone(&table_name), table_schema.clone())
+            .with_enable_deduplication(deduplication);
 
         for chunk in chunks {
             builder = builder.add_chunk(chunk);
@@ -183,8 +157,10 @@ impl<'a> ScanPlanBuilder<'a> {
         // later if possible)
         let projection = None;
 
-        let mut plan_builder = LogicalPlanBuilder::scan(table_name.as_ref(), source, projection)
-            .context(BuildingPlanSnafu)?;
+        // Do not parse the tablename as a SQL identifer, but use as is
+        let table_ref = TableReference::bare(table_name.to_string());
+        let mut plan_builder =
+            LogicalPlanBuilder::scan(table_ref, source, projection).context(BuildingPlanSnafu)?;
 
         // Use a filter node to add general predicates + timestamp
         // range, if any

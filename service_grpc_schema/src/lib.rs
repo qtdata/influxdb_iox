@@ -1,5 +1,21 @@
 //! Implementation of the schema gRPC service
 
+#![deny(rustdoc::broken_intra_doc_links, rust_2018_idioms)]
+#![warn(
+    clippy::clone_on_ref_ptr,
+    clippy::dbg_macro,
+    clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
+    clippy::future_not_send,
+    clippy::todo,
+    clippy::use_self,
+    missing_debug_implementations,
+    unused_crate_dependencies
+)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use std::{ops::DerefMut, sync::Arc};
 
 use generated_types::influxdata::iox::schema::v1::*;
@@ -48,8 +64,6 @@ fn schema_to_proto(schema: Arc<data_types::NamespaceSchema>) -> GetSchemaRespons
     let response = GetSchemaResponse {
         schema: Some(NamespaceSchema {
             id: schema.id.get(),
-            topic_id: schema.topic_id.get(),
-            query_pool_id: schema.query_pool_id.get(),
             tables: schema
                 .tables
                 .iter()
@@ -85,7 +99,10 @@ mod tests {
     use super::*;
     use data_types::ColumnType;
     use generated_types::influxdata::iox::schema::v1::schema_service_server::SchemaService;
-    use iox_catalog::mem::MemCatalog;
+    use iox_catalog::{
+        mem::MemCatalog,
+        test_helpers::{arbitrary_namespace, arbitrary_table},
+    };
     use std::sync::Arc;
 
     #[tokio::test]
@@ -95,18 +112,8 @@ mod tests {
             let metrics = Arc::new(metric::Registry::default());
             let catalog = Arc::new(MemCatalog::new(metrics));
             let mut repos = catalog.repositories().await;
-            let topic = repos.topics().create_or_get("franz").await.unwrap();
-            let pool = repos.query_pools().create_or_get("franz").await.unwrap();
-            let namespace = repos
-                .namespaces()
-                .create("namespace_schema_test", None, topic.id, pool.id)
-                .await
-                .unwrap();
-            let table = repos
-                .tables()
-                .create_or_get("schema_test_table", namespace.id)
-                .await
-                .unwrap();
+            let namespace = arbitrary_namespace(&mut *repos, "namespace_schema_test").await;
+            let table = arbitrary_table(&mut *repos, "schema_test_table", &namespace).await;
             repos
                 .columns()
                 .create_or_get("schema_test_column", table.id, ColumnType::Tag)

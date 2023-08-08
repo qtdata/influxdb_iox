@@ -11,7 +11,7 @@ use datafusion::{
     prelude::Expr,
 };
 use iox_query::{
-    exec::{ExecutorType, SessionContextIOxExt},
+    exec::SessionContextIOxExt,
     provider::{ChunkPruner, Error as ProviderError, ProviderBuilder},
     pruning::{prune_chunks, NotPrunedReason, PruningObserver},
     QueryChunk,
@@ -50,13 +50,32 @@ impl TableProvider for QuerierTable {
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         // build provider out of all chunks
         // TODO: push down some predicates to catalog
-        let iox_ctx = self.exec.new_context_from_df(ExecutorType::Query, ctx);
 
-        let mut builder = ProviderBuilder::new(
-            Arc::clone(self.table_name()),
-            self.schema().clone(),
-            iox_ctx,
-        );
+        let mut builder =
+            ProviderBuilder::new(Arc::clone(self.table_name()), self.schema().clone());
+
+        let filters = match self.namespace_retention_period {
+            Some(d) => {
+                let ts = self
+                    .chunk_adapter
+                    .catalog_cache()
+                    .time_provider()
+                    .now()
+                    .timestamp_nanos()
+                    - d.as_nanos() as i64;
+                filters
+                    .iter()
+                    .cloned()
+                    .chain(
+                        Predicate::default()
+                            .with_retention(ts)
+                            .filter_expr()
+                            .into_iter(),
+                    )
+                    .collect::<Vec<_>>()
+            }
+            None => filters.to_vec(),
+        };
 
         let pruning_predicate = filters
             .iter()
@@ -66,7 +85,7 @@ impl TableProvider for QuerierTable {
         let chunks = self
             .chunks(
                 &pruning_predicate,
-                ctx.child_span("querier table chunks"),
+                ctx.child_span("QuerierTable chunks"),
                 projection,
             )
             .await?;
@@ -80,16 +99,14 @@ impl TableProvider for QuerierTable {
             Err(e) => panic!("unexpected error: {e:?}"),
         };
 
-        provider.scan(ctx, projection, filters, limit).await
+        provider.scan(ctx, projection, &filters, limit).await
     }
 
     fn supports_filter_pushdown(
         &self,
         _filter: &Expr,
     ) -> Result<TableProviderFilterPushDown, DataFusionError> {
-        // we may apply filtering (via pruning) but can not guarantee
-        // that the filter catches all row during scan
-        Ok(TableProviderFilterPushDown::Inexact)
+        Ok(TableProviderFilterPushDown::Exact)
     }
 }
 
@@ -150,16 +167,6 @@ pub(crate) struct MetricPruningObserver {
 impl MetricPruningObserver {
     pub(crate) fn new(metrics: Arc<PruneMetrics>) -> Self {
         Self { metrics }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_unregistered() -> Self {
-        Self::new(Arc::new(PruneMetrics::new_unregistered()))
-    }
-
-    /// Called when pruning a chunk before fully creating the chunk structure
-    pub(crate) fn was_pruned_early(&self, row_count: u64, size_estimate: u64) {
-        self.metrics.pruned_early.inc(1, row_count, size_estimate);
     }
 }
 

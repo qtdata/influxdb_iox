@@ -1,19 +1,17 @@
 use std::{collections::HashSet, sync::Arc};
 
 use datafusion::{
+    common::tree_node::{RewriteRecursion, Transformed, TreeNode, TreeNodeRewriter},
     config::ConfigOptions,
+    datasource::physical_plan::ParquetExec,
     error::{DataFusionError, Result},
     logical_expr::Operator,
-    physical_expr::{
-        rewrite::{RewriteRecursion, TreeNodeRewriter},
-        split_conjunction,
-    },
+    physical_expr::{split_conjunction, utils::collect_columns},
     physical_optimizer::PhysicalOptimizerRule,
     physical_plan::{
         empty::EmptyExec,
         expressions::{BinaryExpr, Column},
         filter::FilterExec,
-        rewrite::TreeNodeRewritable,
         union::UnionExec,
         ExecutionPlan, PhysicalExpr,
     },
@@ -42,7 +40,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                 let child_any = child.as_any();
                 if let Some(child_empty) = child_any.downcast_ref::<EmptyExec>() {
                     if !child_empty.produce_one_row() {
-                        return Ok(Some(child));
+                        return Ok(Transformed::Yes(child));
                     }
                 } else if let Some(child_union) = child_any.downcast_ref::<UnionExec>() {
                     let new_inputs = child_union
@@ -57,7 +55,28 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                         })
                         .collect::<Result<Vec<_>>>()?;
                     let new_union = UnionExec::new(new_inputs);
-                    return Ok(Some(Arc::new(new_union)));
+                    return Ok(Transformed::Yes(Arc::new(new_union)));
+                } else if let Some(child_parquet) = child_any.downcast_ref::<ParquetExec>() {
+                    let existing = child_parquet
+                        .predicate()
+                        .map(split_conjunction)
+                        .unwrap_or_default();
+                    let both = conjunction(
+                        existing
+                            .into_iter()
+                            .chain(split_conjunction(filter_exec.predicate()))
+                            .cloned(),
+                    );
+
+                    let new_node = Arc::new(FilterExec::try_new(
+                        Arc::clone(filter_exec.predicate()),
+                        Arc::new(ParquetExec::new(
+                            child_parquet.base_config().clone(),
+                            both,
+                            None,
+                        )),
+                    )?);
+                    return Ok(Transformed::Yes(new_node));
                 } else if let Some(child_dedup) = child_any.downcast_ref::<DeduplicateExec>() {
                     let dedup_cols = child_dedup.sort_columns();
                     let (pushdown, no_pushdown): (Vec<_>, Vec<_>) =
@@ -65,7 +84,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                             .into_iter()
                             .cloned()
                             .partition(|expr| {
-                                get_phys_expr_columns(expr)
+                                collect_columns(expr)
                                     .into_iter()
                                     .all(|c| dedup_cols.contains(c.name()))
                             });
@@ -81,6 +100,7 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                                 grandchild,
                             )?),
                             child_dedup.sort_keys().to_vec(),
+                            child_dedup.use_chunk_order_col(),
                         ));
                         if !no_pushdown.is_empty() {
                             new_node = Arc::new(FilterExec::try_new(
@@ -88,12 +108,12 @@ impl PhysicalOptimizerRule for PredicatePushdown {
                                 new_node,
                             )?);
                         }
-                        return Ok(Some(new_node));
+                        return Ok(Transformed::Yes(new_node));
                     }
                 }
             }
 
-            Ok(None)
+            Ok(Transformed::No(plan))
         })
     }
 
@@ -106,27 +126,14 @@ impl PhysicalOptimizerRule for PredicatePushdown {
     }
 }
 
-/// Extract referenced [`Column`]s within a [`PhysicalExpr`].
-///
-/// This works recursively.
-///
-/// TODO: remove once <https://github.com/apache/arrow-datafusion/pull/5419> is available.
-pub fn get_phys_expr_columns(pred: &Arc<dyn PhysicalExpr>) -> HashSet<Column> {
-    use datafusion::physical_expr::rewrite::TreeNodeRewritable;
-
-    let mut rewriter = ColumnCollector::default();
-    Arc::clone(pred)
-        .transform_using(&mut rewriter)
-        .expect("never fail");
-    rewriter.cols
-}
-
 #[derive(Debug, Default)]
 struct ColumnCollector {
     cols: HashSet<Column>,
 }
 
-impl TreeNodeRewriter<Arc<dyn PhysicalExpr>> for ColumnCollector {
+impl TreeNodeRewriter for ColumnCollector {
+    type N = Arc<dyn PhysicalExpr>;
+
     fn pre_visit(
         &mut self,
         node: &Arc<dyn PhysicalExpr>,
@@ -157,11 +164,13 @@ fn conjunction(
 mod tests {
     use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::{
+        datasource::object_store::ObjectStoreUrl,
+        datasource::physical_plan::FileScanConfig,
         logical_expr::Operator,
         physical_expr::PhysicalSortExpr,
         physical_plan::{
             expressions::{BinaryExpr, Column, Literal},
-            PhysicalExpr,
+            PhysicalExpr, Statistics,
         },
         scalar::ScalarValue,
     };
@@ -181,7 +190,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -206,7 +215,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -236,7 +245,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -271,7 +280,7 @@ mod tests {
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -295,6 +304,47 @@ mod tests {
     }
 
     #[test]
+    fn test_parquet() {
+        let schema = schema();
+        let base_config = FileScanConfig {
+            object_store_url: ObjectStoreUrl::parse("test://").unwrap(),
+            file_schema: Arc::clone(&schema),
+            file_groups: vec![],
+            statistics: Statistics::default(),
+            projection: None,
+            limit: None,
+            table_partition_cols: vec![],
+            output_ordering: vec![vec![]],
+            infinite_source: false,
+        };
+        let plan = Arc::new(
+            FilterExec::try_new(
+                predicate_mixed(&schema),
+                Arc::new(ParquetExec::new(
+                    base_config,
+                    Some(predicate_tag(&schema)),
+                    None,
+                )),
+            )
+            .unwrap(),
+        );
+        let opt = PredicatePushdown;
+        insta::assert_yaml_snapshot!(
+            OptimizationTest::new(plan, opt),
+            @r###"
+        ---
+        input:
+          - " FilterExec: tag1@0 = field@2"
+          - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1"
+        output:
+          Ok:
+            - " FilterExec: tag1@0 = field@2"
+            - "   ParquetExec: file_groups={0 groups: []}, projection=[tag1, tag2, field], predicate=tag1@0 = foo AND tag1@0 = field@2, pruning_predicate=tag1_min@0 <= foo AND foo <= tag1_max@1"
+        "###
+        );
+    }
+
+    #[test]
     fn test_dedup_no_pushdown() {
         let schema = schema();
         let plan = Arc::new(
@@ -303,11 +353,12 @@ mod tests {
                 Arc::new(DeduplicateExec::new(
                     Arc::new(EmptyExec::new(true, Arc::clone(&schema))),
                     sort_expr(&schema),
+                    false,
                 )),
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -334,11 +385,12 @@ mod tests {
                 Arc::new(DeduplicateExec::new(
                     Arc::new(EmptyExec::new(true, Arc::clone(&schema))),
                     sort_expr(&schema),
+                    false,
                 )),
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -372,11 +424,12 @@ mod tests {
                 Arc::new(DeduplicateExec::new(
                     Arc::new(EmptyExec::new(true, Arc::clone(&schema))),
                     sort_expr(&schema),
+                    false,
                 )),
             )
             .unwrap(),
         );
-        let opt = PredicatePushdown::default();
+        let opt = PredicatePushdown;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"

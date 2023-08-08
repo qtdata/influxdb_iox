@@ -84,12 +84,7 @@ fn optimize_dict_col(
         None => -1,
     });
 
-    let offset = keys.data().offset();
-    let nulls = keys
-        .data()
-        .null_buffer()
-        .map(|buffer| buffer.bit_slice(offset, keys.len()));
-
+    let nulls = keys.nulls().cloned();
     Ok(Arc::new(new_dictionary.to_arrow(new_keys, nulls)))
 }
 
@@ -293,9 +288,9 @@ mod tests {
             Box::new(DataType::Utf8),
         ))
         .len(keys.len())
-        .add_buffer(keys.data().buffers()[0].clone())
-        .null_bit_buffer(keys.data().null_buffer().cloned())
-        .add_child_data(values.data().clone())
+        .add_buffer(keys.to_data().buffers()[0].clone())
+        .nulls(keys.nulls().cloned())
+        .add_child_data(values.into_data())
         .build()
         .unwrap();
 

@@ -13,7 +13,7 @@ use crate::{
     response_chunking::ChunkReadResponses,
     StorageService,
 };
-use data_types::{org_and_bucket_to_namespace, NamespaceName};
+use data_types::NamespaceName;
 use datafusion::error::DataFusionError;
 use futures::{stream::BoxStream, Stream, StreamExt, TryStreamExt};
 use generated_types::{
@@ -58,6 +58,10 @@ use tracker::InstrumentedAsyncOwnedSemaphorePermit;
 /// We will regroup the returned frames (preserving order) to only produce [`ReadResponse`] objects of approximately
 /// this size (there's a bit of additional encoding overhead on top of that, but that should be OK).
 const MAX_READ_RESPONSE_SIZE: usize = 4194304 - 100_000; // 4MB - <wiggle room>
+
+/// The max number of points allowed in each output data frame. This is the same value TSM uses,
+/// and is used to avoid overlarge individual gRPC messages.
+const MAX_POINTS_PER_FRAME: usize = 1000;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -116,6 +120,12 @@ pub enum Error {
         db_name: String,
         tag_name: String,
         source: DataFusionError,
+    },
+
+    #[snafu(display("Error setting predicate table '{:?}': {}", table, source))]
+    SettingPredicateTable {
+        table: Option<String>,
+        source: super::expr::Error,
     },
 
     #[snafu(display("Error converting Predicate '{}: {}", rpc_predicate_string, source))]
@@ -214,7 +224,12 @@ impl Error {
             | Self::ConvertingReadGroupType { source, .. }
             | Self::ConvertingReadGroupAggregate { source, .. }
             | Self::ConvertingWindowAggregate { source, .. }
-                if matches!(source, super::expr::Error::FieldColumnsNotSupported { .. }) =>
+            | Self::SettingPredicateTable { source, .. }
+                if matches!(
+                    source,
+                    super::expr::Error::FieldColumnsNotSupported { .. }
+                        | super::expr::Error::MultipleTablePredicateNotSupported { .. }
+                ) =>
             {
                 tonic::Code::Unimplemented
             }
@@ -225,6 +240,7 @@ impl Error {
             | Self::ConvertingTagKeyInTagValues { .. }
             | Self::ComputingGroupedSeriesSet { .. }
             | Self::ConvertingFieldList { .. }
+            | Self::SettingPredicateTable { .. }
             | Self::MeasurementLiteralOrRegex { .. }
             | Self::MissingTagKeyPredicate {}
             | Self::InvalidTagKeyRegex { .. } => tonic::Code::InvalidArgument,
@@ -292,7 +308,7 @@ enum InfluxCode {
 }
 
 impl Display for InfluxCode {
-    fn fmt(&self, f: &mut Formatter) -> FmtResult {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
         let str = match self {
             InfluxCode::EInternal => "internal error",
             InfluxCode::ENotFound => "not found",
@@ -374,7 +390,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -422,7 +438,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -498,7 +514,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -576,7 +592,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -644,7 +660,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -744,7 +760,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -853,7 +869,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -910,7 +926,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -978,7 +994,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -1048,7 +1064,7 @@ where
 
         let db = self
             .db_store
-            .db(&db_name, span_ctx.child_span("get namespace"))
+            .db(&db_name, span_ctx.child_span("get namespace"), false)
             .await
             .context(NamespaceNotFoundSnafu { db_name: &db_name })?;
 
@@ -1101,7 +1117,7 @@ where
 }
 
 fn get_namespace_name(input: &impl GrpcInputs) -> Result<NamespaceName<'static>, Status> {
-    org_and_bucket_to_namespace(input.org_id()?.to_string(), &input.bucket_name()?)
+    NamespaceName::from_org_and_bucket(input.org_id()?.to_string(), input.bucket_name()?)
         .map_err(|e| Status::internal(e.to_string()))
 }
 
@@ -1171,7 +1187,8 @@ where
 
     let predicate = InfluxRpcPredicateBuilder::default()
         .set_range(range)
-        .table_option(measurement)
+        .table_option(measurement.clone())
+        .context(SettingPredicateTableSnafu { table: measurement })?
         .rpc_predicate(rpc_predicate)
         .context(ConvertingPredicateSnafu {
             rpc_predicate_string,
@@ -1213,7 +1230,8 @@ where
 
     let predicate = InfluxRpcPredicateBuilder::default()
         .set_range(range)
-        .table_option(measurement)
+        .table_option(measurement.clone())
+        .context(SettingPredicateTableSnafu { table: measurement })?
         .rpc_predicate(rpc_predicate)
         .context(ConvertingPredicateSnafu {
             rpc_predicate_string,
@@ -1356,6 +1374,7 @@ where
         .to_series_and_groups(
             series_plan,
             Arc::clone(&ctx.inner().runtime_env().memory_pool),
+            MAX_POINTS_PER_FRAME,
         )
         .await
         .context(FilteringSeriesSnafu {
@@ -1424,6 +1443,7 @@ where
         .to_series_and_groups(
             grouped_series_set_plan,
             Arc::clone(&ctx.inner().runtime_env().memory_pool),
+            MAX_POINTS_PER_FRAME,
         )
         .await
         .context(GroupingSeriesSnafu {
@@ -1460,7 +1480,8 @@ where
 
     let predicate = InfluxRpcPredicateBuilder::default()
         .set_range(range)
-        .table_option(measurement)
+        .table_option(measurement.clone())
+        .context(SettingPredicateTableSnafu { table: measurement })?
         .rpc_predicate(rpc_predicate)
         .context(ConvertingPredicateSnafu {
             rpc_predicate_string,
@@ -1684,7 +1705,7 @@ pub fn make_response<S, T, E>(
     permit: InstrumentedAsyncOwnedSemaphorePermit,
 ) -> Result<Response<StreamWithPermit<QueryCompletedTokenStream<S, T, E>>>, Status>
 where
-    S: Stream<Item = Result<T, E>> + Unpin,
+    S: Stream<Item = Result<T, E>> + Unpin + Send,
 {
     let mut response = Response::new(StreamWithPermit::new(
         QueryCompletedTokenStream::new(stream, token),
@@ -1696,34 +1717,18 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::test_util::Fixture;
+
     use super::*;
-    use data_types::ChunkId;
-    use datafusion::prelude::{col, Expr};
-    use datafusion_util::lit_dict;
     use futures::Future;
-    use generated_types::{
-        google::rpc::Status as GrpcStatus, i_ox_testing_client::IOxTestingClient,
-        tag_key_predicate::Value,
-    };
-    use influxdb_storage_client::{
-        connection::{Builder as ConnectionBuilder, Connection, GrpcConnection},
-        generated_types::*,
-        Client as StorageClient, OrgAndBucket,
-    };
+    use generated_types::{google::rpc::Status as GrpcStatus, tag_key_predicate::Value};
+    use influxdb_storage_client::{generated_types::*, Client as StorageClient, OrgAndBucket};
     use iox_query::test::TestChunk;
     use metric::{Attributes, Metric, U64Counter, U64Gauge};
-    use panic_logging::SendPanicsToTracing;
-    use predicate::{Predicate, PredicateMatch};
     use service_common::test_util::TestDatabaseStore;
-    use std::{
-        any::Any,
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        num::NonZeroU64,
-        sync::Arc,
-    };
-    use test_helpers::{assert_contains, maybe_start_logging, tracing::TracingCapture};
-    use tokio::{pin, task::JoinHandle};
-    use tokio_stream::wrappers::TcpListenerStream;
+    use std::{any::Any, num::NonZeroU64, sync::Arc};
+    use test_helpers::{assert_contains, maybe_start_logging};
+    use tokio::pin;
 
     fn to_str_vec(s: &[&str]) -> Vec<String> {
         s.iter().map(|s| s.to_string()).collect()
@@ -1799,11 +1804,15 @@ mod tests {
 
         let chunk0 = TestChunk::new("h2o")
             .with_id(0)
-            .with_predicate_match(PredicateMatch::AtLeastOneNonNullField);
+            .with_tag_column("state")
+            .with_time_column_with_stats(Some(1000), Some(1000))
+            .with_one_row_of_data();
 
         let chunk1 = TestChunk::new("o2")
             .with_id(1)
-            .with_predicate_match(PredicateMatch::AtLeastOneNonNullField);
+            .with_tag_column("state")
+            .with_time_column_with_stats(Some(1000), Some(1000))
+            .with_one_row_of_data();
 
         fixture
             .test_storage
@@ -1831,8 +1840,8 @@ mod tests {
 
         // --- Timestamp range
         let range = TimestampRange {
-            start: 150,
-            end: 200,
+            start: 900,
+            end: 1100,
         };
         let request = MeasurementNamesRequest {
             source,
@@ -1848,25 +1857,12 @@ mod tests {
         let expected_measurements = to_string_vec(&["h2o", "o2"]);
         assert_eq!(actual_measurements, expected_measurements);
 
-        // also ensure the plumbing is hooked correctly and that the predicate made it
-        // down to the chunk
-        let expected_predicate = Predicate::default().with_range(150, 200);
-
-        fixture
-            .expect_predicates(
-                db_info.db_name(),
-                "my_partition_key",
-                0,
-                &expected_predicate,
-            )
-            .await;
-
         // --- general predicate
         let request = MeasurementNamesRequest {
             source: Some(StorageClient::read_source(&db_info, 1)),
             range: Some(TimestampRange {
-                start: 150,
-                end: 200,
+                start: 900,
+                end: 1100,
             }),
             predicate: Some(make_state_eq_ma_predicate()),
         };
@@ -1898,13 +1894,17 @@ mod tests {
             .with_id(0)
             .with_tag_column("state")
             .with_tag_column("k1")
-            .with_tag_column("k2");
+            .with_tag_column("k2")
+            .with_time_column()
+            .with_one_row_of_data();
 
         let chunk1 = TestChunk::new("m2")
             .with_id(1)
             .with_tag_column("state")
             .with_tag_column("k3")
-            .with_tag_column("k4");
+            .with_tag_column("k4")
+            .with_time_column()
+            .with_one_row_of_data();
 
         fixture
             .test_storage
@@ -1917,7 +1917,7 @@ mod tests {
 
         let request = TagKeysRequest {
             tags_source: source.clone(),
-            range: Some(make_timestamp_range(150, 200)),
+            range: Some(make_timestamp_range(950, 1050)),
             predicate: Some(make_state_eq_ma_predicate()),
         };
 
@@ -1925,21 +1925,6 @@ mod tests {
         let expected_tag_keys = vec!["_f(0xff)", "_m(0x00)", "k1", "k2", "k3", "k4", "state"];
 
         assert_eq!(actual_tag_keys, expected_tag_keys,);
-
-        // also ensure the plumbing is hooked correctly and that the predicate made it
-        // down to the chunk
-        let expected_predicate = Predicate::default()
-            .with_range(150, 200)
-            .with_expr(make_state_ma_expr());
-
-        fixture
-            .expect_predicates(
-                db_info.db_name(),
-                "my_partition_key",
-                0,
-                &expected_predicate,
-            )
-            .await;
 
         grpc_request_metric_has_count(&fixture, "TagKeys", "ok", 1);
     }
@@ -1991,14 +1976,18 @@ mod tests {
 
         let chunk0 = TestChunk::new("m1")
             // predicate specifies m4, so this is filtered out
-            .with_tag_column("k0");
+            .with_tag_column("k0")
+            .with_time_column()
+            .with_one_row_of_data();
 
         let chunk1 = TestChunk::new("m4")
             .with_tag_column("state")
             .with_tag_column("k1")
             .with_tag_column("k2")
             .with_tag_column("k3")
-            .with_tag_column("k4");
+            .with_tag_column("k4")
+            .with_time_column()
+            .with_one_row_of_data();
 
         fixture
             .test_storage
@@ -2015,7 +2004,7 @@ mod tests {
         let request = MeasurementTagKeysRequest {
             measurement: "m4".into(),
             source: source.clone(),
-            range: Some(make_timestamp_range(150, 200)),
+            range: Some(make_timestamp_range(950, 1050)),
             predicate: Some(make_state_eq_ma_predicate()),
         };
 
@@ -2030,21 +2019,6 @@ mod tests {
             actual_tag_keys, expected_tag_keys,
             "unexpected tag keys while getting column names"
         );
-
-        // also ensure the plumbing is hooked correctly and that the predicate made it
-        // down to the chunk
-        let expected_predicate = Predicate::default()
-            .with_range(150, 200)
-            .with_expr(make_state_ma_expr());
-
-        fixture
-            .expect_predicates(
-                db_info.db_name(),
-                "my_partition_key",
-                0,
-                &expected_predicate,
-            )
-            .await;
 
         grpc_request_metric_has_count(&fixture, "MeasurementTagKeys", "ok", 1);
     }
@@ -2148,8 +2122,10 @@ mod tests {
             tag_key: [0].into(),
         };
 
-        let chunk =
-            TestChunk::new("h2o").with_predicate_match(PredicateMatch::AtLeastOneNonNullField);
+        let chunk = TestChunk::new("h2o")
+            .with_tag_column("tag")
+            .with_time_column_with_stats(Some(1100), Some(1200))
+            .with_one_row_of_data();
 
         fixture
             .test_storage
@@ -2629,60 +2605,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_log_on_panic() {
-        // Send a message to a route that causes a panic and ensure:
-        // 1. We don't use up all executors 2. The panic message
-        // message ends up in the log system
-
-        // Normally, the global panic logger is set at program start
-        let _f = SendPanicsToTracing::new();
-
-        // capture all tracing messages
-        let tracing_capture = TracingCapture::new();
-
-        // Start a test gRPC server on a randomally allocated port
-        let mut fixture = Fixture::new().await.expect("Connecting to test server");
-
-        let request = TestErrorRequest {};
-
-        // Test response from storage server
-        let response = fixture.iox_client.test_error(request).await;
-
-        match &response {
-            Ok(_) => {
-                panic!("Unexpected success: {response:?}");
-            }
-            Err(status) => {
-                assert_eq!(status.code(), tonic::Code::Unknown);
-                assert_contains!(status.message(), "transport error");
-            }
-        };
-
-        // Ensure that the logs captured the panic
-        let captured_logs = tracing_capture.to_string();
-        // Note we don't include the actual line / column in the
-        // expected panic message to avoid needing to update the test
-        // whenever the source code file changed.
-        let expected_error = "'This is a test panic', service_grpc_testing/src/lib.rs:18:9";
-        assert_contains!(captured_logs, expected_error);
-
-        // Ensure that panics don't exhaust the tokio executor by
-        // running 100 times (success is if we can make a successful
-        // call after this)
-        for _ in 0usize..100 {
-            let request = TestErrorRequest {};
-
-            // Test response from storage server
-            let response = fixture.iox_client.test_error(request).await;
-            assert!(response.is_err(), "Got an error response: {response:?}");
-        }
-
-        // Ensure there are still threads to answer actual client queries
-        let caps = fixture.storage_client.capabilities().await.unwrap();
-        assert!(!caps.is_empty(), "Caps: {caps:?}");
-    }
-
-    #[tokio::test]
     async fn test_read_filter() {
         test_helpers::maybe_start_logging();
         // Start a test gRPC server on a randomally allocated port
@@ -2716,24 +2638,6 @@ mod tests {
             .read_filter(request.clone())
             .await
             .unwrap();
-
-        // also ensure the plumbing is hooked correctly and that the predicate made it
-        // down to the chunk and it was normalized to namevalue
-        let expected_predicate = Predicate::default()
-            .with_range(0, 10000)
-            // should NOT have CASE nonsense for handling empty strings as
-            // that should bave been optimized by the time it gets to
-            // the chunk
-            .with_expr(col("state").eq(lit_dict("MA")));
-
-        fixture
-            .expect_predicates(
-                db_info.db_name(),
-                "my_partition_key",
-                0,
-                &expected_predicate,
-            )
-            .await;
 
         // TODO: encode the actual output in the test case or something
         assert_eq!(
@@ -2779,24 +2683,6 @@ mod tests {
             .read_filter(request.clone())
             .await
             .unwrap();
-
-        // also ensure the plumbing is hooked correctly and that the predicate made it
-        // down to the chunk and it was normalized to namevalue
-        let expected_predicate = Predicate::default()
-            .with_range(0, 10000)
-            // comparison to empty string conversion results in a messier translation
-            // to handle backwards compatibility semantics
-            // #state IS NULL OR #state = Utf8("")
-            .with_expr(col("state").is_null().or(col("state").eq(lit_dict(""))));
-
-        fixture
-            .expect_predicates(
-                db_info.db_name(),
-                "my_partition_key",
-                0,
-                &expected_predicate,
-            )
-            .await;
     }
 
     #[tokio::test]
@@ -3763,129 +3649,9 @@ mod tests {
         generated_types::Predicate { root: Some(root) }
     }
 
-    /// return an DataFusion Expr predicate like
-    ///
-    /// state="MA"
-    fn make_state_ma_expr() -> Expr {
-        col("state").eq(lit_dict("MA"))
-    }
-
     /// Convert to a Vec<String> to facilitate comparison with results of client
     fn to_string_vec(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[derive(Debug, Snafu)]
-    pub enum FixtureError {
-        #[snafu(display("Error binding fixture server: {}", source))]
-        Bind { source: std::io::Error },
-
-        #[snafu(display("Error creating fixture: {}", source))]
-        Tonic { source: tonic::transport::Error },
-    }
-
-    // Wrapper around raw clients and test database
-    struct Fixture {
-        client_connection: Connection,
-        iox_client: IOxTestingClient<GrpcConnection>,
-        storage_client: StorageClient,
-        test_storage: Arc<TestDatabaseStore>,
-        join_handle: JoinHandle<()>,
-    }
-
-    impl Fixture {
-        /// Start up a test storage server listening on `port`, returning
-        /// a fixture with the test server and clients
-        async fn new() -> Result<Self, FixtureError> {
-            Self::new_with_semaphore_size(u16::MAX as usize).await
-        }
-
-        async fn new_with_semaphore_size(semaphore_size: usize) -> Result<Self, FixtureError> {
-            let test_storage = Arc::new(TestDatabaseStore::new_with_semaphore_size(semaphore_size));
-
-            // Get a random port from the kernel by asking for port 0.
-            let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
-            let socket = tokio::net::TcpListener::bind(bind_addr)
-                .await
-                .context(BindSnafu)?;
-
-            // Pull the assigned port out of the socket
-            let bind_addr = socket.local_addr().unwrap();
-
-            println!("Starting InfluxDB IOx storage test server on {bind_addr:?}");
-
-            let trace_header_parser = trace_http::ctx::TraceHeaderParser::new();
-
-            let router = tonic::transport::Server::builder()
-                .layer(trace_http::tower::TraceLayer::new(
-                    trace_header_parser,
-                    Arc::clone(&test_storage.metric_registry),
-                    None,
-                    true,
-                ))
-                .add_service(service_grpc_testing::make_server())
-                .add_service(crate::make_server(Arc::clone(&test_storage)));
-
-            let server = async move {
-                let stream = TcpListenerStream::new(socket);
-
-                router
-                    .serve_with_incoming(stream)
-                    .await
-                    .log_if_error("Running Tonic Server")
-                    .ok();
-            };
-
-            let join_handle = tokio::task::spawn(server);
-
-            let client_connection = ConnectionBuilder::default()
-                .connect_timeout(std::time::Duration::from_secs(30))
-                .build(format!("http://{bind_addr}"))
-                .await
-                .unwrap();
-
-            let iox_client =
-                IOxTestingClient::new(client_connection.clone().into_grpc_connection());
-
-            let storage_client = StorageClient::new(client_connection.clone());
-
-            Ok(Self {
-                client_connection,
-                iox_client,
-                storage_client,
-                test_storage,
-                join_handle,
-            })
-        }
-
-        /// Gathers predicates applied to the specified chunks and
-        /// asserts that `expected_predicate` is within it
-        async fn expect_predicates(
-            &self,
-            db_name: &str,
-            partition_key: &str,
-            chunk_id: u128,
-            expected_predicate: &predicate::Predicate,
-        ) {
-            let actual_predicates = self
-                .test_storage
-                .db_or_create(db_name)
-                .await
-                .get_chunk(partition_key, ChunkId::new_test(chunk_id))
-                .unwrap()
-                .predicates();
-
-            assert!(
-                actual_predicates.contains(expected_predicate),
-                "\nActual: {actual_predicates:?}\nExpected: {expected_predicate:?}"
-            );
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            self.join_handle.abort();
-        }
     }
 
     /// Assert that given future is pending.

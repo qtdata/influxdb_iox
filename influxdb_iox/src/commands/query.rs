@@ -1,6 +1,8 @@
+use arrow::record_batch::RecordBatch;
+use clap::ValueEnum;
 use futures::TryStreamExt;
+use influxdb_iox_client::format::influxql::{write_columnar, Options};
 use influxdb_iox_client::{connection::Connection, flight, format::QueryOutputFormat};
-use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -10,6 +12,9 @@ pub enum Error {
 
     #[error("Error querying: {0}")]
     Query(#[from] influxdb_iox_client::flight::Error),
+
+    #[error("Error formatting InfluxQL: {0}")]
+    InfluxQlFormatting(#[from] influxdb_iox_client::format::influxql::Error),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -17,7 +22,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(clap::ValueEnum, Clone, Debug, PartialEq)]
 #[clap(rename_all = "lower")]
 enum QueryLanguage {
+    /// Interpret the query as DataFusion SQL
     Sql,
+    /// Interpret the query as InfluxQL
     InfluxQL,
 }
 
@@ -32,13 +39,39 @@ pub struct Config {
     #[clap(action)]
     query: String,
 
-    /// Optional format ('pretty', 'json', or 'csv')
-    #[clap(short, long, default_value = "pretty", action)]
-    format: String,
+    /// Output format of the query results
+    #[clap(short, long, action)]
+    #[clap(value_enum, default_value_t = OutputFormat::Pretty)]
+    format: OutputFormat,
 
     /// Query type used
     #[clap(short = 'l', long = "lang", default_value = "sql")]
     query_lang: QueryLanguage,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    /// Output the most appropriate format for the query language
+    Pretty,
+
+    /// Output the query results using the Arrow JSON formatter
+    Json,
+
+    /// Output the query results using the Arrow CSV formatter
+    Csv,
+
+    /// Output the query results using the Arrow pretty formatter
+    Table,
+}
+
+impl From<OutputFormat> for QueryOutputFormat {
+    fn from(value: OutputFormat) -> Self {
+        match value {
+            OutputFormat::Pretty | OutputFormat::Table => Self::Pretty,
+            OutputFormat::Json => Self::Json,
+            OutputFormat::Csv => Self::Csv,
+        }
+    }
 }
 
 pub async fn command(connection: Connection, config: Config) -> Result<()> {
@@ -51,20 +84,35 @@ pub async fn command(connection: Connection, config: Config) -> Result<()> {
         query_lang,
     } = config;
 
-    let format = QueryOutputFormat::from_str(&format)?;
-
-    let query_results = match query_lang {
+    let mut query_results = match query_lang {
         QueryLanguage::Sql => client.sql(namespace, query).await,
         QueryLanguage::InfluxQL => client.influxql(namespace, query).await,
     }?;
 
     // It might be nice to do some sort of streaming write
     // rather than buffering the whole thing.
-    let batches: Vec<_> = query_results.try_collect().await?;
+    let mut batches: Vec<_> = (&mut query_results).try_collect().await?;
 
-    let formatted_result = format.format(&batches)?;
+    // read schema AFTER collection, otherwise the stream does not have the schema data yet
+    let schema = query_results
+        .inner()
+        .schema()
+        .cloned()
+        .ok_or(influxdb_iox_client::flight::Error::NoSchema)?;
 
-    println!("{formatted_result}");
+    // preserve schema so we print table headers even for empty results
+    batches.push(RecordBatch::new_empty(schema));
+
+    match (query_lang, &format) {
+        (QueryLanguage::InfluxQL, OutputFormat::Pretty) => {
+            write_columnar(std::io::stdout(), &batches, Options::default())?
+        }
+        _ => {
+            let format: QueryOutputFormat = format.into();
+            let formatted_result = format.format(&batches)?;
+            println!("{formatted_result}");
+        }
+    }
 
     Ok(())
 }

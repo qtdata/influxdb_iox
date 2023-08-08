@@ -7,18 +7,21 @@ use std::{collections::HashSet, fmt, sync::Arc};
 use arrow::{error::ArrowError, record_batch::RecordBatch};
 use datafusion_util::{watch::WatchedTask, AdapterStream};
 
+use crate::CHUNK_ORDER_COLUMN_NAME;
+
 use self::algo::get_col_name;
 pub use self::algo::RecordBatchDeduplicator;
 use datafusion::{
     error::{DataFusionError, Result},
     execution::context::TaskContext,
+    physical_expr::PhysicalSortRequirement,
     physical_plan::{
-        expressions::PhysicalSortExpr,
+        expressions::{Column, PhysicalSortExpr},
         metrics::{
             self, BaselineMetrics, ExecutionPlanMetricsSet, MetricBuilder, MetricsSet, RecordOutput,
         },
-        DisplayFormatType, Distribution, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-        Statistics,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+        SendableRecordBatchStream, Statistics,
     },
 };
 use futures::StreamExt;
@@ -108,15 +111,33 @@ use tokio::sync::mpsc;
 pub struct DeduplicateExec {
     input: Arc<dyn ExecutionPlan>,
     sort_keys: Vec<PhysicalSortExpr>,
+    input_order: Vec<PhysicalSortExpr>,
+    use_chunk_order_col: bool,
     /// Execution metrics
     metrics: ExecutionPlanMetricsSet,
 }
 
 impl DeduplicateExec {
-    pub fn new(input: Arc<dyn ExecutionPlan>, sort_keys: Vec<PhysicalSortExpr>) -> Self {
+    pub fn new(
+        input: Arc<dyn ExecutionPlan>,
+        sort_keys: Vec<PhysicalSortExpr>,
+        use_chunk_order_col: bool,
+    ) -> Self {
+        let mut input_order = sort_keys.clone();
+        if use_chunk_order_col {
+            input_order.push(PhysicalSortExpr {
+                expr: Arc::new(
+                    Column::new_with_schema(CHUNK_ORDER_COLUMN_NAME, &input.schema())
+                        .expect("input has chunk order col"),
+                ),
+                options: Default::default(),
+            })
+        }
         Self {
             input,
             sort_keys,
+            input_order,
+            use_chunk_order_col,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -125,11 +146,16 @@ impl DeduplicateExec {
         &self.sort_keys
     }
 
+    /// Combination of all columns within the sort key and potentially the chunk order column.
     pub fn sort_columns(&self) -> HashSet<&str> {
-        self.sort_keys
+        self.input_order
             .iter()
             .map(|sk| get_col_name(sk.expr.as_ref()))
             .collect()
+    }
+
+    pub fn use_chunk_order_col(&self) -> bool {
+        self.use_chunk_order_col
     }
 }
 
@@ -165,9 +191,10 @@ impl ExecutionPlan for DeduplicateExec {
         Some(&self.sort_keys)
     }
 
-    fn required_input_ordering(&self) -> Vec<Option<&[PhysicalSortExpr]>> {
-        // requires the input to be sorted on the primary key
-        vec![self.output_ordering()]
+    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+        vec![Some(PhysicalSortRequirement::from_sort_exprs(
+            &self.input_order,
+        ))]
     }
 
     fn maintains_input_order(&self) -> Vec<bool> {
@@ -188,7 +215,11 @@ impl ExecutionPlan for DeduplicateExec {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         assert_eq!(children.len(), 1);
         let input = Arc::clone(&children[0]);
-        Ok(Arc::new(Self::new(input, self.sort_keys.clone())))
+        Ok(Arc::new(Self::new(
+            input,
+            self.sort_keys.clone(),
+            self.use_chunk_order_col,
+        )))
     }
 
     fn execute(
@@ -236,15 +267,6 @@ impl ExecutionPlan for DeduplicateExec {
         vec![Distribution::SinglePartition]
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                let expr: Vec<String> = self.sort_keys.iter().map(|e| e.to_string()).collect();
-                write!(f, "DeduplicateExec: [{}]", expr.join(","))
-            }
-        }
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -254,6 +276,17 @@ impl ExecutionPlan for DeduplicateExec {
         Statistics {
             is_exact: false,
             ..self.input.statistics()
+        }
+    }
+}
+
+impl DisplayAs for DeduplicateExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                let expr: Vec<String> = self.sort_keys.iter().map(|e| e.to_string()).collect();
+                write!(f, "DeduplicateExec: [{}]", expr.join(","))
+            }
         }
     }
 }
@@ -987,7 +1020,7 @@ mod test {
             },
         }];
 
-        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(input, sort_keys));
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(DeduplicateExec::new(input, sort_keys, false));
         test_collect(exec).await;
     }
 
@@ -1109,7 +1142,7 @@ mod test {
         let input = Arc::new(MemoryExec::try_new(&[input], schema, projection).unwrap());
 
         // Create and run the deduplicator
-        let exec = Arc::new(DeduplicateExec::new(input, sort_keys));
+        let exec = Arc::new(DeduplicateExec::new(input, sort_keys, false));
         let output = test_collect(Arc::clone(&exec) as Arc<dyn ExecutionPlan>).await;
 
         TestResults { output, exec }
@@ -1189,6 +1222,12 @@ mod test {
         fn statistics(&self) -> Statistics {
             // don't know anything about the statistics
             Statistics::default()
+        }
+    }
+
+    impl DisplayAs for DummyExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "DummyExec")
         }
     }
 }

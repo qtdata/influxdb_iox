@@ -4,12 +4,17 @@
     missing_copy_implementations,
     missing_docs,
     clippy::explicit_iter_loop,
+    // See https://github.com/influxdata/influxdb_iox/pull/1671
     clippy::future_not_send,
     clippy::use_self,
     clippy::clone_on_ref_ptr,
     clippy::todo,
-    clippy::dbg_macro
+    clippy::dbg_macro,
+    unused_crate_dependencies
 )]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
 
 use datafusion::{
     execution::FunctionRegistry,
@@ -17,6 +22,8 @@ use datafusion::{
 };
 use group_by::WindowDuration;
 use window::EncodedWindowDuration;
+
+pub mod coalesce_struct;
 
 /// Grouping by structs
 pub mod group_by;
@@ -30,7 +37,6 @@ pub mod selectors;
 /// window_bounds expressions
 mod window;
 
-/// gap filling expressions
 pub mod gapfill;
 
 /// Function registry

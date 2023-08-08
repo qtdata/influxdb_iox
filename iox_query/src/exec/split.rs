@@ -48,7 +48,6 @@
 //! ```
 
 use std::{
-    any::Any,
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -63,12 +62,13 @@ use datafusion::{
     common::DFSchemaRef,
     error::{DataFusionError, Result},
     execution::context::TaskContext,
-    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
+    physical_expr::PhysicalSortRequirement,
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
-        ColumnarValue, DisplayFormatType, Distribution, ExecutionPlan, Partitioning, PhysicalExpr,
-        SendableRecordBatchStream, Statistics,
+        ColumnarValue, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+        PhysicalExpr, SendableRecordBatchStream, Statistics,
     },
     scalar::ScalarValue,
 };
@@ -90,6 +90,7 @@ use tokio::sync::mpsc::Sender;
 ///   in which rows are only evaluated to true in at most one of the expressions.
 /// * partition n (n = partition split_exprs.len())  are the rows for which all split_exprs
 ///   do not evaluate to true (e.g. Null or false)
+#[derive(Hash, PartialEq, Eq)]
 pub struct StreamSplitNode {
     input: LogicalPlan,
     split_exprs: Vec<Expr>,
@@ -115,9 +116,9 @@ impl Debug for StreamSplitNode {
     }
 }
 
-impl UserDefinedLogicalNode for StreamSplitNode {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl UserDefinedLogicalNodeCore for StreamSplitNode {
+    fn name(&self) -> &str {
+        "StreamSplit"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -134,19 +135,15 @@ impl UserDefinedLogicalNode for StreamSplitNode {
     }
 
     fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StreamSplit split_expr={:?}", self.split_exprs)
+        write!(f, "{} split_expr={:?}", self.name(), self.split_exprs)
     }
 
-    fn from_template(
-        &self,
-        exprs: &[Expr],
-        inputs: &[LogicalPlan],
-    ) -> Arc<dyn UserDefinedLogicalNode> {
-        assert_eq!(inputs.len(), 1, "StreamSplitNode: input sizes inconistent");
-        Arc::new(Self {
+    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
+        assert_eq!(inputs.len(), 1, "StreamSplitNode: input sizes inconsistent");
+        Self {
             input: inputs[0].clone(),
             split_exprs: (*exprs).to_vec(),
-        })
+        }
     }
 }
 
@@ -210,6 +207,17 @@ impl ExecutionPlan for StreamSplitExec {
         vec![Distribution::SinglePartition]
     }
 
+    fn required_input_ordering(&self) -> Vec<Option<Vec<PhysicalSortRequirement>>> {
+        // require that the output ordering of the child is preserved
+        // (so that this node logically splits what was desired)
+        let requirement = self
+            .input
+            .output_ordering()
+            .map(PhysicalSortRequirement::from_sort_exprs);
+
+        vec![requirement]
+    }
+
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
         vec![Arc::clone(&self.input)]
     }
@@ -259,14 +267,6 @@ impl ExecutionPlan for StreamSplitExec {
         }
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(f, "StreamSplitExec")
-            }
-        }
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -275,6 +275,16 @@ impl ExecutionPlan for StreamSplitExec {
         // For now, don't return any statistics (in the future we
         // could potentially estimate the output cardinalities)
         Statistics::default()
+    }
+}
+
+impl DisplayAs for StreamSplitExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "StreamSplitExec")
+            }
+        }
     }
 }
 

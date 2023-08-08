@@ -4,24 +4,25 @@ mod measurement_rewrite;
 mod rewrite;
 mod value_rewrite;
 
+use crate::rpc_predicate::column_rewrite::missing_tag_to_null;
 use crate::Predicate;
 
-use datafusion::common::{ExprSchema, ToDFSchema};
-use datafusion::error::{DataFusionError, Result as DataFusionResult};
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::ToDFSchema;
+use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::ExecutionProps;
-use datafusion::logical_expr::expr_rewriter::ExprRewritable;
-use datafusion::logical_expr::ExprSchemable;
-use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyInfo};
-use datafusion::prelude::{lit, Column, Expr};
+use datafusion::optimizer::simplify_expressions::{ExprSimplifier, SimplifyContext};
+use datafusion::prelude::{lit, Expr};
 use observability_deps::tracing::{debug, trace};
 use schema::Schema;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use self::column_rewrite::MissingTagColumnRewriter;
 use self::field_rewrite::FieldProjectionRewriter;
 use self::measurement_rewrite::rewrite_measurement_references;
 use self::value_rewrite::rewrite_field_value_references;
+
+pub use self::rewrite::{iox_expr_rewrite, simplify_predicate};
 
 /// Any column references to this name are rewritten to be
 /// the actual table name by the Influx gRPC planner.
@@ -212,22 +213,22 @@ fn normalize_predicate(
     let mut predicate = predicate.clone();
 
     let mut field_projections = FieldProjectionRewriter::new(schema.clone());
-    let mut missing_tag_columns = MissingTagColumnRewriter::new(schema.clone());
 
     let mut field_value_exprs = vec![];
 
-    // TODO find some better interface than a DFSchema :vomit:
+    let props = ExecutionProps::new();
     let df_schema = schema.as_arrow().to_dfschema_ref()?;
+    let simplify_context = SimplifyContext::new(&props).with_schema(Arc::clone(&df_schema));
+    let simplifier = ExprSimplifier::new(simplify_context);
 
     predicate.exprs = predicate
         .exprs
         .into_iter()
         .map(|e| {
-            let simplifier = ExprSimplifier::new(SimplifyAdapter::new(&schema));
-
             debug!(?e, "rewriting expr");
 
-            let e = rewrite_measurement_references(table_name, e)
+            let e = e
+                .transform(&|e| rewrite_measurement_references(table_name, e))
                 .map(|e| log_rewrite(e, "rewrite_measurement_references"))
                 // Rewrite any references to `_value = some_value` to literal true values.
                 // Keeps track of these expressions, which can then be used to
@@ -243,10 +244,10 @@ fn normalize_predicate(
                 // in the table's schema as tags. Replace any column references that
                 // do not exist, or that are not tags, with NULL.
                 // Field values always use `_value` as a name and are handled above.
-                .and_then(|e| e.rewrite(&mut missing_tag_columns))
+                .and_then(|e| e.transform(&|e| missing_tag_to_null(&schema, e)))
                 .map(|e| log_rewrite(e, "missing_columums"))
                 // apply IOx specific rewrites (that unlock other simplifications)
-                .and_then(rewrite::rewrite)
+                .and_then(rewrite::iox_expr_rewrite)
                 .map(|e| log_rewrite(e, "rewrite"))
                 // apply type_coercing so datafuson simplification can deal with this
                 .and_then(|e| simplifier.coerce(e, Arc::clone(&df_schema)))
@@ -277,63 +278,6 @@ fn normalize_predicate(
 fn log_rewrite(expr: Expr, description: &str) -> Expr {
     trace!(?expr, %description, "After rewrite");
     expr
-}
-
-struct SimplifyAdapter<'a> {
-    schema: &'a Schema,
-    execution_props: ExecutionProps,
-}
-
-impl<'a> SimplifyAdapter<'a> {
-    fn new(schema: &'a Schema) -> Self {
-        Self {
-            schema,
-            execution_props: ExecutionProps::new(),
-        }
-    }
-
-    // returns the field named 'name', if any
-    fn field(&self, name: &str) -> Option<&arrow::datatypes::Field> {
-        self.schema
-            .find_index_of(name)
-            .map(|index| self.schema.field(index).1)
-    }
-}
-
-impl<'a> SimplifyInfo for SimplifyAdapter<'a> {
-    fn is_boolean_type(&self, expr: &Expr) -> DataFusionResult<bool> {
-        Ok(expr
-            .get_type(self)
-            .ok()
-            .map(|t| matches!(t, arrow::datatypes::DataType::Boolean))
-            .unwrap_or(false))
-    }
-
-    fn nullable(&self, expr: &Expr) -> DataFusionResult<bool> {
-        Ok(expr.nullable(self).ok().unwrap_or(false))
-    }
-
-    fn execution_props(&self) -> &ExecutionProps {
-        &self.execution_props
-    }
-}
-
-impl<'a> ExprSchema for SimplifyAdapter<'a> {
-    fn nullable(&self, col: &Column) -> DataFusionResult<bool> {
-        assert!(col.relation.is_none());
-        //if the field isn't present IOx will treat it as null
-        Ok(self
-            .field(&col.name)
-            .map(|f| f.is_nullable())
-            .unwrap_or(true))
-    }
-
-    fn data_type(&self, col: &Column) -> DataFusionResult<&arrow::datatypes::DataType> {
-        assert!(col.relation.is_none());
-        self.field(&col.name)
-            .map(|f| f.data_type())
-            .ok_or_else(|| DataFusionError::Plan(format!("Unknown field {}", &col.name)))
-    }
 }
 
 #[cfg(test)]

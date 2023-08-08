@@ -5,27 +5,24 @@ authors.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[dependencies]
-# Workspace dependencies, in alphabetical order
-data_types = { path = "../data_types" }
+[dependencies] # In alphabetical order
+async-trait = "0.1"
+authz = { path = "../authz" }
 clap_blocks = { path = "../clap_blocks" }
+data_types = { path = "../data_types" }
+gossip = { version = "0.1.0", path = "../gossip" }
+hashbrown = { workspace = true }
+hyper = "0.14"
 iox_catalog = { path = "../iox_catalog" }
 ioxd_common = { path = "../ioxd_common" }
 metric = { path = "../metric" }
 mutable_batch = { path = "../mutable_batch" }
-object_store = "0.5.4"
-observability_deps = { path = "../observability_deps" }
+object_store = { workspace = true }
 router = { path = "../router" }
-sharder = { path = "../sharder" }
+thiserror = "1.0.44"
+tokio-util = { version = "0.7.8" }
 trace = { path = "../trace" }
-write_buffer = { path = "../write_buffer" }
-write_summary = { path = "../write_summary" }
-
-# Crates.io dependencies, in alphabetical order
-async-trait = "0.1"
-hashbrown = { workspace = true }
-hyper = "0.14"
-thiserror = "1.0.38"
-tokio = { version = "1.25", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }
-tokio-util = { version = "0.7.7" }
 workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[dev-dependencies]
+tokio = { version = "1.29", features = ["macros", "net", "parking_lot", "rt-multi-thread", "signal", "sync", "time"] }

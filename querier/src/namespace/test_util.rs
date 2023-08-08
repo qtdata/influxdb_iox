@@ -2,25 +2,27 @@ use super::QuerierNamespace;
 use crate::{
     cache::namespace::CachedNamespace, create_ingester_connection_for_testing, QuerierCatalogCache,
 };
-use data_types::{ShardIndex, TableId};
-use iox_catalog::interface::{get_schema_by_name, SoftDeletedRows};
+use data_types::TableId;
+use datafusion_util::config::register_iox_object_store;
 use iox_query::exec::ExecutorType;
 use iox_tests::TestNamespace;
-use sharder::JumpHash;
 use std::sync::Arc;
 use tokio::runtime::Handle;
 
 /// Create [`QuerierNamespace`] for testing.
 pub async fn querier_namespace(ns: &Arc<TestNamespace>) -> QuerierNamespace {
     let mut repos = ns.catalog.catalog.repositories().await;
-    let schema = get_schema_by_name(
-        &ns.namespace.name,
-        repos.as_mut(),
-        SoftDeletedRows::ExcludeDeleted,
-    )
-    .await
-    .unwrap();
-    let cached_ns = Arc::new(CachedNamespace::from(schema));
+    let tables = repos
+        .tables()
+        .list_by_namespace_id(ns.namespace.id)
+        .await
+        .unwrap();
+    let columns = repos
+        .columns()
+        .list_by_namespace_id(ns.namespace.id)
+        .await
+        .unwrap();
+    let cached_ns = Arc::new(CachedNamespace::new(ns.namespace.clone(), tables, columns));
 
     let catalog_cache = Arc::new(QuerierCatalogCache::new_testing(
         ns.catalog.catalog(),
@@ -32,18 +34,17 @@ pub async fn querier_namespace(ns: &Arc<TestNamespace>) -> QuerierNamespace {
 
     // add cached store
     let parquet_store = catalog_cache.parquet_store();
-    ns.catalog
+    let runtime_env = ns
+        .catalog
         .exec()
         .new_context(ExecutorType::Query)
         .inner()
-        .runtime_env()
-        .register_object_store(
-            "iox",
-            parquet_store.id(),
-            Arc::clone(parquet_store.object_store()),
-        );
-
-    let sharder = Arc::new(JumpHash::new((0..1).map(ShardIndex::new).map(Arc::new)));
+        .runtime_env();
+    register_iox_object_store(
+        runtime_env,
+        parquet_store.id(),
+        Arc::clone(parquet_store.object_store()),
+    );
 
     QuerierNamespace::new_testing(
         catalog_cache,
@@ -52,8 +53,6 @@ pub async fn querier_namespace(ns: &Arc<TestNamespace>) -> QuerierNamespace {
         cached_ns,
         ns.catalog.exec(),
         Some(create_ingester_connection_for_testing()),
-        sharder,
-        true,
     )
 }
 

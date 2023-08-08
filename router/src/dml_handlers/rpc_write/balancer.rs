@@ -8,6 +8,7 @@ use tokio::task::JoinHandle;
 use super::{
     circuit_breaker::CircuitBreaker,
     circuit_breaking_client::{CircuitBreakerState, CircuitBreakingClient},
+    upstream_snapshot::UpstreamSnapshot,
 };
 
 thread_local! {
@@ -30,12 +31,12 @@ const METRIC_EVAL_INTERVAL: Duration = Duration::from_secs(3);
 ///
 /// # Request Distribution
 ///
-/// Requests are distributed uniformly across all shards **per thread**. Given
+/// Requests are distributed uniformly across all endpoints **per thread**. Given
 /// enough requests (where `N` is significantly larger than the number of
 /// threads) an approximately uniform distribution is achieved.
 #[derive(Debug)]
 pub(super) struct Balancer<T, C = CircuitBreaker> {
-    endpoints: Arc<[CircuitBreakingClient<T, C>]>,
+    endpoints: Arc<[Arc<CircuitBreakingClient<T, C>>]>,
 
     /// An optional metric exporter task that evaluates the state of this
     /// [`Balancer`] every [`METRIC_EVAL_INTERVAL`].
@@ -53,11 +54,16 @@ where
         endpoints: impl IntoIterator<Item = CircuitBreakingClient<T, C>>,
         metrics: Option<&metric::Registry>,
     ) -> Self {
-        let endpoints = endpoints.into_iter().collect();
+        let endpoints = endpoints.into_iter().map(Arc::new).collect();
         Self {
             metric_task: metrics.map(|m| tokio::spawn(metric_task(m, Arc::clone(&endpoints)))),
             endpoints,
         }
+    }
+
+    /// Returns the number of configured upstream endpoints.
+    pub(super) fn len(&self) -> usize {
+        self.endpoints.len()
     }
 
     /// Return an (infinite) iterator of healthy [`CircuitBreakingClient`], and
@@ -67,7 +73,7 @@ where
     /// evaluated at this point and the result is returned to the caller as an
     /// infinite / cycling iterator. A node that becomes unavailable after the
     /// snapshot was taken will continue to be returned by the iterator.
-    pub(super) fn endpoints(&self) -> impl Iterator<Item = &'_ CircuitBreakingClient<T, C>> {
+    pub(super) fn endpoints(&self) -> Option<UpstreamSnapshot<Arc<CircuitBreakingClient<T, C>>>> {
         // Grab and increment the current counter.
         let counter = COUNTER.with(|cell| {
             let mut cell = cell.borrow_mut();
@@ -90,7 +96,7 @@ where
         let mut healthy = Vec::with_capacity(self.endpoints.len());
         for e in &*self.endpoints {
             if e.is_healthy() {
-                healthy.push(e);
+                healthy.push(Arc::clone(e));
                 continue;
             }
 
@@ -98,7 +104,7 @@ where
             // probe request - therefore it is added to the front of the
             // iter/request queue.
             if probe.is_none() && e.should_probe() {
-                probe = Some(e);
+                probe = Some(Arc::clone(e));
             }
         }
 
@@ -114,7 +120,7 @@ where
             }
         };
 
-        probe.into_iter().chain(healthy).cycle().skip(idx)
+        UpstreamSnapshot::new(probe.into_iter().chain(healthy), idx)
     }
 }
 
@@ -122,7 +128,7 @@ where
 /// health evaluation future that updates it.
 fn metric_task<T, C>(
     metrics: &metric::Registry,
-    endpoints: Arc<[CircuitBreakingClient<T, C>]>,
+    endpoints: Arc<[Arc<CircuitBreakingClient<T, C>>]>,
 ) -> impl Future<Output = ()> + Send
 where
     T: Send + Sync + 'static,
@@ -138,7 +144,7 @@ where
 
 async fn metric_loop<T, C>(
     metric: metric::Metric<U64Gauge>,
-    endpoints: Arc<[CircuitBreakingClient<T, C>]>,
+    endpoints: Arc<[Arc<CircuitBreakingClient<T, C>>]>,
 ) where
     T: Send + Sync + 'static,
     C: CircuitBreakerState + 'static,
@@ -213,34 +219,41 @@ mod tests {
 
     use super::*;
 
-    /// No healthy nodes yields an empty iterator.
+    const ARBITRARY_TEST_ERROR_WINDOW: Duration = Duration::from_secs(5);
+    const ARBITRARY_TEST_NUM_PROBES: u64 = 10;
+
+    /// No healthy nodes prevents a snapshot from being returned.
     #[tokio::test]
     async fn test_balancer_empty_iter() {
-        const BALANCER_CALLS: usize = 10;
-
         // Initialise 3 RPC clients and configure their mock circuit breakers;
         // all are unhealthy and should not be probed.
         let circuit_err_1 = Arc::new(MockCircuitBreaker::default());
         circuit_err_1.set_healthy(false);
         circuit_err_1.set_should_probe(false);
-        let client_err_1 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_1));
+        let client_err_1 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_1));
 
         let circuit_err_2 = Arc::new(MockCircuitBreaker::default());
         circuit_err_2.set_healthy(false);
         circuit_err_2.set_should_probe(false);
-        let client_err_2 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_2));
+        let client_err_2 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_2));
 
         assert_eq!(circuit_err_1.ok_count(), 0);
         assert_eq!(circuit_err_2.ok_count(), 0);
 
         let balancer = Balancer::new([client_err_1, client_err_2], None);
-        let mut endpoints = balancer.endpoints();
-
-        assert_matches!(endpoints.next(), None);
+        assert!(balancer.endpoints().is_none());
     }
 
     /// When multiple nodes are unhealthy and available for probing, at most one
@@ -252,31 +265,44 @@ mod tests {
         let circuit_err_1 = Arc::new(MockCircuitBreaker::default());
         circuit_err_1.set_healthy(false);
         circuit_err_1.set_should_probe(true);
-        let client_err_1 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_1));
+        let client_err_1 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_1));
 
         let circuit_err_2 = Arc::new(MockCircuitBreaker::default());
         circuit_err_2.set_healthy(false);
         circuit_err_2.set_should_probe(true);
-        let client_err_2 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_2));
+        let client_err_2 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_2));
         let circuit_ok = Arc::new(MockCircuitBreaker::default());
         circuit_ok.set_healthy(true);
         circuit_ok.set_should_probe(false);
-        let client_ok = CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-            .with_circuit_breaker(Arc::clone(&circuit_ok));
+        let client_ok = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_ok));
 
         let balancer = Balancer::new([client_err_1, client_err_2, client_ok], None);
 
-        let mut endpoints = balancer.endpoints();
+        let mut endpoints = balancer.endpoints().unwrap();
 
         // A bad client is yielded first
         let _ = endpoints
             .next()
             .unwrap()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await;
         assert!((circuit_err_1.ok_count() == 1) ^ (circuit_err_2.ok_count() == 1));
         assert!(circuit_ok.ok_count() == 0);
@@ -285,7 +311,7 @@ mod tests {
         let _ = endpoints
             .next()
             .unwrap()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await;
         assert!((circuit_err_1.ok_count() == 1) ^ (circuit_err_2.ok_count() == 1));
         assert!(circuit_ok.ok_count() == 1);
@@ -294,7 +320,7 @@ mod tests {
         let _ = endpoints
             .next()
             .unwrap()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await;
         assert!((circuit_err_1.ok_count() == 2) ^ (circuit_err_2.ok_count() == 2));
         assert!(circuit_ok.ok_count() == 1);
@@ -303,14 +329,15 @@ mod tests {
         let _ = endpoints
             .next()
             .unwrap()
-            .write(WriteRequest::default())
+            .write(WriteRequest::default(), None)
             .await;
         assert!((circuit_err_1.ok_count() == 2) ^ (circuit_err_2.ok_count() == 2));
         assert!(circuit_ok.ok_count() == 2);
     }
 
     /// A test that ensures only healthy clients are returned by the balancer,
-    /// and that they are polled exactly once per request.
+    /// and that they are polled exactly once per call to
+    /// [`Balancer::endpoints()`].
     #[tokio::test]
     async fn test_balancer_yield_healthy_polled_once() {
         const BALANCER_CALLS: usize = 10;
@@ -320,28 +347,41 @@ mod tests {
         let circuit_err_1 = Arc::new(MockCircuitBreaker::default());
         circuit_err_1.set_healthy(false);
         circuit_err_1.set_should_probe(false);
-        let client_err_1 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_1));
+        let client_err_1 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_1));
 
         let circuit_err_2 = Arc::new(MockCircuitBreaker::default());
         circuit_err_2.set_healthy(false);
         circuit_err_2.set_should_probe(false);
-        let client_err_2 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err_2));
+        let client_err_2 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_2));
 
         let circuit_ok = Arc::new(MockCircuitBreaker::default());
         circuit_ok.set_healthy(true);
-        let client_ok = CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-            .with_circuit_breaker(Arc::clone(&circuit_ok));
+        let client_ok = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_ok));
 
         assert_eq!(circuit_ok.ok_count(), 0);
         assert_eq!(circuit_err_1.ok_count(), 0);
         assert_eq!(circuit_err_2.ok_count(), 0);
 
         let balancer = Balancer::new([client_err_1, client_ok, client_err_2], None);
-        let mut endpoints = balancer.endpoints();
+        let mut endpoints = balancer.endpoints().unwrap();
 
         // Only the health client should be yielded, and it should cycle
         // indefinitely.
@@ -349,7 +389,7 @@ mod tests {
             endpoints
                 .next()
                 .expect("should yield healthy client")
-                .write(WriteRequest::default())
+                .write(WriteRequest::default(), None)
                 .await
                 .expect("should succeed");
 
@@ -375,27 +415,33 @@ mod tests {
     /// An unhealthy node that recovers is yielded to the caller.
     #[tokio::test]
     async fn test_balancer_upstream_recovery() {
-        const BALANCER_CALLS: usize = 10;
-
-        // Initialise 3 RPC clients and configure their mock circuit breakers;
-        // two returns a unhealthy state, one is healthy.
+        // Initialise a single client and configure its mock circuit breaker to
+        // return unhealthy.
         let circuit = Arc::new(MockCircuitBreaker::default());
         circuit.set_healthy(false);
         circuit.set_should_probe(false);
-        let client = CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-            .with_circuit_breaker(Arc::clone(&circuit));
+        let client = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit));
 
         assert_eq!(circuit.ok_count(), 0);
 
         let balancer = Balancer::new([client], None);
 
-        let mut endpoints = balancer.endpoints();
-        assert_matches!(endpoints.next(), None);
+        // The balancer should yield no candidates.
+        assert!(balancer.endpoints().is_none());
+        // The circuit breaker health state should have been read
         assert_eq!(circuit.is_healthy_count(), 1);
 
+        // Mark the client as healthy.
         circuit.set_healthy(true);
 
-        let mut endpoints = balancer.endpoints();
+        // A single client should be yielded
+        let mut endpoints = balancer.endpoints().unwrap();
         assert_matches!(endpoints.next(), Some(_));
         assert_eq!(circuit.is_healthy_count(), 2);
 
@@ -405,7 +451,7 @@ mod tests {
             endpoints
                 .next()
                 .expect("should yield healthy client")
-                .write(WriteRequest::default())
+                .write(WriteRequest::default(), None)
                 .await
                 .expect("should succeed");
         }
@@ -428,30 +474,43 @@ mod tests {
         // two returns a healthy state, one is unhealthy.
         let circuit_err = Arc::new(MockCircuitBreaker::default());
         circuit_err.set_healthy(false);
-        let client_err =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_err));
+        let client_err = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err));
 
         let circuit_ok_1 = Arc::new(MockCircuitBreaker::default());
         circuit_ok_1.set_healthy(true);
-        let client_ok_1 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_ok_1));
+        let client_ok_1 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_ok_1));
 
         let circuit_ok_2 = Arc::new(MockCircuitBreaker::default());
         circuit_ok_2.set_healthy(true);
-        let client_ok_2 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bananas")
-                .with_circuit_breaker(Arc::clone(&circuit_ok_2));
+        let client_ok_2 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bananas",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_ok_2));
 
         let balancer = Balancer::new([client_err, client_ok_1, client_ok_2], None);
 
         for _ in 0..N {
             balancer
                 .endpoints()
+                .unwrap()
                 .next()
                 .expect("should yield healthy client")
-                .write(WriteRequest::default())
+                .write(WriteRequest::default(), None)
                 .await
                 .expect("should succeed");
         }
@@ -473,22 +532,34 @@ mod tests {
         let circuit_err_1 = Arc::new(MockCircuitBreaker::default());
         circuit_err_1.set_healthy(false);
         circuit_err_1.set_should_probe(false);
-        let client_err_1 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bad-client-1")
-                .with_circuit_breaker(Arc::clone(&circuit_err_1));
+        let client_err_1 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bad-client-1",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_1));
 
         let circuit_err_2 = Arc::new(MockCircuitBreaker::default());
         circuit_err_2.set_healthy(false);
         circuit_err_2.set_should_probe(true);
-        let client_err_2 =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "bad-client-2")
-                .with_circuit_breaker(Arc::clone(&circuit_err_2));
+        let client_err_2 = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bad-client-2",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err_2));
 
         let circuit_ok = Arc::new(MockCircuitBreaker::default());
         circuit_ok.set_healthy(true);
-        let client_ok =
-            CircuitBreakingClient::new(Arc::new(MockWriteClient::default()), "ok-client")
-                .with_circuit_breaker(Arc::clone(&circuit_ok));
+        let client_ok = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "ok-client",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_ok));
 
         let balancer = Balancer::new([client_err_1, client_err_2, client_ok], None);
 
@@ -540,5 +611,37 @@ mod tests {
         assert!(circuit_ok.is_healthy_count() > 0);
 
         worker.abort();
+    }
+
+    #[test]
+    fn test_no_endpoints() {
+        let balancer = Balancer::<MockWriteClient>::new([], None);
+        assert!(balancer.endpoints().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_no_healthy_endpoints() {
+        let circuit_err = Arc::new(MockCircuitBreaker::default());
+        circuit_err.set_healthy(false);
+        circuit_err.set_should_probe(false);
+        let client_err = CircuitBreakingClient::new(
+            Arc::new(MockWriteClient::default()),
+            "bad-client-1",
+            ARBITRARY_TEST_ERROR_WINDOW,
+            ARBITRARY_TEST_NUM_PROBES,
+        )
+        .with_circuit_breaker(Arc::clone(&circuit_err));
+
+        let balancer = Balancer::new([client_err], None);
+        assert!(balancer.endpoints().is_none());
+
+        circuit_err.set_should_probe(true);
+        assert!(balancer.endpoints().is_some());
+
+        circuit_err.set_should_probe(false);
+        assert!(balancer.endpoints().is_none());
+
+        circuit_err.set_healthy(true);
+        assert!(balancer.endpoints().is_some());
     }
 }

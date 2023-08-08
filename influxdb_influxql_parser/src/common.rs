@@ -8,12 +8,13 @@ use crate::literal::unsigned_integer;
 use crate::string::{regex, Regex};
 use core::fmt;
 use nom::branch::alt;
-use nom::bytes::complete::{is_not, tag, take_until};
+use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::{char, multispace1};
 use nom::combinator::{map, opt, recognize, value};
 use nom::multi::{fold_many0, fold_many1, separated_list1};
 use nom::sequence::{delimited, pair, preceded, terminated};
 use std::fmt::{Display, Formatter};
+use std::mem;
 use std::ops::{Deref, DerefMut};
 
 /// A error returned when parsing an InfluxQL query, expressions.
@@ -146,7 +147,7 @@ pub(crate) fn qualified_measurement_name(i: &str) -> ParseResult<&str, Qualified
 
 /// Parse a SQL-style single-line comment
 fn comment_single_line(i: &str) -> ParseResult<&str, &str> {
-    recognize(pair(tag("--"), is_not("\n\r")))(i)
+    recognize(pair(tag("--"), take_till(|c| c == '\n' || c == '\r')))(i)
 }
 
 /// Parse a SQL-style inline comment, which can span multiple lines
@@ -324,6 +325,13 @@ pub enum OrderByClause {
 
     /// Signals the `ORDER BY` is in descending order.
     Descending,
+}
+
+impl OrderByClause {
+    /// Return `true` if the order by clause is ascending.
+    pub fn is_ascending(self) -> bool {
+        matches!(self, Self::Ascending)
+    }
 }
 
 impl Display for OrderByClause {
@@ -507,6 +515,17 @@ impl<T> ZeroOrMore<T> {
     /// Returns true if the container has no elements.
     pub fn is_empty(&self) -> bool {
         self.contents.is_empty()
+    }
+
+    /// Takes the vector out of the receiver, leaving a default vector value in its place.
+    pub fn take(&mut self) -> Vec<T> {
+        mem::take(&mut self.contents)
+    }
+
+    /// Replaces the actual value in the receiver by the value given in parameter,
+    /// returning the old value if present.
+    pub fn replace(&mut self, value: Vec<T>) -> Vec<T> {
+        mem::replace(&mut self.contents, value)
     }
 }
 
@@ -935,6 +954,12 @@ mod tests {
         // Comment to EOL
         let (rem, _) = comment_single_line("-- this is a test\nmore text").unwrap();
         assert_eq!(rem, "\nmore text");
+
+        // Empty comments
+        let (rem, _) = comment_single_line("--").unwrap();
+        assert_eq!(rem, "");
+        let (rem, _) = comment_single_line("--\nSELECT").unwrap();
+        assert_eq!(rem, "\nSELECT");
     }
 
     #[test]

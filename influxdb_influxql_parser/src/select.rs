@@ -4,14 +4,15 @@
 
 use crate::common::{
     limit_clause, offset_clause, order_by_clause, qualified_measurement_name, where_clause, ws0,
-    ws1, LimitClause, OffsetClause, OrderByClause, Parser, QualifiedMeasurementName, WhereClause,
-    ZeroOrMore,
+    ws1, LimitClause, OffsetClause, OrderByClause, ParseError, Parser, QualifiedMeasurementName,
+    WhereClause, ZeroOrMore,
 };
 use crate::expression::arithmetic::Expr::Wildcard;
 use crate::expression::arithmetic::{
     arithmetic, call_expression, var_ref, ArithmeticParsers, Expr, WildcardType,
 };
-use crate::expression::conditional::is_valid_now_call;
+use crate::expression::{Call, VarRef};
+use crate::functions::is_now_function;
 use crate::identifier::{identifier, Identifier};
 use crate::impl_tuple_clause;
 use crate::internal::{expect, map_fail, verify, ParseResult};
@@ -25,8 +26,10 @@ use nom::bytes::complete::tag;
 use nom::character::complete::char;
 use nom::combinator::{map, opt, value};
 use nom::sequence::{delimited, pair, preceded, tuple};
+use nom::Offset;
 use std::fmt;
 use std::fmt::{Display, Formatter, Write};
+use std::str::FromStr;
 
 /// Represents a `SELECT` statement.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,8 +46,8 @@ pub struct SelectStatement {
     /// Expressions used for grouping the selection.
     pub group_by: Option<GroupByClause>,
 
-    /// The [fill clause] specifies the fill behaviour for the selection. If the value is [`None`],
-    /// it is the same behavior as `fill(none)`.
+    /// The [fill] clause specifies the fill behaviour for the selection. If the value is [`None`],
+    /// it is the same behavior as `fill(null)`.
     ///
     /// [fill]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#group-by-time-intervals-and-fill
     pub fill: Option<FillClause>,
@@ -68,6 +71,15 @@ pub struct SelectStatement {
     ///
     /// [time_zone_clause]: https://docs.influxdata.com/influxdb/v1.8/query_language/explore-data/#the-time-zone-clause
     pub timezone: Option<TimeZoneClause>,
+}
+
+impl SelectStatement {
+    /// Return the sort order for the `SELECT` statement.
+    ///
+    /// The default when no `ORDER BY` clause present is `TIME ASC`.
+    pub fn order_by(&self) -> OrderByClause {
+        self.order_by.unwrap_or_default()
+    }
 }
 
 impl Display for SelectStatement {
@@ -242,6 +254,32 @@ impl Display for GroupByClause {
     }
 }
 
+impl GroupByClause {
+    /// Returns the time dimension for the `GROUP BY` clause.
+    pub fn time_dimension(&self) -> Option<&TimeDimension> {
+        self.contents.iter().find_map(|dim| match dim {
+            Dimension::Time(t) => Some(t),
+            _ => None,
+        })
+    }
+
+    /// Returns an iterator of all the names of the tag dimensions for the `GROUP BY` clause.
+    pub fn tag_names(&self) -> impl Iterator<Item = &Identifier> + '_ {
+        self.contents.iter().filter_map(|dim| match dim {
+            Dimension::VarRef(i) => Some(&i.name),
+            _ => None,
+        })
+    }
+
+    /// Returns an iterator of all the tag dimensions for the `GROUP BY` clause.
+    pub fn tags(&self) -> impl Iterator<Item = &VarRef> + '_ {
+        self.contents.iter().filter_map(|dim| match dim {
+            Dimension::VarRef(i) => Some(i),
+            _ => None,
+        })
+    }
+}
+
 /// Used to parse the interval argument of the TIME function
 struct TimeCallIntervalArgument;
 
@@ -265,6 +303,14 @@ impl ArithmeticParsers for TimeCallIntervalArgument {
 ///
 /// The offset argument accepts either a duration, datetime-like string or `now`.
 struct TimeCallOffsetArgument;
+
+/// Returns true if `expr` is a valid [`Expr::Call`] expression for the `now` function.
+pub(crate) fn is_valid_now_call(expr: &Expr) -> bool {
+    match expr {
+        Expr::Call(Call { name, args }) => is_now_function(&name.to_lowercase()) && args.is_empty(),
+        _ => false,
+    }
+}
 
 impl TimeCallOffsetArgument {
     /// Parse the `now()` function call
@@ -290,19 +336,33 @@ impl ArithmeticParsers for TimeCallOffsetArgument {
     }
 }
 
+/// Represents a `TIME` dimension in a `GROUP BY` clause.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TimeDimension {
+    /// The first argument of the `TIME` call.
+    pub interval: Expr,
+    /// An optional second argument to specify the offset applied to the `TIME` call.
+    pub offset: Option<Expr>,
+}
+
+impl Display for TimeDimension {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "TIME({}", self.interval)?;
+        if let Some(offset) = &self.offset {
+            write!(f, ", {offset}")?;
+        }
+        write!(f, ")")
+    }
+}
+
 /// Represents a dimension of a `GROUP BY` clause.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Dimension {
     /// Represents a `TIME` call in a `GROUP BY` clause.
-    Time {
-        /// The first argument of the `TIME` call.
-        interval: Expr,
-        /// An optional second argument to specify the offset applied to the `TIME` call.
-        offset: Option<Expr>,
-    },
+    Time(TimeDimension),
 
     /// Represents a literal tag reference in a `GROUP BY` clause.
-    Tag(Identifier),
+    VarRef(VarRef),
 
     /// Represents a regular expression in a `GROUP BY` clause.
     Regex(Regex),
@@ -314,12 +374,8 @@ pub enum Dimension {
 impl Display for Dimension {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Time {
-                interval,
-                offset: Some(offset),
-            } => write!(f, "TIME({interval}, {offset})"),
-            Self::Time { interval, .. } => write!(f, "TIME({interval})"),
-            Self::Tag(v) => Display::fmt(v, f),
+            Self::Time(v) => Display::fmt(v, f),
+            Self::VarRef(v) => Display::fmt(v, f),
             Self::Regex(v) => Display::fmt(v, f),
             Self::Wildcard => f.write_char('*'),
         }
@@ -334,8 +390,8 @@ impl Parser for Dimension {
             time_call_expression,
             map(regex, Self::Regex),
             map(var_ref, |v| {
-                Self::Tag(match v {
-                    Expr::VarRef { name, .. } => name,
+                Self::VarRef(match v {
+                    Expr::VarRef(var_ref) => var_ref,
                     // var_ref only returns Expr::VarRef
                     _ => unreachable!(),
                 })
@@ -366,7 +422,7 @@ fn time_call_expression(i: &str) -> ParseResult<&str, Dimension> {
                 expect("invalid TIME call, expected ')'", preceded(ws0, char(')'))),
             ),
         ),
-        |(interval, offset)| Dimension::Time { interval, offset },
+        |(interval, offset)| Dimension::Time(TimeDimension { interval, offset }),
     )(i)
 }
 
@@ -390,9 +446,12 @@ fn group_by_clause(i: &str) -> ParseResult<&str, GroupByClause> {
 }
 
 /// Represents a `FILL` clause, and specifies all possible cases of the argument to the `FILL` clause.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
 pub enum FillClause {
     /// Empty aggregate windows will contain null values and is specified as `fill(null)`
+    ///
+    /// This is the default behavior of a `SELECT` statement, when the `FILL` clause is omitted.
+    #[default]
     Null,
 
     /// Empty aggregate windows will be discarded and is specified as `fill(none)`.
@@ -462,6 +521,64 @@ impl Parser for Field {
             ),
             |(expr, alias)| Self { expr, alias },
         )(i)
+    }
+}
+
+/// Parse the input completely and return a [`Field`].
+///
+/// All leading and trailing whitespace is consumed. If any input remains after parsing,
+/// an error is returned.
+pub fn parse_field(input: &str) -> Result<Field, ParseError> {
+    let mut i: &str = input;
+
+    // Consume whitespace from the input
+    (i, _) = ws0(i).expect("ws0 is infallible");
+
+    if i.is_empty() {
+        return Err(ParseError {
+            message: "unexpected eof".into(),
+            pos: 0,
+        });
+    }
+
+    let (mut i, cond) = match Field::parse(i) {
+        Ok((i1, cond)) => (i1, cond),
+        Err(nom::Err::Failure(crate::InternalError::Syntax {
+            input: pos,
+            message,
+        })) => {
+            return Err(ParseError {
+                message: message.into(),
+                pos: input.offset(pos),
+            })
+        }
+        // any other error indicates an invalid expression
+        Err(_) => {
+            return Err(ParseError {
+                message: "invalid field expression".into(),
+                pos: input.offset(i),
+            })
+        }
+    };
+
+    // Consume remaining whitespace from the input
+    (i, _) = ws0(i).expect("ws0 is infallible");
+
+    if !i.is_empty() {
+        return Err(ParseError {
+            message: "invalid field expression".into(),
+            pos: input.offset(i),
+        });
+    }
+
+    Ok(cond)
+}
+
+impl FromStr for Field {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_field(s)
     }
 }
 
@@ -699,6 +816,7 @@ mod test {
     use super::*;
     use crate::{assert_expect_error, binary_op, call, distinct, regex, var_ref, wildcard};
     use assert_matches::assert_matches;
+    use test_helpers::assert_error;
 
     #[test]
     fn test_select_statement() {
@@ -740,6 +858,7 @@ mod test {
             got.to_string(),
             r#"SELECT sum(value) FROM foo GROUP BY TIME(5m), host FILL(PREVIOUS)"#
         );
+        assert_matches!(got.fill, Some(FillClause::Previous));
 
         let (_, got) = select_statement("SELECT value FROM foo ORDER BY DESC").unwrap();
         assert_eq!(
@@ -886,7 +1005,7 @@ mod test {
         assert_eq!(
             got,
             Field {
-                expr: call!("COUNT", var_ref!("foo")),
+                expr: call!("count", var_ref!("foo")),
                 alias: Some("bar".into())
             }
         );
@@ -896,7 +1015,7 @@ mod test {
         assert_eq!(
             got,
             Field {
-                expr: call!("LAST", var_ref!("n.asks")),
+                expr: call!("last", var_ref!("n.asks")),
                 alias: None
             }
         );
@@ -916,7 +1035,7 @@ mod test {
         assert_eq!(
             got,
             Field {
-                expr: call!("COUNT", distinct!("foo")),
+                expr: call!("count", distinct!("foo")),
                 alias: Some("bar".into())
             }
         );
@@ -926,7 +1045,7 @@ mod test {
         assert_eq!(
             got,
             Field {
-                expr: call!("COUNT", call!("DISTINCT", var_ref!("foo"))),
+                expr: call!("count", call!("distinct", var_ref!("foo"))),
                 alias: None
             }
         );
@@ -966,7 +1085,7 @@ mod test {
         assert_eq!(
             got,
             Field {
-                expr: call!("COUNT", wildcard!()),
+                expr: call!("count", wildcard!()),
                 alias: None,
             }
         );
@@ -1098,7 +1217,7 @@ mod test {
         assert_matches!(got, Dimension::Time { .. });
 
         let (_, got) = Dimension::parse("foo").unwrap();
-        assert_matches!(got, Dimension::Tag(t) if t == "foo".into());
+        assert_matches!(got, Dimension::VarRef(VarRef { name, ..}) if name == "foo".into());
 
         let (_, got) = Dimension::parse("/bar/").unwrap();
         assert_matches!(got, Dimension::Regex(_));
@@ -1139,6 +1258,20 @@ mod test {
             group_by_clause("GROUP BY 1"),
             "invalid GROUP BY clause, expected wildcard, TIME, identifier or regular expression"
         );
+    }
+
+    #[test]
+    fn test_group_by_clause_tags_time_dimension() {
+        let (_, got) = group_by_clause("GROUP BY *, /foo/, TIME(5m), tag1, tag2").unwrap();
+        assert!(got.time_dimension().is_some());
+        assert_eq!(
+            got.tag_names().cloned().collect::<Vec<_>>(),
+            vec!["tag1".into(), "tag2".into()]
+        );
+
+        let (_, got) = group_by_clause("GROUP BY *, /foo/").unwrap();
+        assert!(got.time_dimension().is_none());
+        assert_eq!(got.tag_names().count(), 0);
     }
 
     #[test]
@@ -1248,5 +1381,24 @@ mod test {
             wildcard("*::foo"),
             "invalid wildcard type specifier, expected TAG or FIELD"
         );
+    }
+
+    #[test]
+    fn test_parse_field() {
+        assert_eq!(parse_field("a as foo").unwrap().to_string(), "a AS foo");
+
+        // with leading and trailing whitespace
+        assert_eq!(
+            parse_field("  a+3 as foo  ").unwrap().to_string(),
+            "a + 3 AS foo"
+        );
+
+        // fallible
+        assert_error!(parse_field("  a+3 as "), ref e @ ParseError { .. } if e.pos == 8);
+
+        // FromStr
+
+        let field = " sum(a) as foo  ".parse::<Field>().unwrap();
+        assert_eq!(field.to_string(), "sum(a) AS foo");
     }
 }

@@ -9,7 +9,7 @@ use crate::{
 use async_trait::async_trait;
 use data_types::NamespaceId;
 use datafusion::{
-    catalog::{catalog::CatalogProvider, schema::SchemaProvider},
+    catalog::{schema::SchemaProvider, CatalogProvider},
     datasource::TableProvider,
     error::DataFusionError,
 };
@@ -59,7 +59,7 @@ impl QueryNamespace for QuerierNamespace {
         let mut chunks = table
             .chunks(
                 predicate,
-                ctx.span().map(|span| span.child("querier table chunks")),
+                ctx.child_span("QuerierNamespace chunks"),
                 projection,
             )
             .await?;
@@ -78,6 +78,12 @@ impl QueryNamespace for QuerierNamespace {
             })
         }
         Ok(chunks)
+    }
+
+    fn retention_time_ns(&self) -> Option<i64> {
+        self.retention_period.map(|d| {
+            self.catalog_cache.time_provider().now().timestamp_nanos() - d.as_nanos() as i64
+        })
     }
 
     fn record_query(
@@ -108,6 +114,9 @@ pub struct QuerierCatalogProvider {
 
     /// Query log.
     query_log: Arc<QueryLog>,
+
+    /// Include debug info tables.
+    include_debug_info_tables: bool,
 }
 
 impl QuerierCatalogProvider {
@@ -116,6 +125,7 @@ impl QuerierCatalogProvider {
             namespace_id: namespace.id,
             tables: Arc::clone(&namespace.tables),
             query_log: Arc::clone(&namespace.query_log),
+            include_debug_info_tables: namespace.include_debug_info_tables,
         }
     }
 }
@@ -137,6 +147,7 @@ impl CatalogProvider for QuerierCatalogProvider {
             SYSTEM_SCHEMA => Some(Arc::new(SystemSchemaProvider::new(
                 Arc::clone(&self.query_log),
                 self.namespace_id,
+                self.include_debug_info_tables,
             ))),
             _ => None,
         }
@@ -186,11 +197,17 @@ impl SchemaProvider for UserSchemaProvider {
 
 impl ExecutionContextProvider for QuerierNamespace {
     fn new_query_context(&self, span_ctx: Option<SpanContext>) -> IOxSessionContext {
-        self.exec
+        let mut cfg = self
+            .exec
             .new_execution_config(ExecutorType::Query)
             .with_default_catalog(Arc::new(QuerierCatalogProvider::from_namespace(self)) as _)
-            .with_span_context(span_ctx)
-            .build()
+            .with_span_context(span_ctx);
+
+        for (k, v) in self.datafusion_config.as_ref() {
+            cfg = cfg.with_config_option(k, v);
+        }
+
+        cfg.build()
     }
 }
 
@@ -199,13 +216,13 @@ mod tests {
     use super::*;
     use crate::namespace::test_util::{clear_parquet_cache, querier_namespace};
     use arrow::record_batch::RecordBatch;
-    use arrow_util::assert_batches_sorted_eq;
+    use arrow_util::test_util::{batches_to_sorted_lines, Normalizer};
     use data_types::ColumnType;
     use datafusion::common::DataFusionError;
     use iox_query::frontend::sql::SqlQueryPlanner;
     use iox_tests::{TestCatalog, TestParquetFileBuilder};
+    use iox_time::Time;
     use metric::{Observation, RawReporter};
-    use regex::Regex;
     use snafu::{ResultExt, Snafu};
     use trace::{span::SpanStatus, RingBufferTraceCollector};
 
@@ -218,9 +235,6 @@ mod tests {
         // namespace with infinite retention policy
         let ns = catalog.create_namespace_with_retention("ns", None).await;
 
-        let shard1 = ns.create_shard(1).await;
-        let shard2 = ns.create_shard(2).await;
-
         let table_cpu = ns.create_table("cpu").await;
         let table_mem = ns.create_table("mem").await;
 
@@ -232,22 +246,22 @@ mod tests {
         table_mem.create_column("time", ColumnType::Time).await;
         table_mem.create_column("perc", ColumnType::F64).await;
 
-        let partition_cpu_a_1 = table_cpu.with_shard(&shard1).create_partition("a").await;
-        let partition_cpu_a_2 = table_cpu.with_shard(&shard2).create_partition("a").await;
-        let partition_cpu_b_1 = table_cpu.with_shard(&shard1).create_partition("b").await;
-        let partition_mem_c_1 = table_mem.with_shard(&shard1).create_partition("c").await;
-        let partition_mem_c_2 = table_mem.with_shard(&shard2).create_partition("c").await;
+        let partition_cpu_a_1 = table_cpu.create_partition("a").await;
+        let partition_cpu_a_2 = table_cpu.create_partition("a").await;
+        let partition_cpu_b_1 = table_cpu.create_partition("b").await;
+        let partition_mem_c_1 = table_mem.create_partition("c").await;
+        let partition_mem_c_2 = table_mem.create_partition("c").await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(1))
             .with_line_protocol("cpu,host=a load=1 11")
-            .with_max_seq(1)
             .with_min_time(11)
             .with_max_time(11);
         partition_cpu_a_1.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(2))
             .with_line_protocol("cpu,host=a load=2 22")
-            .with_max_seq(2)
             .with_min_time(22)
             .with_max_time(22);
         partition_cpu_a_1
@@ -257,51 +271,49 @@ mod tests {
             .await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(3))
             .with_line_protocol("cpu,host=z load=0 0")
-            .with_max_seq(2)
             .with_min_time(22)
             .with_max_time(22);
         partition_cpu_a_1.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(4))
             .with_line_protocol("cpu,host=a load=3 33")
-            .with_max_seq(3)
             .with_min_time(33)
             .with_max_time(33);
         partition_cpu_a_1.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(5))
             .with_line_protocol("cpu,host=a load=4 10001")
-            .with_max_seq(4)
             .with_min_time(10_001)
             .with_max_time(10_001);
         partition_cpu_a_2.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_creation_time(Time::from_timestamp_nanos(6))
             .with_line_protocol("cpu,host=b load=5 11")
-            .with_max_seq(5)
             .with_min_time(11)
             .with_max_time(11);
         partition_cpu_b_1.create_parquet_file(builder).await;
 
-        // row `host=d perc=52 13` will be removed by the tombstone
         let lp = [
             "mem,host=c perc=50 11",
             "mem,host=c perc=51 12",
-            "mem,host=d perc=52 13",
             "mem,host=d perc=53 14",
         ]
         .join("\n");
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(7))
             .with_line_protocol(&lp)
-            .with_max_seq(6)
             .with_min_time(11)
             .with_max_time(14);
         partition_mem_c_1.create_parquet_file(builder).await;
 
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(8))
             .with_line_protocol("mem,host=c perc=50 1001")
-            .with_max_seq(7)
             .with_min_time(1001)
             .with_max_time(1001);
         partition_mem_c_2
@@ -310,46 +322,35 @@ mod tests {
             .flag_for_delete()
             .await;
 
-        // will be pruned by the tombstone
-        let builder = TestParquetFileBuilder::default()
-            .with_line_protocol("mem,host=d perc=55 1")
-            .with_max_seq(7)
-            .with_min_time(1)
-            .with_max_time(1);
-        partition_mem_c_1.create_parquet_file(builder).await;
-
-        table_mem
-            .with_shard(&shard1)
-            .create_tombstone(1000, 1, 13, "host=d")
-            .await;
-
         let querier_namespace = Arc::new(querier_namespace(&ns).await);
 
         let traces = Arc::new(RingBufferTraceCollector::new(100));
         let span_ctx = SpanContext::new(Arc::clone(&traces) as _);
 
-        assert_query_with_span_ctx(
-            &querier_namespace,
-            "SELECT * FROM cpu WHERE host != 'z' ORDER BY host,time",
-            &[
-                "+-----+------+------+--------------------------------+",
-                "| foo | host | load | time                           |",
-                "+-----+------+------+--------------------------------+",
-                "|     | a    | 1.0  | 1970-01-01T00:00:00.000000011Z |",
-                "|     | a    | 3.0  | 1970-01-01T00:00:00.000000033Z |",
-                "|     | a    | 4.0  | 1970-01-01T00:00:00.000010001Z |",
-                "|     | b    | 5.0  | 1970-01-01T00:00:00.000000011Z |",
-                "+-----+------+------+--------------------------------+",
-            ],
-            Some(span_ctx),
-        )
-        .await;
+        insta::assert_yaml_snapshot!(
+            format_query_with_span_ctx(
+                &querier_namespace,
+                "SELECT * FROM cpu WHERE host != 'z' ORDER BY host,time",
+                Some(span_ctx),
+            ).await,
+            @r###"
+        ---
+        - +-----+------+------+--------------------------------+
+        - "| foo | host | load | time                           |"
+        - +-----+------+------+--------------------------------+
+        - "|     | a    | 1.0  | 1970-01-01T00:00:00.000000011Z |"
+        - "|     | a    | 3.0  | 1970-01-01T00:00:00.000000033Z |"
+        - "|     | a    | 4.0  | 1970-01-01T00:00:00.000010001Z |"
+        - "|     | b    | 5.0  | 1970-01-01T00:00:00.000000011Z |"
+        - +-----+------+------+--------------------------------+
+        "###
+        );
 
         // check span
         let span = traces
             .spans()
             .into_iter()
-            .find(|s| s.name == "querier table chunks")
+            .find(|s| s.name == "QuerierTable chunks")
             .expect("tracing span not found");
         assert_eq!(span.status, SpanStatus::Ok);
 
@@ -464,79 +465,67 @@ mod tests {
             &Observation::U64Counter(0),
         );
 
-        assert_query(
-            &querier_namespace,
-            "SELECT * FROM mem ORDER BY host,time",
-            &[
-                "+------+------+--------------------------------+",
-                "| host | perc | time                           |",
-                "+------+------+--------------------------------+",
-                "| c    | 50.0 | 1970-01-01T00:00:00.000000011Z |",
-                "| c    | 51.0 | 1970-01-01T00:00:00.000000012Z |",
-                "| d    | 53.0 | 1970-01-01T00:00:00.000000014Z |",
-                "+------+------+--------------------------------+",
-            ],
-        )
-        .await;
+        insta::assert_yaml_snapshot!(
+            format_query(
+                &querier_namespace,
+                "SELECT * FROM mem ORDER BY host,time"
+            ).await,
+            @r###"
+        ---
+        - +------+------+--------------------------------+
+        - "| host | perc | time                           |"
+        - +------+------+--------------------------------+
+        - "| c    | 50.0 | 1970-01-01T00:00:00.000000011Z |"
+        - "| c    | 51.0 | 1970-01-01T00:00:00.000000012Z |"
+        - "| d    | 53.0 | 1970-01-01T00:00:00.000000014Z |"
+        - +------+------+--------------------------------+
+        "###
+        );
 
         // ---------------------------------------------------------
         // EXPLAIN
 
         // 5 chunks but one was flaged for deleted -> 4 chunks left
         // all chunks are persisted and do not overlap -> they will be scanned in one IOxReadFilterNode node
-        assert_explain(
-            &querier_namespace,
-            "EXPLAIN SELECT * FROM cpu",
-            &[
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                                                                                                                                                                                                                                                  |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                                                                                                                                                                                                                                                                                                     |",
-                "|               |   TableScan: cpu projection=[foo, host, load, time]                                                                                                                                                                                                                                                                                                                   |",
-                "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time]                                                                                                                                                                                                                                                                                   |",
-                "|               |   ParquetExec: limit=None, partitions={1 group: [[1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/2/2/<uuid>.parquet, 1/1/1/3/<uuid>.parquet]]}, projection=[foo, host, load, time] |",
-                "|               |                                                                                                                                                                                                                                                                                                                                                                       |",
-                "+---------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-            ],
-        )
-            .await;
+        insta::assert_yaml_snapshot!(
+            format_explain(&querier_namespace, "EXPLAIN SELECT * FROM cpu").await,
+            @r###"
+        ---
+        - "----------"
+        - "| plan_type    | plan    |"
+        - "----------"
+        - "| logical_plan    | TableScan: cpu projection=[foo, host, load, time]    |"
+        - "| physical_plan    | ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000000.parquet, 1/1/1/00000000-0000-0000-0000-000000000001.parquet, 1/1/1/00000000-0000-0000-0000-000000000002.parquet, 1/1/1/00000000-0000-0000-0000-000000000003.parquet, 1/1/1/00000000-0000-0000-0000-000000000004.parquet]]}, projection=[foo, host, load, time]    |"
+        - "|    |    |"
+        - "----------"
+        "###
+        );
 
-        // 3 chunks but 1 (with time = 1) got pruned by the tombstone  --> 2 chunks left
-        // The 2 participated chunks in the plan do not overlap -> no deduplication, no sort. Final sort is for order by
-        // FilterExec is for the tombstone
-        assert_explain(
-            &querier_namespace,
-            "EXPLAIN SELECT * FROM mem ORDER BY host,time",
-            &[
-                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| plan_type     | plan                                                                                                                                               |",
-                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
-                "| logical_plan  | Sort: mem.host ASC NULLS LAST, mem.time ASC NULLS LAST                                                                                             |",
-                "|               |   Projection: mem.host, mem.perc, mem.time                                                                                                         |",
-                "|               |     TableScan: mem projection=[host, perc, time]                                                                                                   |",
-                "| physical_plan | SortExec: expr=[host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]                                                                                       |",
-                "|               |   CoalescePartitionsExec                                                                                                                           |",
-                "|               |     ProjectionExec: expr=[host@0 as host, perc@1 as perc, time@2 as time]                                                                          |",
-                "|               |       UnionExec                                                                                                                                    |",
-                "|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                |",
-                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
-                "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
-                "|               |         CoalesceBatchesExec: target_batch_size=8192                                                                                                |",
-                "|               |           FilterExec: time@2 < 1 OR time@2 > 13 OR NOT host@0 = CAST(d AS Dictionary(Int32, Utf8))                                                 |",
-                "|               |             ParquetExec: limit=None, partitions={1 group: [[1/2/1/4/<uuid>.parquet]]}, projection=[host, perc, time] |",
-                "|               |                                                                                                                                                    |",
-                "+---------------+----------------------------------------------------------------------------------------------------------------------------------------------------+",
-            ],
-        )
-            .await;
+        // The 2 participated chunks in the plan do not overlap -> no deduplication, no sort. Final
+        // sort is for order by.
+        insta::assert_yaml_snapshot!(
+            format_explain(&querier_namespace, "EXPLAIN SELECT * FROM mem ORDER BY host,time").await,
+            @r###"
+        ---
+        - "----------"
+        - "| plan_type    | plan    |"
+        - "----------"
+        - "| logical_plan    | Sort: mem.host ASC NULLS LAST, mem.time ASC NULLS LAST    |"
+        - "|    |   TableScan: mem projection=[host, perc, time]    |"
+        - "| physical_plan    | SortExec: expr=[host@0 ASC NULLS LAST,time@2 ASC NULLS LAST]    |"
+        - "|    |   ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000000.parquet]]}, projection=[host, perc, time], output_ordering=[host@0 ASC, time@2 ASC]    |"
+        - "|    |    |"
+        - "----------"
+        "###
+        );
 
         // -----------
         // Add an overlapped chunk
         // (overlaps `partition_cpu_a_2`)
         let builder = TestParquetFileBuilder::default()
+            .with_max_l0_created_at(Time::from_timestamp_nanos(10))
             // duplicate row with different field value (load=14)
             .with_line_protocol("cpu,host=a load=14 10001")
-            .with_max_seq(2_000)
             .with_min_time(10_001)
             .with_max_time(10_001);
         partition_cpu_a_2.create_parquet_file(builder).await;
@@ -544,87 +533,68 @@ mod tests {
         // Since we made a new parquet file, we need to tell querier about it
         clear_parquet_cache(&querier_namespace, table_cpu.table.id);
 
-        assert_query(
-            &querier_namespace,
-            "SELECT * FROM cpu", // no need `order by` because data is sorted before comparing in assert_query
-            &[
-                "+-----+------+------+--------------------------------+",
-                "| foo | host | load | time                           |",
-                "+-----+------+------+--------------------------------+",
-                "|     | a    | 1.0  | 1970-01-01T00:00:00.000000011Z |",
-                "|     | a    | 14.0 | 1970-01-01T00:00:00.000010001Z |",
-                "|     | a    | 3.0  | 1970-01-01T00:00:00.000000033Z |",
-                "|     | b    | 5.0  | 1970-01-01T00:00:00.000000011Z |",
-                "|     | z    | 0.0  | 1970-01-01T00:00:00Z           |",
-                "+-----+------+------+--------------------------------+",
-            ],
-        )
-        .await;
+        insta::assert_yaml_snapshot!(
+            format_query(&querier_namespace,
+                         "SELECT * FROM cpu", // no need `order by` because data is sorted before comparing in assert_query
+            ).await,
+            @r###"
+        ---
+        - +-----+------+------+--------------------------------+
+        - "| foo | host | load | time                           |"
+        - +-----+------+------+--------------------------------+
+        - "|     | a    | 1.0  | 1970-01-01T00:00:00.000000011Z |"
+        - "|     | a    | 14.0 | 1970-01-01T00:00:00.000010001Z |"
+        - "|     | a    | 3.0  | 1970-01-01T00:00:00.000000033Z |"
+        - "|     | b    | 5.0  | 1970-01-01T00:00:00.000000011Z |"
+        - "|     | z    | 0.0  | 1970-01-01T00:00:00Z           |"
+        - +-----+------+------+--------------------------------+
+        "###
+        );
 
         // 5 chunks:
         //   . 2 chunks overlap  with each other and must be deduplicated but no sort needed because they are sorted on the same sort key
         //   . 3 chunks do not overlap and have no duplicated --> will be scanned in one IOxReadFilterNode node
-        assert_explain(
-            &querier_namespace,
-            "EXPLAIN SELECT * FROM cpu",
-            &[
-    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    "| plan_type     | plan                                                                                                                                                                                                                                                                                                              |",
-    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-    "| logical_plan  | Projection: cpu.foo, cpu.host, cpu.load, cpu.time                                                                                                                                                                                                                                                                 |",
-    "|               |   TableScan: cpu projection=[foo, host, load, time]                                                                                                                                                                                                                                                               |",
-    "| physical_plan | ProjectionExec: expr=[foo@0 as foo, host@1 as host, load@2 as load, time@3 as time]                                                                                                                                                                                                                               |",
-    "|               |   UnionExec                                                                                                                                                                                                                                                                                                       |",
-    "|               |     DeduplicateExec: [host@1 ASC,time@3 ASC]                                                                                                                                                                                                                                                                      |",
-    "|               |       SortPreservingMergeExec: [host@1 ASC,time@3 ASC]                                                                                                                                                                                                                                                            |",
-    "|               |         UnionExec                                                                                                                                                                                                                                                                                                 |",
-    "|               |           ParquetExec: limit=None, partitions={1 group: [[1/1/2/2/<uuid>.parquet]]}, output_ordering=[host@1 ASC, time@3 ASC], projection=[foo, host, load, time]                                                                                                                   |",
-    "|               |           ParquetExec: limit=None, partitions={1 group: [[1/1/2/2/<uuid>.parquet]]}, output_ordering=[host@1 ASC, time@3 ASC], projection=[foo, host, load, time]                                                                                                                   |",
-    "|               |     ParquetExec: limit=None, partitions={1 group: [[1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/1/<uuid>.parquet, 1/1/1/3/<uuid>.parquet]]}, projection=[foo, host, load, time] |",
-    "|               |                                                                                                                                                                                                                                                                                                                   |",
-    "+---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+",
-            ],
-        )
-            .await;
-    }
-
-    async fn assert_query(
-        querier_namespace: &Arc<QuerierNamespace>,
-        sql: &str,
-        expected_lines: &[&str],
-    ) {
-        assert_query_with_span_ctx(querier_namespace, sql, expected_lines, None).await
-    }
-
-    async fn assert_query_with_span_ctx(
-        querier_namespace: &Arc<QuerierNamespace>,
-        sql: &str,
-        expected_lines: &[&str],
-        span_ctx: Option<SpanContext>,
-    ) {
-        let results = run(querier_namespace, sql, span_ctx).await;
-        assert_batches_sorted_eq!(expected_lines, &results);
-    }
-
-    async fn assert_explain(
-        querier_namespace: &Arc<QuerierNamespace>,
-        sql: &str,
-        expected_lines: &[&str],
-    ) {
-        let results = run(querier_namespace, sql, None).await;
-        let formatted = arrow_util::display::pretty_format_batches(&results).unwrap();
-
-        let regex = Regex::new("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
-            .expect("UUID regex");
-        let actual_lines = formatted
-            .trim()
-            .split('\n')
-            .map(|s| regex.replace_all(s, "<uuid>").to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            expected_lines, actual_lines,
-            "\n\nexpected:\n\n{expected_lines:#?}\nactual:\n\n{actual_lines:#?}\n\n"
+        insta::assert_yaml_snapshot!(
+            format_explain(&querier_namespace, "EXPLAIN SELECT * FROM cpu").await,
+            @r###"
+        ---
+        - "----------"
+        - "| plan_type    | plan    |"
+        - "----------"
+        - "| logical_plan    | TableScan: cpu projection=[foo, host, load, time]    |"
+        - "| physical_plan    | UnionExec    |"
+        - "|    |   ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000000.parquet]]}, projection=[foo, host, load, time], output_ordering=[host@1 ASC, time@3 ASC]    |"
+        - "|    |   ParquetExec: file_groups={1 group: [[1/1/1/00000000-0000-0000-0000-000000000001.parquet, 1/1/1/00000000-0000-0000-0000-000000000002.parquet, 1/1/1/00000000-0000-0000-0000-000000000003.parquet]]}, projection=[foo, host, load, time]    |"
+        - "|    |   ProjectionExec: expr=[foo@1 as foo, host@2 as host, load@3 as load, time@4 as time]    |"
+        - "|    |     DeduplicateExec: [host@2 ASC,time@4 ASC]    |"
+        - "|    |       SortPreservingMergeExec: [host@2 ASC,time@4 ASC,__chunk_order@0 ASC]    |"
+        - "|    |         ParquetExec: file_groups={2 groups: [[1/1/1/00000000-0000-0000-0000-000000000004.parquet], [1/1/1/00000000-0000-0000-0000-000000000005.parquet]]}, projection=[__chunk_order, foo, host, load, time], output_ordering=[host@2 ASC, time@4 ASC, __chunk_order@0 ASC]    |"
+        - "|    |    |"
+        - "----------"
+        "###
         );
+    }
+
+    async fn format_query(querier_namespace: &Arc<QuerierNamespace>, sql: &str) -> Vec<String> {
+        format_query_with_span_ctx(querier_namespace, sql, None).await
+    }
+
+    async fn format_query_with_span_ctx(
+        querier_namespace: &Arc<QuerierNamespace>,
+        sql: &str,
+        span_ctx: Option<SpanContext>,
+    ) -> Vec<String> {
+        let results = run(querier_namespace, sql, span_ctx).await;
+        batches_to_sorted_lines(&results)
+    }
+
+    async fn format_explain(querier_namespace: &Arc<QuerierNamespace>, sql: &str) -> Vec<String> {
+        let results = run(querier_namespace, sql, None).await;
+        let normalizer = Normalizer {
+            normalized_uuids: true,
+            ..Default::default()
+        };
+        normalizer.normalize_results(results)
     }
 
     async fn run(

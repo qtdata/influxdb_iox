@@ -1,13 +1,14 @@
 use std::sync::Arc;
 
 use datafusion::{
+    common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{rewrite::TreeNodeRewritable, union::UnionExec, ExecutionPlan},
+    physical_plan::{union::UnionExec, ExecutionPlan},
 };
 
-/// Optimizer that places [`UnionExec`] with a single child node w/ the child note itself.
+/// Optimizer that replaces [`UnionExec`] with a single child node w/ the child note itself.
 ///
 /// # Example
 /// ```yaml
@@ -33,11 +34,11 @@ impl PhysicalOptimizerRule for OneUnion {
             if let Some(union_exec) = plan_any.downcast_ref::<UnionExec>() {
                 let mut children = union_exec.children();
                 if children.len() == 1 {
-                    return Ok(Some(children.remove(0)));
+                    return Ok(Transformed::Yes(children.remove(0)));
                 }
             }
 
-            Ok(None)
+            Ok(Transformed::No(plan))
         })
     }
 
@@ -69,7 +70,7 @@ mod tests {
     #[test]
     fn test_union_one() {
         let plan = Arc::new(UnionExec::new(vec![other_node()]));
-        let opt = OneUnion::default();
+        let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -87,7 +88,7 @@ mod tests {
     #[test]
     fn test_union_two() {
         let plan = Arc::new(UnionExec::new(vec![other_node(), other_node()]));
-        let opt = OneUnion::default();
+        let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -108,7 +109,7 @@ mod tests {
     #[test]
     fn test_other_node() {
         let plan = other_node();
-        let opt = OneUnion::default();
+        let opt = OneUnion;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"

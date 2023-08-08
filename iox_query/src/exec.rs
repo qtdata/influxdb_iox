@@ -4,17 +4,18 @@
 pub(crate) mod context;
 pub mod field;
 pub mod fieldlist;
-pub(crate) mod gapfill;
+pub mod gapfill;
 mod non_null_checker;
-mod query_tracing;
+pub mod query_tracing;
 mod schema_pivot;
 pub mod seriesset;
 pub(crate) mod split;
 pub mod stringset;
+use datafusion_util::config::register_iox_object_store;
 use executor::DedicatedExecutor;
+use metric::Registry;
 use object_store::DynObjectStore;
 use parquet_file::storage::StorageId;
-use trace::span::{SpanExt, SpanRecorder};
 mod cross_rt_stream;
 
 use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
@@ -22,13 +23,12 @@ use std::{collections::HashMap, fmt::Display, num::NonZeroUsize, sync::Arc};
 use datafusion::{
     self,
     execution::{
-        context::SessionState,
         disk_manager::DiskManagerConfig,
+        memory_pool::MemoryPool,
         runtime_env::{RuntimeConfig, RuntimeEnv},
     },
     logical_expr::{expr_rewriter::normalize_col, Extension},
     logical_expr::{Expr, LogicalPlan},
-    prelude::SessionContext,
 };
 
 pub use context::{IOxSessionConfig, IOxSessionContext, SessionContextIOxExt};
@@ -47,6 +47,9 @@ pub struct ExecutorConfig {
 
     /// Object stores
     pub object_stores: HashMap<StorageId, Arc<DynObjectStore>>,
+
+    /// Metric registry
+    pub metric_registry: Arc<Registry>,
 
     /// Memory pool size in bytes.
     pub mem_pool_size: usize,
@@ -76,9 +79,10 @@ pub struct DedicatedExecutors {
 }
 
 impl DedicatedExecutors {
-    pub fn new(num_threads: NonZeroUsize) -> Self {
-        let query_exec = DedicatedExecutor::new("IOx Query", num_threads);
-        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads);
+    pub fn new(num_threads: NonZeroUsize, metric_registry: Arc<Registry>) -> Self {
+        let query_exec =
+            DedicatedExecutor::new("IOx Query", num_threads, Arc::clone(&metric_registry));
+        let reorg_exec = DedicatedExecutor::new("IOx Reorg", num_threads, metric_registry);
 
         Self {
             query_exec,
@@ -137,18 +141,26 @@ pub enum ExecutorType {
 impl Executor {
     /// Creates a new executor with a two dedicated thread pools, each
     /// with num_threads
-    pub fn new(num_threads: NonZeroUsize, mem_pool_size: usize) -> Self {
+    pub fn new(
+        num_threads: NonZeroUsize,
+        mem_pool_size: usize,
+        metric_registry: Arc<Registry>,
+    ) -> Self {
         Self::new_with_config(ExecutorConfig {
             num_threads,
             target_query_partitions: num_threads,
             object_stores: HashMap::default(),
+            metric_registry,
             mem_pool_size,
         })
     }
 
     /// Create new executor based on a specific config.
     pub fn new_with_config(config: ExecutorConfig) -> Self {
-        let executors = Arc::new(DedicatedExecutors::new(config.num_threads));
+        let executors = Arc::new(DedicatedExecutors::new(
+            config.num_threads,
+            Arc::clone(&config.metric_registry),
+        ));
         Self::new_with_config_and_executors(config, executors)
     }
 
@@ -159,6 +171,7 @@ impl Executor {
             num_threads: NonZeroUsize::new(1).unwrap(),
             target_query_partitions: NonZeroUsize::new(1).unwrap(),
             object_stores: HashMap::default(),
+            metric_registry: Arc::new(Registry::default()),
             mem_pool_size: 1024 * 1024 * 1024, // 1GB
         };
         let executors = Arc::new(DedicatedExecutors::new_testing());
@@ -181,13 +194,10 @@ impl Executor {
             .with_disk_manager(DiskManagerConfig::Disabled)
             .with_memory_limit(config.mem_pool_size, 1.0);
 
-        for (id, store) in &config.object_stores {
-            runtime_config
-                .object_store_registry
-                .register_store("iox", id, Arc::clone(store));
-        }
-
         let runtime = Arc::new(RuntimeEnv::new(runtime_config).expect("creating runtime"));
+        for (id, store) in &config.object_stores {
+            register_iox_object_store(&runtime, id, Arc::clone(store));
+        }
 
         Self {
             executors,
@@ -203,18 +213,6 @@ impl Executor {
         let exec = self.executor(executor_type).clone();
         IOxSessionConfig::new(exec, Arc::clone(&self.runtime))
             .with_target_partitions(self.config.target_query_partitions)
-    }
-
-    /// Get IOx context from DataFusion state.
-    pub fn new_context_from_df(
-        &self,
-        executor_type: ExecutorType,
-        state: &SessionState,
-    ) -> IOxSessionContext {
-        let inner = SessionContext::with_state(state.clone());
-        let exec = self.executor(executor_type).clone();
-        let recorder = SpanRecorder::new(state.span_ctx().child_span("Query Execution"));
-        IOxSessionContext::new(inner, exec, recorder)
     }
 
     /// Create a new execution context, suitable for executing a new query or system task
@@ -247,6 +245,11 @@ impl Executor {
     pub async fn join(&self) {
         self.executors.query_exec.join().await;
         self.executors.reorg_exec.join().await;
+    }
+
+    /// Returns the memory pool associated with this `Executor`
+    pub fn pool(&self) -> Arc<dyn MemoryPool> {
+        Arc::clone(&self.runtime.memory_pool)
     }
 }
 

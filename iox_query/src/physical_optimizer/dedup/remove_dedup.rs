@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use datafusion::{
+    common::tree_node::{Transformed, TreeNode},
     config::ConfigOptions,
     error::Result,
     physical_optimizer::PhysicalOptimizerRule,
-    physical_plan::{rewrite::TreeNodeRewritable, ExecutionPlan},
+    physical_plan::ExecutionPlan,
 };
-use predicate::Predicate;
 
 use crate::{
     physical_optimizer::chunk_extraction::extract_chunks,
@@ -30,22 +30,21 @@ impl PhysicalOptimizerRule for RemoveDedup {
                 let mut children = dedup_exec.children();
                 assert_eq!(children.len(), 1);
                 let child = children.remove(0);
-                let Some((schema, chunks)) = extract_chunks(child.as_ref()) else {
-                    return Ok(None);
+                let Some((schema, chunks, output_sort_key)) = extract_chunks(child.as_ref()) else {
+                    return Ok(Transformed::No(plan));
                 };
 
                 if (chunks.len() < 2) && chunks.iter().all(|c| !c.may_contain_pk_duplicates()) {
-                    return Ok(Some(chunks_to_physical_nodes(
+                    return Ok(Transformed::Yes(chunks_to_physical_nodes(
                         &schema,
-                        None,
+                        output_sort_key.as_ref(),
                         chunks,
-                        Predicate::new(),
                         config.execution.target_partitions,
                     )));
                 }
             }
 
-            Ok(None)
+            Ok(Transformed::No(plan))
         })
     }
 
@@ -65,7 +64,7 @@ mod tests {
             dedup::test_util::{chunk, dedup_plan},
             test_util::OptimizationTest,
         },
-        QueryChunkMeta,
+        QueryChunk,
     };
 
     use super::*;
@@ -74,7 +73,7 @@ mod tests {
     fn test_no_chunks() {
         let schema = chunk(1).schema().clone();
         let plan = dedup_plan(schema, vec![]);
-        let opt = RemoveDedup::default();
+        let opt = RemoveDedup;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -94,7 +93,7 @@ mod tests {
         let chunk1 = chunk(1).with_may_contain_pk_duplicates(false);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1]);
-        let opt = RemoveDedup::default();
+        let opt = RemoveDedup;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -116,7 +115,7 @@ mod tests {
         let chunk1 = chunk(1).with_may_contain_pk_duplicates(true);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1]);
-        let opt = RemoveDedup::default();
+        let opt = RemoveDedup;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"
@@ -140,7 +139,7 @@ mod tests {
         let chunk2 = chunk(2).with_may_contain_pk_duplicates(false);
         let schema = chunk1.schema().clone();
         let plan = dedup_plan(schema, vec![chunk1, chunk2]);
-        let opt = RemoveDedup::default();
+        let opt = RemoveDedup;
         insta::assert_yaml_snapshot!(
             OptimizationTest::new(plan, opt),
             @r###"

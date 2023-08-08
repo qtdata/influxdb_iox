@@ -1,5 +1,6 @@
 use std::{convert::Infallible, num::NonZeroI32, sync::Arc};
 
+use authz::http::AuthorizationHeaderExtension;
 use hyper::{
     http::HeaderValue,
     server::conn::{AddrIncoming, AddrStream},
@@ -96,7 +97,13 @@ pub async fn serve(
     let metric_registry = server_type.metric_registry();
     let trace_collector = server_type.trace_collector();
 
-    let trace_layer = TraceLayer::new(trace_header_parser, metric_registry, trace_collector, false);
+    let trace_layer = TraceLayer::new(
+        trace_header_parser,
+        metric_registry,
+        trace_collector,
+        false,
+        server_type.name(),
+    );
 
     hyper::Server::builder(addr)
         .serve(hyper::service::make_service_fn(|_conn: &AddrStream| {
@@ -116,8 +123,12 @@ async fn route_request(
     server_type: Arc<dyn ServerType>,
     mut req: Request<Body>,
 ) -> Result<Response<Body>, Infallible> {
-    // we don't need the authorization header and we don't want to accidentally log it.
-    req.headers_mut().remove("authorization");
+    let auth = { req.headers().get(hyper::header::AUTHORIZATION).cloned() };
+    req.extensions_mut()
+        .insert(AuthorizationHeaderExtension::new(auth));
+
+    // we don't need the authorization header anymore and we don't want to accidentally log it.
+    req.headers_mut().remove(hyper::header::AUTHORIZATION);
     debug!(request = ?req,"Processing request");
 
     let method = req.method().clone();

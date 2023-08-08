@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use http::StatusCode;
 use observability_deps::tracing::info;
 use std::{path::PathBuf, time::Duration};
+use test_helpers::assert_contains;
 
 const MAX_QUERY_RETRY_TIME_SEC: u64 = 20;
 
@@ -64,7 +65,7 @@ impl<'a> StepTestState<'a> {
         let retry_duration = Duration::from_secs(MAX_QUERY_RETRY_TIME_SEC);
         let num_parquet_files = self.num_parquet_files.expect(
             "No previous number of Parquet files recorded! \
-                Use `Step::RecordNumParquetFiles` before `Step::WaitForPersisted2`.",
+                Use `Step::RecordNumParquetFiles` before `Step::WaitForPersisted`.",
         );
         let expected_count = num_parquet_files + expected_increase;
 
@@ -99,7 +100,7 @@ impl<'a> StepTestState<'a> {
         let mut catalog_client = influxdb_iox_client::catalog::Client::new(connection);
 
         catalog_client
-            .get_parquet_files_by_namespace(self.cluster.namespace().into())
+            .get_parquet_files_by_namespace(self.cluster.namespace())
             .await
             .map(|parquet_files| parquet_files.len())
             .unwrap_or_default()
@@ -142,27 +143,42 @@ pub enum Step {
         expected_error_code: StatusCode,
     },
 
+    /// Writes the specified line protocol to the `/api/v2/write` endpoint
+    /// using the specified authorization header, assert the data was
+    /// written successfully.
+    WriteLineProtocolWithAuthorization {
+        line_protocol: String,
+        authorization: String,
+    },
+
     /// Ask the catalog service how many Parquet files it has for this cluster's namespace. Do this
     /// before a write where you're interested in when the write has been persisted to Parquet;
-    /// then after the write use `WaitForPersisted2` to observe the change in the number of Parquet
+    /// then after the write use `WaitForPersisted` to observe the change in the number of Parquet
     /// files from the value this step recorded.
     RecordNumParquetFiles,
+
+    /// Query the catalog service for how many parquet files it has for this
+    /// cluster's namespace, asserting the value matches expected.
+    AssertNumParquetFiles { expected: usize },
 
     /// Ask the ingester to persist immediately through the persist service gRPC API
     Persist,
 
     /// Wait for all previously written data to be persisted by observing an increase in the number
-    /// of Parquet files in the catalog as specified for this cluster's namespace. Needed for
-    /// router2/ingester2/querier2.
-    WaitForPersisted2 { expected_increase: usize },
+    /// of Parquet files in the catalog as specified for this cluster's namespace.
+    WaitForPersisted { expected_increase: usize },
 
     /// Set the namespace retention interval to a retention period,
     /// specified in ns relative to `now()`.  `None` represents infinite retention
     /// (i.e. never drop data).
     SetRetention(Option<i64>),
 
-    /// Run one hot and one cold compaction operation and wait for it to finish.
+    /// Run one compaction operation and wait for it to finish, expecting success.
     Compact,
+
+    /// Run one compaction operation and wait for it to finish, expecting an error that matches
+    /// the specified message.
+    CompactExpectingError { expected_message: String },
 
     /// Run a SQL query using the FlightSQL interface and verify that the
     /// results match the expected results using the
@@ -186,6 +202,25 @@ pub enum Step {
         sql: String,
         expected_error_code: tonic::Code,
         expected_message: String,
+    },
+
+    /// Run a SQL query using the FlightSQL interface authorized by the
+    /// authorization header. Verify that the
+    /// results match the expected results using the `assert_batches_eq!`
+    /// macro
+    QueryWithAuthorization {
+        sql: String,
+        authorization: String,
+        expected: Vec<&'static str>,
+    },
+
+    /// Run a SQL query using the FlightSQL interface with the `iox-debug` header set.
+    /// Verify that the
+    /// results match the expected results using the `assert_batches_eq!`
+    /// macro
+    QueryWithDebug {
+        sql: String,
+        expected: Vec<&'static str>,
     },
 
     /// Run a SQL query using the FlightSQL interface, and then verifies
@@ -222,6 +257,31 @@ pub enum Step {
         expected_error_code: tonic::Code,
         expected_message: String,
     },
+
+    /// Run an InfluxQL query using the FlightSQL interface including an
+    /// authorization header. Verify that the results match the expected
+    /// results using the `assert_batches_eq!` macro.
+    InfluxQLQueryWithAuthorization {
+        query: String,
+        authorization: String,
+        expected: Vec<&'static str>,
+    },
+
+    /// Read and verify partition keys for a given table
+    PartitionKeys {
+        table_name: String,
+        namespace_name: Option<String>,
+        expected: Vec<&'static str>,
+    },
+
+    /// Attempt to gracefully shutdown all running ingester instances.
+    ///
+    /// This step blocks until all ingesters have gracefully stopped, or at
+    /// least [`GRACEFUL_SERVER_STOP_TIMEOUT`] elapses before they are killed.
+    ///
+    /// [`GRACEFUL_SERVER_STOP_TIMEOUT`]:
+    ///     crate::server_fixture::GRACEFUL_SERVER_STOP_TIMEOUT
+    GracefulStopIngesters,
 
     /// Retrieve the metrics and verify the results using the provided
     /// validation function.
@@ -275,8 +335,19 @@ where
                         "====Begin writing line protocol to v2 HTTP API:\n{}",
                         line_protocol
                     );
-                    let response = state.cluster.write_to_router(line_protocol).await;
-                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    let response = state.cluster.write_to_router(line_protocol, None).await;
+                    let status = response.status();
+                    let body = hyper::body::to_bytes(response.into_body())
+                        .await
+                        .expect("reading response body");
+                    assert!(
+                        status == StatusCode::NO_CONTENT,
+                        "Invalid response code while writing line protocol:\n\nLine Protocol:\n{}\n\nExpected Status: {}\nActual Status: {}\n\nBody:\n{:?}",
+                        line_protocol,
+                        StatusCode::NO_CONTENT,
+                        status,
+                        body,
+                    );
                     info!("====Done writing line protocol");
                 }
                 Step::WriteLineProtocolExpectingError {
@@ -287,20 +358,39 @@ where
                         "====Begin writing line protocol expecting error to v2 HTTP API:\n{}",
                         line_protocol
                     );
-                    let response = state.cluster.write_to_router(line_protocol).await;
+                    let response = state.cluster.write_to_router(line_protocol, None).await;
                     assert_eq!(response.status(), *expected_error_code);
                     info!("====Done writing line protocol expecting error");
+                }
+                Step::WriteLineProtocolWithAuthorization {
+                    line_protocol,
+                    authorization,
+                } => {
+                    info!(
+                        "====Begin writing line protocol (authenticated) to v2 HTTP API:\n{}",
+                        line_protocol
+                    );
+                    let response = state
+                        .cluster
+                        .write_to_router(line_protocol, Some(authorization))
+                        .await;
+                    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+                    info!("====Done writing line protocol");
                 }
                 // Get the current number of Parquet files in the cluster's namespace before
                 // starting a new write so we can observe a change when waiting for persistence.
                 Step::RecordNumParquetFiles => {
                     state.record_num_parquet_files().await;
                 }
+                Step::AssertNumParquetFiles { expected } => {
+                    let have_files = state.get_num_parquet_files().await;
+                    assert_eq!(have_files, *expected);
+                }
                 // Ask the ingesters to persist immediately through the persist service gRPC API
                 Step::Persist => {
                     state.cluster().persist_ingesters().await;
                 }
-                Step::WaitForPersisted2 { expected_increase } => {
+                Step::WaitForPersisted { expected_increase } => {
                     info!("====Begin waiting for a change in the number of Parquet files");
                     state
                         .wait_for_num_parquet_file_change(*expected_increase)
@@ -309,9 +399,18 @@ where
                 }
                 Step::Compact => {
                     info!("====Begin running compaction");
-                    state.cluster.run_compaction();
+                    state.cluster.run_compaction().unwrap();
                     info!("====Done running compaction");
                 }
+                Step::CompactExpectingError { expected_message } => {
+                    info!("====Begin running compaction expected to error");
+                    let err = state.cluster.run_compaction().unwrap_err();
+
+                    assert_contains!(err, expected_message);
+
+                    info!("====Done running");
+                }
+
                 Step::SetRetention(retention_period_ns) => {
                     info!("====Begin setting retention period to {retention_period_ns:?}");
                     let namespace = state.cluster().namespace();
@@ -326,12 +425,15 @@ where
                 Step::Query { sql, expected } => {
                     info!("====Begin running SQL query: {}", sql);
                     // run query
-                    let batches = run_sql(
+                    let (mut batches, schema) = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
+                        false,
                     )
                     .await;
+                    batches.push(RecordBatch::new_empty(schema));
                     assert_batches_sorted_eq!(expected, &batches);
                     info!("====Done running");
                 }
@@ -366,6 +468,8 @@ where
                         sql,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        false,
                     )
                     .await
                     .unwrap_err();
@@ -374,13 +478,49 @@ where
 
                     info!("====Done running");
                 }
+                Step::QueryWithAuthorization {
+                    sql,
+                    authorization,
+                    expected,
+                } => {
+                    info!("====Begin running SQL query (authenticated): {}", sql);
+                    // run query
+                    let (mut batches, schema) = run_sql(
+                        sql,
+                        state.cluster.namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                        Some(authorization.as_str()),
+                        false,
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
+                Step::QueryWithDebug { sql, expected } => {
+                    info!("====Begin running SQL query (w/ iox-debug): {}", sql);
+                    // run query
+                    let (mut batches, schema) = run_sql(
+                        sql,
+                        state.cluster.namespace(),
+                        state.cluster().querier().querier_grpc_connection(),
+                        None,
+                        true,
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
                 Step::VerifiedQuery { sql, verify } => {
                     info!("====Begin running SQL verified query: {}", sql);
                     // run query
-                    let batches = run_sql(
+                    let (batches, _schema) = run_sql(
                         sql,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
+                        true,
                     )
                     .await;
                     verify(batches);
@@ -389,12 +529,14 @@ where
                 Step::InfluxQLQuery { query, expected } => {
                     info!("====Begin running InfluxQL query: {}", query);
                     // run query
-                    let batches = run_influxql(
+                    let (mut batches, schema) = run_influxql(
                         query,
                         state.cluster.namespace(),
                         state.cluster.querier().querier_grpc_connection(),
+                        None,
                     )
                     .await;
+                    batches.push(RecordBatch::new_empty(schema));
                     assert_batches_sorted_eq!(expected, &batches);
                     info!("====Done running");
                 }
@@ -432,6 +574,7 @@ where
                         query,
                         state.cluster().namespace(),
                         state.cluster().querier().querier_grpc_connection(),
+                        None,
                     )
                     .await
                     .unwrap_err();
@@ -439,6 +582,45 @@ where
                     check_flight_error(err, *expected_error_code, Some(expected_message));
 
                     info!("====Done running");
+                }
+                Step::InfluxQLQueryWithAuthorization {
+                    query,
+                    authorization,
+                    expected,
+                } => {
+                    info!("====Begin running InfluxQL query: {}", query);
+                    // run query
+                    let (mut batches, schema) = run_influxql(
+                        query,
+                        state.cluster.namespace(),
+                        state.cluster.querier().querier_grpc_connection(),
+                        Some(authorization),
+                    )
+                    .await;
+                    batches.push(RecordBatch::new_empty(schema));
+                    assert_batches_sorted_eq!(expected, &batches);
+                    info!("====Done running");
+                }
+                Step::PartitionKeys {
+                    table_name,
+                    namespace_name,
+                    expected,
+                } => {
+                    info!("====Begin reading partition keys for table: {}", table_name);
+                    let partition_keys = state
+                        .cluster()
+                        .partition_keys(table_name, namespace_name.clone())
+                        .await;
+                    // order the partition keys so that we can compare them
+                    let mut partition_keys = partition_keys;
+                    partition_keys.sort();
+                    assert_eq!(partition_keys, *expected);
+                    info!("====Done reading partition keys");
+                }
+                Step::GracefulStopIngesters => {
+                    info!("====Gracefully stop all ingesters");
+
+                    state.cluster_mut().gracefully_stop_ingesters();
                 }
                 Step::VerifiedMetrics(verify) => {
                     info!("====Begin validating metrics");

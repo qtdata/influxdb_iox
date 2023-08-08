@@ -4,14 +4,14 @@ use criterion::{
     criterion_group, criterion_main, measurement::WallTime, BatchSize, BenchmarkGroup, Criterion,
     Throughput,
 };
-use data_types::{NamespaceId, NamespaceName};
+use data_types::NamespaceName;
 use hashbrown::HashMap;
-use iox_catalog::mem::MemCatalog;
+use iox_catalog::{interface::Catalog, mem::MemCatalog};
 use mutable_batch::MutableBatch;
 use once_cell::sync::Lazy;
 use router::{
     dml_handlers::{DmlHandler, SchemaValidator},
-    namespace_cache::{MemoryNamespaceCache, ShardedCache},
+    namespace_cache::{MemoryNamespaceCache, NamespaceCache, ReadThroughCache, ShardedCache},
 };
 use schema::Projection;
 use tokio::runtime::Runtime;
@@ -24,7 +24,7 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
-fn sharder_benchmarks(c: &mut Criterion) {
+fn schema_validator_benchmarks(c: &mut Criterion) {
     let mut group = c.benchmark_group("schema_validator");
 
     bench(&mut group, 1, 1);
@@ -41,15 +41,19 @@ fn sharder_benchmarks(c: &mut Criterion) {
 fn bench(group: &mut BenchmarkGroup<WallTime>, tables: usize, columns_per_table: usize) {
     let metrics = Arc::new(metric::Registry::default());
 
-    let catalog = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
-    let ns_cache = Arc::new(ShardedCache::new(
-        iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+    let catalog: Arc<dyn Catalog> = Arc::new(MemCatalog::new(Arc::clone(&metrics)));
+    let ns_cache = Arc::new(ReadThroughCache::new(
+        Arc::new(ShardedCache::new(
+            iter::repeat_with(|| Arc::new(MemoryNamespaceCache::default())).take(10),
+        )),
+        Arc::clone(&catalog),
     ));
-    let validator = SchemaValidator::new(catalog, ns_cache, &metrics);
+    let validator = SchemaValidator::new(catalog, Arc::clone(&ns_cache), &metrics);
 
     for i in 0..65_000 {
         let write = lp_to_writes(format!("{}{}", i + 10_000_000, generate_lp(1, 1)).as_str());
-        let _ = runtime().block_on(validator.write(&NAMESPACE, NamespaceId::new(42), write, None));
+        let namespace_schema = runtime().block_on(ns_cache.get_schema(&NAMESPACE)).unwrap();
+        let _ = runtime().block_on(validator.write(&NAMESPACE, namespace_schema, write, None));
     }
 
     let write = lp_to_writes(&generate_lp(tables, columns_per_table));
@@ -60,8 +64,13 @@ fn bench(group: &mut BenchmarkGroup<WallTime>, tables: usize, columns_per_table:
     group.throughput(Throughput::Elements(column_count as _));
     group.bench_function(format!("{tables}x{columns_per_table}"), |b| {
         b.to_async(runtime()).iter_batched(
-            || write.clone(),
-            |write| validator.write(&NAMESPACE, NamespaceId::new(42), write, None),
+            || {
+                (
+                    write.clone(),
+                    runtime().block_on(ns_cache.get_schema(&NAMESPACE)).unwrap(),
+                )
+            },
+            |(write, namespace_schema)| validator.write(&NAMESPACE, namespace_schema, write, None),
             BatchSize::SmallInput,
         );
     });
@@ -88,5 +97,5 @@ fn lp_to_writes(lp: &str) -> HashMap<String, MutableBatch> {
     writes
 }
 
-criterion_group!(benches, sharder_benchmarks);
+criterion_group!(benches, schema_validator_benchmarks);
 criterion_main!(benches);

@@ -1,11 +1,7 @@
 use datafusion::{
+    common::tree_node::{Transformed, TreeNode},
     error::Result,
-    logical_expr::{
-        binary_expr,
-        expr::Case,
-        expr_rewriter::{ExprRewritable, ExprRewriter},
-        BinaryExpr, Operator,
-    },
+    logical_expr::{binary_expr, expr::Case, BinaryExpr, Cast, Like, Operator},
     prelude::Expr,
 };
 
@@ -37,8 +33,22 @@ use datafusion::{
 ///  ELSE tag_col = 'cpu'
 /// END
 /// ```
-pub fn rewrite(expr: Expr) -> Result<Expr> {
-    expr.rewrite(&mut IOxExprRewriter::new())
+pub fn iox_expr_rewrite(expr: Expr) -> Result<Expr> {
+    expr.transform(&iox_expr_rewrite_inner)
+}
+
+fn iox_expr_rewrite_inner(expr: Expr) -> Result<Transformed<Expr>> {
+    Ok(match expr {
+        Expr::BinaryExpr(BinaryExpr { left, op, right }) if is_case(&left) && is_comparison(op) => {
+            Transformed::Yes(inline_case(true, *left, *right, op))
+        }
+        Expr::BinaryExpr(BinaryExpr { left, op, right })
+            if is_case(&right) && is_comparison(op) =>
+        {
+            Transformed::Yes(inline_case(false, *left, *right, op))
+        }
+        expr => Transformed::No(expr),
+    })
 }
 
 /// Special purpose `Expr` rewrite rules for an Expr that is used as a predicate.
@@ -58,15 +68,58 @@ pub fn rewrite(expr: Expr) -> Result<Expr> {
 /// Currently it is special cases, but it would be great to generalize
 /// it and contribute it back to DataFusion
 pub fn simplify_predicate(expr: Expr) -> Result<Expr> {
-    expr.rewrite(&mut IOxPredicateRewriter::new())
+    expr.transform(&simplify_predicate_inner)
 }
 
-/// see docs on [rewrite]
-struct IOxExprRewriter {}
+fn simplify_predicate_inner(expr: Expr) -> Result<Transformed<Expr>> {
+    // look for this structure:
+    //
+    //  NOT(col IS NULL) AND col = 'foo'
+    //
+    // and replace it with
+    //
+    // col = 'foo'
+    //
+    // Proof:
+    // Case 1: col is NULL
+    //
+    // not (NULL IS NULL) AND col = 'foo'
+    // not (true) AND NULL = 'foo'
+    // NULL
+    //
+    // Case 2: col is not NULL and not equal to 'foo'
+    // not (false) AND false
+    // true AND false
+    // false
+    //
+    // Case 3: col is not NULL and equal to 'foo'
+    // not (false) AND true
+    // true AND true
+    // true
+    match expr {
+        Expr::BinaryExpr(BinaryExpr {
+            left,
+            op: Operator::And,
+            right,
+        }) => {
+            if let (Some(coll), Some(colr)) = (is_col_not_null(&left), is_col_op_lit(&right)) {
+                if colr == coll {
+                    return Ok(Transformed::Yes(*right));
+                }
+            } else if let (Some(coll), Some(colr)) = (is_col_op_lit(&left), is_col_not_null(&right))
+            {
+                if colr == coll {
+                    return Ok(Transformed::Yes(*left));
+                }
+            };
 
-impl IOxExprRewriter {
-    fn new() -> Self {
-        Self {}
+            Ok(Transformed::No(Expr::BinaryExpr(BinaryExpr {
+                left,
+                op: Operator::And,
+                right,
+            })))
+        }
+        expr => Ok(Transformed::No(expr)),
     }
 }
 
@@ -106,24 +159,9 @@ fn is_comparison(op: Operator) -> bool {
         Operator::RegexNotMatch => true,
         Operator::RegexNotIMatch => true,
         Operator::StringConcat => false,
-    }
-}
-
-impl ExprRewriter for IOxExprRewriter {
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
-        match expr {
-            Expr::BinaryExpr(BinaryExpr { left, op, right })
-                if is_case(&left) && is_comparison(op) =>
-            {
-                Ok(inline_case(true, *left, *right, op))
-            }
-            Expr::BinaryExpr(BinaryExpr { left, op, right })
-                if is_case(&right) && is_comparison(op) =>
-            {
-                Ok(inline_case(false, *left, *right, op))
-            }
-            expr => Ok(expr),
-        }
+        // array containment operators
+        Operator::ArrowAt => true,
+        Operator::AtArrow => true,
     }
 }
 
@@ -177,21 +215,12 @@ fn inline_case(case_on_left: bool, left: Expr, right: Expr, op: Operator) -> Exp
     })
 }
 
-/// see docs on [simplify_predicate]
-struct IOxPredicateRewriter {}
-
-impl IOxPredicateRewriter {
-    fn new() -> Self {
-        Self {}
-    }
-}
-
 /// returns the column name for a column expression
 fn is_col(expr: &Expr) -> Option<&str> {
-    if let Expr::Column(c) = &expr {
-        Some(c.name.as_str())
-    } else {
-        None
+    match expr {
+        Expr::Column(c) => Some(c.name.as_str()),
+        Expr::Cast(Cast { expr, data_type: _ }) => is_col(expr),
+        _ => None,
     }
 }
 
@@ -222,71 +251,18 @@ fn is_col_op_lit(expr: &Expr) -> Option<&str> {
     match expr {
         Expr::BinaryExpr(BinaryExpr { left, op: _, right }) if is_lit(right) => is_col(left),
         Expr::BinaryExpr(BinaryExpr { left, op: _, right }) if is_lit(left) => is_col(right),
+        Expr::Like(Like { expr, pattern, .. }) if is_lit(pattern) => is_col(expr),
         _ => None,
-    }
-}
-
-impl ExprRewriter for IOxPredicateRewriter {
-    fn mutate(&mut self, expr: Expr) -> Result<Expr> {
-        // look for this structure:
-        //
-        //  NOT(col IS NULL) AND col = 'foo'
-        //
-        // and replace it with
-        //
-        // col = 'foo'
-        //
-        // Proof:
-        // Case 1: col is NULL
-        //
-        // not (NULL IS NULL) AND col = 'foo'
-        // not (true) AND NULL = 'foo'
-        // NULL
-        //
-        // Case 2: col is not NULL and not equal to 'foo'
-        // not (false) AND false
-        // true AND false
-        // false
-        //
-        // Case 3: col is not NULL and equal to 'foo'
-        // not (false) AND true
-        // true AND true
-        // true
-        match expr {
-            Expr::BinaryExpr(BinaryExpr {
-                left,
-                op: Operator::And,
-                right,
-            }) => {
-                if let (Some(coll), Some(colr)) = (is_col_not_null(&left), is_col_op_lit(&right)) {
-                    if colr == coll {
-                        return Ok(*right);
-                    }
-                } else if let (Some(coll), Some(colr)) =
-                    (is_col_op_lit(&left), is_col_not_null(&right))
-                {
-                    if colr == coll {
-                        return Ok(*left);
-                    }
-                };
-
-                Ok(Expr::BinaryExpr(BinaryExpr {
-                    left,
-                    op: Operator::And,
-                    right,
-                }))
-            }
-            expr => Ok(expr),
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::ops::Add;
+    use std::ops::{Add, Not};
 
     use super::*;
-    use datafusion::prelude::{case, col, lit, when};
+    use arrow::datatypes::DataType;
+    use datafusion::prelude::{case, cast, col, lit, when};
 
     #[test]
     fn test_fold_case_expr() {
@@ -299,7 +275,7 @@ mod tests {
             .eq(lit("case2"));
 
         let expected = expr.clone();
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -314,7 +290,7 @@ mod tests {
             col("tag").eq(lit("bar")),
         );
 
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -331,7 +307,7 @@ mod tests {
             lit("bar").eq(col("tag")),
         );
 
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -358,7 +334,7 @@ mod tests {
             )),
         );
 
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -404,7 +380,7 @@ mod tests {
             expr.clone()
         };
 
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -434,7 +410,7 @@ mod tests {
             .otherwise(lit("WTF?").eq(lit("is null")))
             .unwrap();
 
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     #[test]
@@ -450,7 +426,7 @@ mod tests {
             .add(lit(1));
 
         let expected = expr.clone();
-        assert_eq!(expected, rewrite(expr).unwrap());
+        assert_eq!(expected, iox_expr_rewrite(expr).unwrap());
     }
 
     fn make_case(when_expr: Expr, then_expr: Expr, otherwise_expr: Expr) -> Expr {
@@ -501,6 +477,55 @@ mod tests {
         // can't rewrite to some thing else fancy on the right
         let expr = col("foo").is_null().not().and(col("foo").eq(col("foo")));
         let expected = expr.clone();
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_left() {
+        let expr = cast(col("foo"), DataType::Utf8)
+            .is_null()
+            .not()
+            .and(col("foo").eq(lit("bar")));
+        let expected = col("foo").eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_right() {
+        let expr = col("foo")
+            .is_null()
+            .not()
+            .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
+        let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    #[test]
+    fn test_simplify_predicate_cast_both() {
+        let expr = cast(col("foo"), DataType::Utf8)
+            .is_null()
+            .not()
+            .and(cast(col("foo"), DataType::Utf8).eq(lit("bar")));
+        let expected = cast(col("foo"), DataType::Utf8).eq(lit("bar"));
+        assert_eq!(expected, simplify_predicate(expr).unwrap());
+    }
+
+    fn like(expr: Expr, pattern: Expr) -> Expr {
+        let expr = Box::new(expr);
+        let pattern = Box::new(pattern);
+        Expr::Like(Like {
+            negated: false,
+            expr,
+            pattern,
+            escape_char: None,
+            case_insensitive: false,
+        })
+    }
+
+    #[test]
+    fn test_simplify_predicate_like() {
+        let expr = col("foo").is_null().not().and(like(col("foo"), lit("bar")));
+        let expected = like(col("foo"), lit("bar"));
         assert_eq!(expected, simplify_predicate(expr).unwrap());
     }
 }

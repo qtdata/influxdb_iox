@@ -37,7 +37,6 @@
 //! This operation can be used to implement the table_name metadata query
 
 use std::{
-    any::Any,
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -51,12 +50,12 @@ use datafusion::{
     common::{DFSchemaRef, ToDFSchema},
     error::{DataFusionError, Result},
     execution::context::TaskContext,
-    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayFormatType, Distribution, ExecutionPlan, Partitioning, SendableRecordBatchStream,
-        Statistics,
+        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, Partitioning,
+        SendableRecordBatchStream, Statistics,
     },
 };
 
@@ -66,6 +65,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 /// Implements the NonNullChecker operation as described in this module's documentation
+#[derive(Hash, PartialEq, Eq)]
 pub struct NonNullCheckerNode {
     input: LogicalPlan,
     schema: DFSchemaRef,
@@ -112,9 +112,9 @@ impl Debug for NonNullCheckerNode {
     }
 }
 
-impl UserDefinedLogicalNode for NonNullCheckerNode {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl UserDefinedLogicalNodeCore for NonNullCheckerNode {
+    fn name(&self) -> &str {
+        "NonNullChecker"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -132,21 +132,17 @@ impl UserDefinedLogicalNode for NonNullCheckerNode {
 
     /// For example: `NonNullChecker('the_value')`
     fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "NonNullChecker('{}')", self.value)
+        write!(f, "{}('{}')", self.name(), self.value)
     }
 
-    fn from_template(
-        &self,
-        exprs: &[Expr],
-        inputs: &[LogicalPlan],
-    ) -> Arc<dyn UserDefinedLogicalNode> {
+    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
         assert_eq!(inputs.len(), 1, "NonNullChecker: input sizes inconistent");
         assert_eq!(
             exprs.len(),
             self.exprs.len(),
             "NonNullChecker: expression sizes inconistent"
         );
-        Arc::new(Self::new(self.value.as_ref(), inputs[0].clone()))
+        Self::new(self.value.as_ref(), inputs[0].clone())
     }
 }
 
@@ -276,14 +272,6 @@ impl ExecutionPlan for NonNullCheckerExec {
         Ok(AdapterStream::adapt(self.schema(), rx, handle))
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(f, "NonNullCheckerExec")
-            }
-        }
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -291,6 +279,16 @@ impl ExecutionPlan for NonNullCheckerExec {
     fn statistics(&self) -> Statistics {
         // don't know anything about the statistics
         Statistics::default()
+    }
+}
+
+impl DisplayAs for NonNullCheckerExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "NonNullCheckerExec")
+            }
+        }
     }
 }
 

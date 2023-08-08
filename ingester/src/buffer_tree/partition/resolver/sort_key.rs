@@ -3,21 +3,21 @@
 use std::sync::Arc;
 
 use backoff::{Backoff, BackoffConfig};
-use data_types::PartitionId;
-use iox_catalog::interface::Catalog;
+use data_types::TransitionPartitionId;
+use iox_catalog::{interface::Catalog, partition_lookup};
 use schema::sort::SortKey;
 
-/// A resolver of [`SortKey`] from the catalog for a given [`PartitionId`].
+/// A resolver of [`SortKey`] from the catalog for a given [`TransitionPartitionId`].
 #[derive(Debug)]
 pub(crate) struct SortKeyResolver {
-    partition_id: PartitionId,
+    partition_id: TransitionPartitionId,
     backoff_config: BackoffConfig,
     catalog: Arc<dyn Catalog>,
 }
 
 impl SortKeyResolver {
     pub(crate) fn new(
-        partition_id: PartitionId,
+        partition_id: TransitionPartitionId,
         catalog: Arc<dyn Catalog>,
         backoff_config: BackoffConfig,
     ) -> Self {
@@ -33,14 +33,15 @@ impl SortKeyResolver {
     pub(crate) async fn fetch(self) -> Option<SortKey> {
         Backoff::new(&self.backoff_config)
             .retry_all_errors("fetch partition sort key", || async {
-                let s = self
-                    .catalog
-                    .repositories()
-                    .await
-                    .partitions()
-                    .get_by_id(self.partition_id)
+                let mut repos = self.catalog.repositories().await;
+                let s = partition_lookup(repos.as_mut(), &self.partition_id)
                     .await?
-                    .expect("resolving sort key for non-existent partition")
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "resolving sort key for non-existent partition ID {}",
+                            self.partition_id
+                        )
+                    })
                     .sort_key();
 
                 Result::<_, iox_catalog::interface::Error>::Ok(s)
@@ -54,12 +55,9 @@ impl SortKeyResolver {
 mod tests {
     use std::sync::Arc;
 
-    use data_types::ShardIndex;
-
     use super::*;
     use crate::test_util::populate_catalog;
 
-    const SHARD_INDEX: ShardIndex = ShardIndex::new(24);
     const TABLE_NAME: &str = "bananas";
     const NAMESPACE_NAME: &str = "platanos";
     const PARTITION_KEY: &str = "platanos";
@@ -71,28 +69,33 @@ mod tests {
         let catalog: Arc<dyn Catalog> =
             Arc::new(iox_catalog::mem::MemCatalog::new(Arc::clone(&metrics)));
 
-        // Populate the catalog with the shard / namespace / table
-        let (shard_id, _ns_id, table_id) =
-            populate_catalog(&*catalog, SHARD_INDEX, NAMESPACE_NAME, TABLE_NAME).await;
+        // Populate the catalog with the namespace / table
+        let (_ns_id, table_id) = populate_catalog(&*catalog, NAMESPACE_NAME, TABLE_NAME).await;
 
-        let partition_id = catalog
+        let partition = catalog
             .repositories()
             .await
             .partitions()
-            .create_or_get(PARTITION_KEY.into(), shard_id, table_id)
+            .create_or_get(PARTITION_KEY.into(), table_id)
             .await
-            .expect("should create")
-            .id;
+            .expect("should create");
 
-        let fetcher =
-            SortKeyResolver::new(partition_id, Arc::clone(&catalog), backoff_config.clone());
+        let fetcher = SortKeyResolver::new(
+            partition.transition_partition_id(),
+            Arc::clone(&catalog),
+            backoff_config.clone(),
+        );
 
         // Set the sort key
         let catalog_state = catalog
             .repositories()
             .await
             .partitions()
-            .cas_sort_key(partition_id, None, &["uno", "dos", "bananas"])
+            .cas_sort_key(
+                &partition.transition_partition_id(),
+                None,
+                &["uno", "dos", "bananas"],
+            )
             .await
             .expect("should update existing partition key");
 

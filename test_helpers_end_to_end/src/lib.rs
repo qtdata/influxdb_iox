@@ -1,9 +1,15 @@
+#![warn(unused_crate_dependencies)]
+
+// Workaround for "unused crate" lint false positives.
+use workspace_hack as _;
+
 use rand::{
     distributions::{Alphanumeric, Standard},
     thread_rng, Rng,
 };
 
 mod addrs;
+mod authz;
 mod client;
 mod config;
 mod data_generator;
@@ -13,11 +19,12 @@ mod grpc;
 mod mini_cluster;
 mod server_fixture;
 mod server_type;
-mod snapshot_comparison;
+pub mod snapshot_comparison;
 mod steps;
 mod udp_listener;
 
 pub use addrs::BindAddresses;
+pub use authz::Authorizer;
 pub use client::*;
 pub use config::TestConfig;
 pub use data_generator::DataGenerator;

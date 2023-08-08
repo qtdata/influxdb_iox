@@ -5,13 +5,12 @@ use arrow_flight::{
 use async_trait::async_trait;
 use client_util::connection::{self, Connection};
 use futures::StreamExt;
-use generated_types::ingester::IngesterQueryRequest;
-use influxdb_iox_client::flight::generated_types as proto;
+use ingester_query_grpc::{influxdata::iox::ingester::v1 as proto, IngesterQueryRequest};
 use observability_deps::tracing::{debug, warn};
 use prost::Message;
 use snafu::{ResultExt, Snafu};
 use std::{collections::HashMap, fmt::Debug, ops::DerefMut, sync::Arc};
-use trace::ctx::SpanContext;
+use trace::{ctx::SpanContext, span::SpanRecorder};
 use trace_http::ctx::format_jaeger_trace_context;
 
 pub use influxdb_iox_client::flight::Error as FlightError;
@@ -33,7 +32,7 @@ pub enum Error {
 
     #[snafu(display("Internal error creating flight request : {}", source))]
     CreatingRequest {
-        source: influxdb_iox_client::google::FieldViolation,
+        source: ingester_query_grpc::FieldViolation,
     },
 
     #[snafu(display("Failed to perform flight request: {}", source))]
@@ -97,12 +96,18 @@ pub struct FlightClientImpl {
     /// for a very short period of time, and any actual connection (and
     /// waiting) is done in CachedConnection
     connections: parking_lot::Mutex<HashMap<String, CachedConnection>>,
+
+    /// Name of the http header that will contain the tracing context value.
+    trace_context_header_name: String,
 }
 
 impl FlightClientImpl {
     /// Create new client.
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(trace_context_header_name: &str) -> Self {
+        Self {
+            trace_context_header_name: trace_context_header_name.to_string(),
+            ..Default::default()
+        }
     }
 
     /// Establish connection to given addr and perform handshake.
@@ -138,39 +143,59 @@ impl IngesterFlightClient for FlightClientImpl {
         request: IngesterQueryRequest,
         span_context: Option<SpanContext>,
     ) -> Result<Box<dyn QueryData>, Error> {
-        let connection = self.connect(Arc::clone(&ingester_addr)).await?;
+        let span = span_context.map(|s| s.child("ingester flight client impl"));
+        let span_recorder = SpanRecorder::new(span.clone());
+
+        let connection = {
+            let _span_recorder = span_recorder.child("connect");
+
+            self.connect(Arc::clone(&ingester_addr)).await?
+        };
+
+        debug!(%ingester_addr, ?request, "Sending request to ingester");
+        let ticket = {
+            let _span_recorder = span_recorder.child("serialize request");
+
+            let request = serialize_ingester_query_request(request)?.encode_to_vec();
+
+            Ticket {
+                ticket: request.into(),
+            }
+        };
 
         let mut client = influxdb_iox_client::flight::Client::new(connection)
             // use lower level client to send a custom message type
             .into_inner();
 
         // Add the span context header, if any
-        if let Some(ctx) = span_context {
+        let span_recorder_comm = span_recorder.child("comm");
+        if let Some(span) = span_recorder_comm.span() {
             client
                 .add_header(
-                    trace_exporters::DEFAULT_JAEGER_TRACE_CONTEXT_HEADER_NAME,
-                    &format_jaeger_trace_context(&ctx),
+                    &self.trace_context_header_name,
+                    &format_jaeger_trace_context(&span.ctx),
                 )
                 // wrap in client error type
                 .map_err(FlightError::ArrowFlightError)
                 .context(FlightSnafu)?;
         }
 
-        debug!(%ingester_addr, ?request, "Sending request to ingester");
-        let request = serialize_ingester_query_request(request)?.encode_to_vec();
+        let data_stream = {
+            let _span_recorder = span_recorder_comm.child("initial request");
 
-        let ticket = Ticket {
-            ticket: request.into(),
+            client
+                .do_get(ticket)
+                .await
+                // wrap in client error type
+                .map_err(FlightError::ArrowFlightError)
+                .context(FlightSnafu)?
+                .into_inner()
         };
 
-        let data_stream = client
-            .do_get(ticket)
-            .await
-            // wrap in client error type
-            .map_err(FlightError::ArrowFlightError)
-            .context(FlightSnafu)?
-            .into_inner();
-        Ok(Box::new(data_stream))
+        Ok(Box::new(QueryDataTracer {
+            inner: data_stream,
+            recorder: span_recorder_comm.child("stream"),
+        }))
     }
 }
 
@@ -267,6 +292,68 @@ impl QueryData for FlightDataDecoder {
                 Ok((payload, app_metadata)) as Result<_, FlightError>
             })
             .transpose()?)
+    }
+}
+
+/// Wraps [`QueryData`] so that all calls to [`QueryData::next_message`] have proper tracing spans.
+#[derive(Debug)]
+struct QueryDataTracer<T>
+where
+    T: QueryData,
+{
+    inner: T,
+    recorder: SpanRecorder,
+}
+
+#[async_trait]
+impl<T> QueryData for QueryDataTracer<T>
+where
+    T: QueryData,
+{
+    async fn next_message(
+        &mut self,
+    ) -> Result<Option<(DecodedPayload, proto::IngesterQueryResponseMetadata)>, FlightError> {
+        let mut span_recorder = self.recorder.child("next message");
+        let res = self.inner.next_message().await;
+
+        match &res {
+            Ok(res) => {
+                span_recorder.ok("ok");
+                self.record_metadata(&mut span_recorder, res.as_ref())
+            }
+            Err(e) => span_recorder.error(e.to_string()),
+        }
+
+        res
+    }
+}
+
+impl<T> QueryDataTracer<T>
+where
+    T: QueryData,
+{
+    /// Record additional metadata on the
+    fn record_metadata(
+        &self,
+        span_recorder: &mut SpanRecorder,
+        res: Option<&(DecodedPayload, proto::IngesterQueryResponseMetadata)>,
+    ) {
+        let Some((payload, _metadata)) = res else {
+            return;
+        };
+        match payload {
+            DecodedPayload::None => {
+                span_recorder.set_metadata("payload_type", "none");
+            }
+            DecodedPayload::Schema(_) => {
+                span_recorder.set_metadata("payload_type", "schema");
+            }
+            DecodedPayload::RecordBatch(batch) => {
+                span_recorder.set_metadata("payload_type", "batch");
+                span_recorder.set_metadata("num_rows", batch.num_rows() as i64);
+                span_recorder.set_metadata("mem_bytes", batch.get_array_memory_size() as i64);
+            }
+        }
     }
 }
 

@@ -1,21 +1,25 @@
-use crate::common::{TestContext, TEST_QUERY_POOL_ID, TEST_RETENTION_PERIOD_NS, TEST_TOPIC_ID};
+use crate::common::{TestContextBuilder, TEST_RETENTION_PERIOD};
 use assert_matches::assert_matches;
-use data_types::{ColumnType, QueryPoolId, TopicId};
+use data_types::ColumnType;
 use futures::{stream::FuturesUnordered, StreamExt};
 use generated_types::influxdata::{iox::ingester::v1::WriteRequest, pbdata::v1::DatabaseBatch};
 use hashbrown::HashMap;
 use hyper::{Body, Request, StatusCode};
-use iox_catalog::interface::SoftDeletedRows;
+use iox_catalog::{interface::SoftDeletedRows, test_helpers::arbitrary_namespace};
 use iox_time::{SystemProvider, TimeProvider};
 use metric::{Attributes, DurationHistogram, Metric, U64Counter};
-use router::dml_handlers::{DmlError, RetentionError, RpcWriteError, SchemaError};
+use router::dml_handlers::{DmlError, RetentionError, SchemaError};
 use std::sync::Arc;
 
 pub mod common;
 
 #[tokio::test]
 async fn test_write_ok() {
-    let ctx = TestContext::new(true, None).await;
+    // Create a test context with implicit namespace creation.
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(None)
+        .build()
+        .await;
 
     // Write data inside retention period
     let now = SystemProvider::default()
@@ -58,8 +62,6 @@ async fn test_write_ok() {
         .expect("query should succeed")
         .expect("namespace not found");
     assert_eq!(ns.name, "bananas_test");
-    assert_eq!(ns.topic_id, TopicId::new(TEST_TOPIC_ID));
-    assert_eq!(ns.query_pool_id, QueryPoolId::new(TEST_QUERY_POOL_ID));
     assert_eq!(ns.retention_period_ns, None);
 
     // Ensure the metric instrumentation was hit
@@ -89,7 +91,10 @@ async fn test_write_ok() {
 
 #[tokio::test]
 async fn test_write_outside_retention_period() {
-    let ctx = TestContext::new(true, TEST_RETENTION_PERIOD_NS).await;
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(Some(TEST_RETENTION_PERIOD))
+        .build()
+        .await;
 
     // Write data outside retention period into a new table
     let two_hours_ago =
@@ -105,9 +110,10 @@ async fn test_write_outside_retention_period() {
         &response,
         router::server::http::Error::DmlHandler(
             DmlError::Retention(
-                RetentionError::OutsideRetention(e))
+                RetentionError::OutsideRetention{table_name, min_acceptable_ts, observed_ts})
         ) => {
-            assert_eq!(e, "apple");
+            assert_eq!(table_name, "apple");
+            assert!(observed_ts < min_acceptable_ts);
         }
     );
     assert_eq!(response.as_status_code(), StatusCode::FORBIDDEN);
@@ -115,7 +121,10 @@ async fn test_write_outside_retention_period() {
 
 #[tokio::test]
 async fn test_schema_conflict() {
-    let ctx = TestContext::new(true, None).await;
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(None)
+        .build()
+        .await;
 
     // data inside the retention period
     let now = SystemProvider::default()
@@ -167,7 +176,7 @@ async fn test_schema_conflict() {
 
 #[tokio::test]
 async fn test_rejected_ns() {
-    let ctx = TestContext::new(false, None).await;
+    let ctx = TestContextBuilder::default().build().await;
 
     let now = SystemProvider::default()
         .now()
@@ -194,7 +203,10 @@ async fn test_rejected_ns() {
 
 #[tokio::test]
 async fn test_schema_limit() {
-    let ctx = TestContext::new(true, None).await;
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(None)
+        .build()
+        .await;
 
     let now = SystemProvider::default()
         .now()
@@ -248,22 +260,13 @@ async fn test_schema_limit() {
 
 #[tokio::test]
 async fn test_write_propagate_ids() {
-    let ctx = TestContext::new(true, None).await;
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(None)
+        .build()
+        .await;
 
     // Create the namespace and a set of tables.
-    let ns = ctx
-        .catalog()
-        .repositories()
-        .await
-        .namespaces()
-        .create(
-            "bananas_test",
-            None,
-            TopicId::new(TEST_TOPIC_ID),
-            QueryPoolId::new(TEST_QUERY_POOL_ID),
-        )
-        .await
-        .expect("failed to update table limit");
+    let ns = arbitrary_namespace(&mut *ctx.catalog().repositories().await, "bananas_test").await;
 
     let catalog = ctx.catalog();
     let ids = ["another", "test", "table", "platanos"]
@@ -275,7 +278,7 @@ async fn test_write_propagate_ids() {
                     .repositories()
                     .await
                     .tables()
-                    .create_or_get(t, ns.id)
+                    .create(t, Default::default(), ns.id)
                     .await
                     .unwrap();
                 (*t, table.id)
@@ -333,7 +336,10 @@ async fn test_write_propagate_ids() {
 
 #[tokio::test]
 async fn test_delete_unsupported() {
-    let ctx = TestContext::new(true, None).await;
+    let ctx = TestContextBuilder::default()
+        .with_autocreate_namespace(None)
+        .build()
+        .await;
 
     // Create the namespace and a set of tables.
     ctx.catalog()
@@ -341,10 +347,10 @@ async fn test_delete_unsupported() {
         .await
         .namespaces()
         .create(
-            "bananas_test",
+            &data_types::NamespaceName::new("bananas_test").unwrap(),
             None,
-            TopicId::new(TEST_TOPIC_ID),
-            QueryPoolId::new(TEST_QUERY_POOL_ID),
+            None,
+            None,
         )
         .await
         .expect("failed to update table limit");
@@ -365,14 +371,10 @@ async fn test_delete_unsupported() {
 
     assert_matches!(
         &err,
-        e @ router::server::http::Error::DmlHandler(
-            DmlError::RpcWrite(
-                RpcWriteError::DeletesUnsupported
-            )
-        ) => {
+        e @ router::server::http::Error::DeletesUnsupported => {
             assert_eq!(
                 e.to_string(),
-                "dml handler error: deletes are not supported"
+                "deletes are not supported"
             );
         }
     );

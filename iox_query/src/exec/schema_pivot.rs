@@ -20,7 +20,6 @@
 //! This operation can be used to implement the tag_keys metadata query
 
 use std::{
-    any::Any,
     fmt::{self, Debug},
     sync::Arc,
 };
@@ -31,12 +30,11 @@ use arrow::{
     error::ArrowError,
     record_batch::RecordBatch,
 };
-use datafusion::error::DataFusionError;
 use datafusion::{
     common::{DFSchemaRef, ToDFSchema},
     error::{DataFusionError as Error, Result},
     execution::context::TaskContext,
-    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNode},
+    logical_expr::{Expr, LogicalPlan, UserDefinedLogicalNodeCore},
     physical_plan::{
         expressions::PhysicalSortExpr,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet, RecordOutput},
@@ -44,6 +42,7 @@ use datafusion::{
         Statistics,
     },
 };
+use datafusion::{error::DataFusionError, physical_plan::DisplayAs};
 
 use datafusion_util::{watch::WatchedTask, AdapterStream};
 use observability_deps::tracing::debug;
@@ -51,6 +50,7 @@ use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 /// Implements the SchemaPivot operation described in `make_schema_pivot`
+#[derive(Hash, PartialEq, Eq)]
 pub struct SchemaPivotNode {
     input: LogicalPlan,
     schema: DFSchemaRef,
@@ -88,9 +88,9 @@ impl Debug for SchemaPivotNode {
     }
 }
 
-impl UserDefinedLogicalNode for SchemaPivotNode {
-    fn as_any(&self) -> &dyn Any {
-        self
+impl UserDefinedLogicalNodeCore for SchemaPivotNode {
+    fn name(&self) -> &str {
+        "SchemaPivot"
     }
 
     fn inputs(&self) -> Vec<&LogicalPlan> {
@@ -108,21 +108,17 @@ impl UserDefinedLogicalNode for SchemaPivotNode {
 
     /// For example: `SchemaPivot`
     fn fmt_for_explain(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SchemaPivot")
+        write!(f, "{}", self.name())
     }
 
-    fn from_template(
-        &self,
-        exprs: &[Expr],
-        inputs: &[LogicalPlan],
-    ) -> Arc<dyn UserDefinedLogicalNode> {
+    fn from_template(&self, exprs: &[Expr], inputs: &[LogicalPlan]) -> Self {
         assert_eq!(inputs.len(), 1, "SchemaPivot: input sizes inconistent");
         assert_eq!(
             exprs.len(),
             self.exprs.len(),
             "SchemaPivot: expression sizes inconistent"
         );
-        Arc::new(Self::new(inputs[0].clone()))
+        Self::new(inputs[0].clone())
     }
 }
 
@@ -251,14 +247,6 @@ impl ExecutionPlan for SchemaPivotExec {
         Ok(AdapterStream::adapt(self.schema(), rx, handle))
     }
 
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match t {
-            DisplayFormatType::Default => {
-                write!(f, "SchemaPivotExec")
-            }
-        }
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         Some(self.metrics.clone_inner())
     }
@@ -266,6 +254,16 @@ impl ExecutionPlan for SchemaPivotExec {
     fn statistics(&self) -> Statistics {
         // don't know anything about the statistics
         Statistics::default()
+    }
+}
+
+impl DisplayAs for SchemaPivotExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "SchemaPivotExec")
+            }
+        }
     }
 }
 

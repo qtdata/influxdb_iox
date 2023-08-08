@@ -2,55 +2,58 @@
 # In alphabetical order
 members = [
     "arrow_util",
+    "authz",
     "backoff",
     "cache_system",
     "clap_blocks",
     "client_util",
+    "compactor_test_utils",
     "compactor",
-    "compactor2",
-    "compactor2_test_utils",
+    "compactor_scheduler",
     "data_types",
     "datafusion_util",
     "dml",
     "executor",
     "flightsql",
-    "generated_types",
     "garbage_collector",
+    "generated_types",
+    "gossip",
     "grpc-binary-logger-proto",
     "grpc-binary-logger-test-proto",
     "grpc-binary-logger",
-    "import",
+    "import_export",
     "influxdb_influxql_parser",
-    "influxdb_iox",
     "influxdb_iox_client",
+    "influxdb_iox",
     "influxdb_line_protocol",
     "influxdb_storage_client",
     "influxdb_tsm",
     "influxdb2_client",
     "influxrpc_parser",
+    "ingester_query_grpc",
+    "ingester_test_ctx",
     "ingester",
-    "ingester2",
     "iox_catalog",
     "iox_data_generator",
+    "iox_query_influxql",
+    "iox_query_influxrpc",
     "iox_query",
     "iox_tests",
     "iox_time",
     "ioxd_common",
     "ioxd_compactor",
-    "ioxd_compactor2",
-    "ioxd_ingester",
-    "ioxd_ingester2",
     "ioxd_garbage_collector",
+    "ioxd_ingester",
     "ioxd_querier",
     "ioxd_router",
     "ioxd_test",
     "logfmt",
-    "metric",
     "metric_exporters",
-    "mutable_batch",
+    "metric",
     "mutable_batch_lp",
     "mutable_batch_pb",
     "mutable_batch_tests",
+    "mutable_batch",
     "object_store_metrics",
     "observability_deps",
     "panic_logging",
@@ -62,26 +65,27 @@ members = [
     "router",
     "schema",
     "service_common",
-    "service_grpc_influxrpc",
+    "service_grpc_catalog",
     "service_grpc_flight",
+    "service_grpc_influxrpc",
     "service_grpc_namespace",
     "service_grpc_object_store",
-    "service_grpc_catalog",
     "service_grpc_schema",
+    "service_grpc_table",
     "service_grpc_testing",
     "sharder",
     "sqlx-hotswap-pool",
-    "test_helpers",
     "test_helpers_end_to_end",
-    "trace",
+    "test_helpers",
+    "tokio_metrics_bridge",
     "trace_exporters",
     "trace_http",
+    "trace",
     "tracker",
     "trogging",
+    "wal_inspect",
     "wal",
     "workspace-hack",
-    "write_buffer",
-    "write_summary",
 ]
 default-members = ["influxdb_iox"]
 
@@ -115,12 +119,18 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-arrow = { version = "33.0.0" }
-arrow-flight = { version = "33.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev="f6e49ac7a027abb95d8b7fa755502dfa7d53c21c", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev="f6e49ac7a027abb95d8b7fa755502dfa7d53c21c" }
-hashbrown = { version = "0.13.2" }
-parquet = { version = "33.0.0" }
+arrow = { version = "43.0.0" }
+arrow-flight = { version = "43.0.0" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "5faa10b2911ecca4c2199f78ae675363c7d8230e", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "5faa10b2911ecca4c2199f78ae675363c7d8230e" }
+
+hashbrown = { version = "0.14.0" }
+object_store = { version = "0.6.0" }
+parquet = { version = "43.0.0" }
+tonic = { version = "0.9.2", features = ["tls", "tls-webpki-roots"] }
+tonic-build = { version = "0.9.2" }
+tonic-health = { version = "0.9.2" }
+tonic-reflection = { version = "0.9.2" }
 
 # This profile optimizes for runtime performance and small binary size at the expense of longer
 # build times. It's most suitable for final release builds.

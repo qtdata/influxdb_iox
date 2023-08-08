@@ -7,8 +7,7 @@ use panic_logging::SendPanicsToTracing;
 use snafu::{ResultExt, Snafu};
 use tokio_util::sync::CancellationToken;
 
-#[cfg(all(not(feature = "heappy"), feature = "jemalloc_replacing_malloc"))]
-mod jemalloc;
+use crate::process_info;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -73,11 +72,12 @@ pub async fn main(
     services: Vec<Service>,
     metrics: Arc<metric::Registry>,
 ) -> Result<()> {
-    let git_hash = env!("GIT_HASH", "starting influxdb_iox server");
     let num_cpus = num_cpus::get();
     let build_malloc_conf = build_malloc_conf();
     info!(
-        git_hash,
+        git_hash = %process_info::IOX_GIT_HASH as &str,
+        version = %process_info::IOX_VERSION.as_ref() as &str,
+        uuid = %process_info::PROCESS_UUID.as_ref() as &str,
         num_cpus,
         %build_malloc_conf,
         "InfluxDB IOx server starting",
@@ -104,17 +104,8 @@ pub async fn main(
     // lifetime of the program - this is actually a good thing, as it prevents
     // the panic handler from being removed while unwinding a panic (which in
     // turn, causes a panic - see #548)
-    let f = SendPanicsToTracing::new().with_metrics(&metrics);
+    let f = SendPanicsToTracing::new_with_metrics(&metrics);
     std::mem::forget(f);
-
-    // Register jemalloc metrics
-    #[cfg(all(not(feature = "heappy"), feature = "jemalloc_replacing_malloc"))]
-    for service in &services {
-        service
-            .server_type
-            .metric_registry()
-            .register_instrument("jemalloc_metrics", jemalloc::JemallocMetrics::new);
-    }
 
     // Construct a token to trigger clean shutdown
     let frontend_shutdown = CancellationToken::new();

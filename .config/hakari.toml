@@ -28,16 +28,15 @@ platforms = [
 # workspace-hack crate.
 #
 # Lists most bench- or test-only crates. Also lists optional object_store dependencies as those are
-# usually off in development.
+# usually off in development, and influxdb_line_protocol which is published to crates.io separately.
 [traversal-excludes]
 workspace-members = [
     "influxdb_iox_client",
+    # influxdb_line_protocol is published as a standalone crate, so don't
+    # depend on workspace
+    "influxdb-line-protocol",
     "influxdb2_client",
     "iox_data_generator",
-    # The garbage collector uses chrono-english which needlessly
-    # brings in chrono with the default features. This exclusion can
-    # likely be removed if they publish a version without that.
-    "garbage_collector",
     "mutable_batch_tests",
 ]
 third-party = [

@@ -36,6 +36,8 @@ fn namespace_to_proto(namespace: Namespace) -> proto::Namespace {
         id: namespace.id.get(),
         name: namespace.name,
         retention_period_ns: namespace.retention_period_ns,
+        max_tables: namespace.max_tables,
+        max_columns_per_table: namespace.max_columns_per_table,
     }
 }
 
@@ -82,15 +84,32 @@ impl proto::namespace_service_server::NamespaceService for NamespaceServiceImpl 
             "use router instances to manage namespaces",
         ))
     }
+
+    async fn update_namespace_service_protection_limit(
+        &self,
+        _request: tonic::Request<proto::UpdateNamespaceServiceProtectionLimitRequest>,
+    ) -> Result<tonic::Response<proto::UpdateNamespaceServiceProtectionLimitResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented(
+            "use router instances to manage namespaces",
+        ))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
     use generated_types::influxdata::iox::namespace::v1::namespace_service_server::NamespaceService;
     use iox_tests::TestCatalog;
     use querier::{create_ingester_connection_for_testing, QuerierCatalogCache};
     use tokio::runtime::Handle;
+
+    use iox_catalog::{
+        DEFAULT_MAX_COLUMNS_PER_TABLE as TEST_MAX_COLUMNS_PER_TABLE,
+        DEFAULT_MAX_TABLES as TEST_MAX_TABLES,
+    };
 
     /// Common retention period value we'll use in tests
     const TEST_RETENTION_PERIOD_NS: Option<i64> = Some(3_600 * 1_000_000_000);
@@ -98,9 +117,6 @@ mod tests {
     #[tokio::test]
     async fn test_get_namespaces_empty() {
         let catalog = TestCatalog::new();
-
-        // QuerierDatabase::new returns an error if there are no shards in the catalog
-        catalog.create_shard(0).await;
 
         let catalog_cache = Arc::new(QuerierCatalogCache::new_testing(
             catalog.catalog(),
@@ -116,7 +132,7 @@ mod tests {
                 catalog.exec(),
                 Some(create_ingester_connection_for_testing()),
                 QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-                true,
+                Arc::new(HashMap::default()),
             )
             .await
             .unwrap(),
@@ -135,9 +151,6 @@ mod tests {
     async fn test_get_namespaces() {
         let catalog = TestCatalog::new();
 
-        // QuerierDatabase::new returns an error if there are no shards in the catalog
-        catalog.create_shard(0).await;
-
         let catalog_cache = Arc::new(QuerierCatalogCache::new_testing(
             catalog.catalog(),
             catalog.time_provider(),
@@ -152,7 +165,7 @@ mod tests {
                 catalog.exec(),
                 Some(create_ingester_connection_for_testing()),
                 QuerierDatabase::MAX_CONCURRENT_QUERIES_MAX,
-                true,
+                Arc::new(HashMap::default()),
             )
             .await
             .unwrap(),
@@ -171,11 +184,15 @@ mod tests {
                         id: 1,
                         name: "namespace2".to_string(),
                         retention_period_ns: TEST_RETENTION_PERIOD_NS,
+                        max_tables: TEST_MAX_TABLES,
+                        max_columns_per_table: TEST_MAX_COLUMNS_PER_TABLE,
                     },
                     proto::Namespace {
                         id: 2,
                         name: "namespace1".to_string(),
                         retention_period_ns: TEST_RETENTION_PERIOD_NS,
+                        max_tables: TEST_MAX_TABLES,
+                        max_columns_per_table: TEST_MAX_COLUMNS_PER_TABLE,
                     },
                 ]
             }

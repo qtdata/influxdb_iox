@@ -4,16 +4,13 @@ use std::sync::Arc;
 
 use arrow::datatypes::Field;
 use datafusion::{
-    logical_expr::LogicalPlan,
+    logical_expr::{LogicalPlan, LogicalPlanBuilder},
     prelude::{col, lit_timestamp_nano},
 };
 use observability_deps::tracing::debug;
 use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
 
-use crate::{
-    exec::{make_stream_split, IOxSessionContext},
-    QueryChunk,
-};
+use crate::{exec::make_stream_split, util::logical_sort_key_exprs, QueryChunk};
 use snafu::{ResultExt, Snafu};
 
 use super::common::ScanPlanBuilder;
@@ -53,26 +50,26 @@ impl From<datafusion::error::DataFusionError> for Error {
 
 /// Planner for physically rearranging chunk data. This planner
 /// creates COMPACT and SPLIT plans for use in the database lifecycle manager
-#[derive(Debug)]
-pub struct ReorgPlanner {
-    ctx: IOxSessionContext,
-}
+#[derive(Debug, Default)]
+pub struct ReorgPlanner {}
 
 impl ReorgPlanner {
-    pub fn new(ctx: IOxSessionContext) -> Self {
-        Self { ctx }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Creates an execution plan for the COMPACT operations which does the following:
     ///
     /// 1. Merges chunks together into a single stream
     /// 2. Deduplicates via PK as necessary
-    /// 3. Sorts the result according to the requested `output_sort_key`
+    /// 3. Sorts the result according to the requested `output_sort_key` (if necessary)
     ///
     /// The plan looks like:
     ///
-    /// (Sort on output_sort_key)
+    /// ```text
+    /// (Optional Sort on output_sort_key)
     ///   (Scan chunks) <-- any needed deduplication happens here
+    /// ```
     pub fn compact_plan<I>(
         &self,
         table_name: Arc<str>,
@@ -83,15 +80,20 @@ impl ReorgPlanner {
     where
         I: IntoIterator<Item = Arc<dyn QueryChunk>>,
     {
-        let scan_plan =
-            ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("compact_plan"))
-                .with_chunks(chunks)
-                .with_output_sort_key(output_sort_key)
-                .enable_deduplication(false)
-                .build()
-                .context(BuildingScanSnafu)?;
+        let scan_plan = ScanPlanBuilder::new(table_name, schema)
+            .with_chunks(chunks)
+            .with_output_sort_key(output_sort_key)
+            .enable_deduplication(false)
+            .build()
+            .context(BuildingScanSnafu)?;
 
         let plan = scan_plan.plan_builder.build()?;
+        let sort_expr = logical_sort_key_exprs(&output_sort_key);
+        let plan = LogicalPlanBuilder::from(plan)
+            .sort(sort_expr)
+            .context(BuildingPlanSnafu)?
+            .build()
+            .context(BuildingPlanSnafu)?;
 
         debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
                "created compact plan for table");
@@ -109,16 +111,31 @@ impl ReorgPlanner {
     ///
     /// The plan looks like:
     ///
+    /// ```text
     /// (Split on Time)
     ///   (Sort on output_sort)
     ///     (Scan chunks) <-- any needed deduplication happens here
+    /// ```
     ///
-    /// The output execution plan has n "output streams" (DataFusion partition):
+    /// The output execution plan has `N` "output streams" (DataFusion
+    /// partitions) where `N` = `split_times.len() + 1`. The
+    /// time ranges of the streams are:
+    ///
     /// Stream 0: Rows that have `time` *on or before* the `split_times[0]`
-    /// Stream i (0 < i < split_times's length): Rows that have  `time` in range `(split_times[i-1], split_times[i]]`
-    /// Stream n (n = split_times.len()): Rows that have `time` *after* all the split_times and NULL rows
     ///
-    /// For example, if the input looks like:
+    /// Stream i, where 0 < i < split_times.len():
+    /// Rows have: `time` in range `(split_times[i-1], split_times[i]]`,
+    ///  Which is: greater than `split_times[i-1]` up to and including `split_times[i]`.
+    ///
+    /// Stream n, where n = split_times.len()): Rows that have `time`
+    /// *after* `split_times[n-1]` as well as NULL rows
+    ///
+    /// # Panics
+    ///
+    /// The code will panic if split_times are not in monotonically increasing order
+    ///
+    /// # Example
+    /// if the input looks like:
     /// ```text
     ///  X | time
     /// ---+-----
@@ -174,12 +191,19 @@ impl ReorgPlanner {
             .find(|c| time_columns.contains(c))
             .expect("a time column is needed")[..];
 
-        let scan_plan = ScanPlanBuilder::new(table_name, schema, self.ctx.child_ctx("split_plan"))
+        let scan_plan = ScanPlanBuilder::new(table_name, schema)
             .with_chunks(chunks)
             .with_output_sort_key(output_sort_key)
             .enable_deduplication(false)
             .build()
             .context(BuildingScanSnafu)?;
+        let plan = scan_plan.plan_builder.build().context(BuildingPlanSnafu)?;
+        let sort_expr = logical_sort_key_exprs(&output_sort_key);
+        let plan = LogicalPlanBuilder::from(plan)
+            .sort(sort_expr)
+            .context(BuildingPlanSnafu)?
+            .build()
+            .context(BuildingPlanSnafu)?;
 
         let mut split_exprs = Vec::with_capacity(split_times.len());
         // time <= split_times[0]
@@ -201,8 +225,6 @@ impl ReorgPlanner {
                     .and(col(time_column_name).lt_eq(lit_timestamp_nano(split_times[i]))),
             );
         }
-
-        let plan = scan_plan.plan_builder.build().context(BuildingPlanSnafu)?;
         let plan = make_stream_split(plan, split_exprs);
 
         debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
@@ -221,7 +243,7 @@ mod test {
 
     use crate::{
         exec::{Executor, ExecutorType},
-        test::{raw_data, TestChunk},
+        test::{format_execution_plan, raw_data, TestChunk},
     };
 
     use super::*;
@@ -344,7 +366,7 @@ mod test {
                 .with_col_opts(TIME_COLUMN_NAME, false, true)
                 .build();
 
-            let compact_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+            let compact_plan = ReorgPlanner::new()
                 .compact_plan(Arc::from("t"), &schema, chunks, sort_key)
                 .expect("created compact plan");
 
@@ -381,7 +403,7 @@ mod test {
             .with_col_opts(TIME_COLUMN_NAME, false, false)
             .build();
 
-        let compact_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let compact_plan = ReorgPlanner::new()
             .compact_plan(Arc::from("t"), &schema, chunks, sort_key)
             .expect("created compact plan");
 
@@ -391,6 +413,23 @@ mod test {
             .create_physical_plan(&compact_plan)
             .await
             .unwrap();
+
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&physical_plan),
+            @r###"
+        ---
+        - " SortPreservingMergeExec: [tag1@2 DESC,time@3 ASC NULLS LAST]"
+        - "   UnionExec"
+        - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST]"
+        - "       RecordBatchesExec: batches_groups=1 batches=1 total_rows=5"
+        - "     SortExec: expr=[tag1@2 DESC,time@3 ASC NULLS LAST]"
+        - "       ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
+        - "         DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
+        - "           SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC]"
+        - "             RecordBatchesExec: batches_groups=1 batches=1 total_rows=4"
+        "###
+        );
+
         assert_eq!(
             physical_plan.output_partitioning().partition_count(),
             1,
@@ -432,7 +471,7 @@ mod test {
             .build();
 
         // split on 1000 should have timestamps 1000, 5000, and 7000
-        let split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let split_plan = ReorgPlanner::new()
             .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000])
             .expect("created compact plan");
 
@@ -442,6 +481,23 @@ mod test {
             .create_physical_plan(&split_plan)
             .await
             .unwrap();
+
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&physical_plan),
+            @r###"
+        ---
+        - " StreamSplitExec"
+        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "     UnionExec"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "         RecordBatchesExec: batches_groups=1 batches=1 total_rows=5"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "         ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
+        - "           DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
+        - "             SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC]"
+        - "               RecordBatchesExec: batches_groups=1 batches=1 total_rows=4"
+        "###
+        );
 
         assert_eq!(
             physical_plan.output_partitioning().partition_count(),
@@ -496,7 +552,7 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let split_plan = ReorgPlanner::new()
             .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000, 7000])
             .expect("created compact plan");
 
@@ -506,6 +562,23 @@ mod test {
             .create_physical_plan(&split_plan)
             .await
             .unwrap();
+
+        insta::assert_yaml_snapshot!(
+            format_execution_plan(&physical_plan),
+            @r###"
+        ---
+        - " StreamSplitExec"
+        - "   SortPreservingMergeExec: [time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "     UnionExec"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "         RecordBatchesExec: batches_groups=1 batches=1 total_rows=5"
+        - "       SortExec: expr=[time@3 ASC NULLS LAST,tag1@2 ASC]"
+        - "         ProjectionExec: expr=[field_int@1 as field_int, field_int2@2 as field_int2, tag1@3 as tag1, time@4 as time]"
+        - "           DeduplicateExec: [tag1@3 ASC,time@4 ASC]"
+        - "             SortExec: expr=[tag1@3 ASC,time@4 ASC,__chunk_order@0 ASC]"
+        - "               RecordBatchesExec: batches_groups=1 batches=1 total_rows=4"
+        "###
+        );
 
         assert_eq!(
             physical_plan.output_partitioning().partition_count(),
@@ -572,7 +645,7 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let _split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let _split_plan = ReorgPlanner::new()
             .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![]) // reason of panic: empty split_times
             .expect("created compact plan");
     }
@@ -591,7 +664,7 @@ mod test {
             .build();
 
         // split on 1000 and 7000
-        let _split_plan = ReorgPlanner::new(IOxSessionContext::with_testing())
+        let _split_plan = ReorgPlanner::new()
             .split_plan(Arc::from("t"), &schema, chunks, sort_key, vec![1000, 500]) // reason of panic: split_times not in ascending order
             .expect("created compact plan");
     }

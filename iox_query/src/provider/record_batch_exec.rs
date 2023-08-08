@@ -1,22 +1,31 @@
 //! Implementation of a DataFusion PhysicalPlan node across partition chunks
 
-use crate::QueryChunk;
+use crate::{statistics::DFStatsAggregator, QueryChunk, CHUNK_ORDER_COLUMN_NAME};
 
 use super::adapter::SchemaAdapterStream;
-use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
-use data_types::TableSummary;
+use arrow::{
+    datatypes::{Schema, SchemaRef},
+    record_batch::RecordBatch,
+};
 use datafusion::{
     error::DataFusionError,
     execution::context::TaskContext,
     physical_plan::{
-        expressions::PhysicalSortExpr,
+        expressions::{Column, PhysicalSortExpr},
         memory::MemoryStream,
         metrics::{BaselineMetrics, ExecutionPlanMetricsSet, MetricsSet},
-        DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream, Statistics,
+        ColumnStatistics, DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning,
+        SendableRecordBatchStream, Statistics,
     },
+    scalar::ScalarValue,
 };
 use observability_deps::tracing::trace;
-use std::{collections::HashSet, fmt, sync::Arc};
+use schema::sort::SortKey;
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    sync::Arc,
+};
 
 /// Implements the DataFusion physical plan interface for [`RecordBatch`]es with automatic projection and NULL-column creation.
 #[derive(Debug)]
@@ -32,11 +41,28 @@ pub(crate) struct RecordBatchesExec {
 
     /// Statistics over all batches.
     statistics: Statistics,
+
+    /// Sort key that was passed to [`chunks_to_physical_nodes`].
+    ///
+    /// This is NOT used to set the output ordering. It is only here to recover this information later.
+    ///
+    ///
+    /// [`chunks_to_physical_nodes`]: super::physical::chunks_to_physical_nodes
+    output_sort_key_memo: Option<SortKey>,
+
+    /// Output ordering.
+    output_ordering: Option<Vec<PhysicalSortExpr>>,
 }
 
 impl RecordBatchesExec {
-    pub fn new(chunks: impl IntoIterator<Item = Arc<dyn QueryChunk>>, schema: SchemaRef) -> Self {
-        let mut combined_summary_option: Option<TableSummary> = None;
+    pub fn new(
+        chunks: impl IntoIterator<Item = Arc<dyn QueryChunk>>,
+        schema: SchemaRef,
+        output_sort_key_memo: Option<SortKey>,
+    ) -> Self {
+        let chunk_order_field = schema.field_with_name(CHUNK_ORDER_COLUMN_NAME).ok();
+        let chunk_order_only_schema =
+            chunk_order_field.map(|field| Schema::new(vec![field.clone()]));
 
         let chunks: Vec<_> = chunks
             .into_iter()
@@ -45,28 +71,63 @@ impl RecordBatchesExec {
                     .data()
                     .into_record_batches()
                     .expect("chunk must have record batches");
-                let summary = chunk.summary();
-                match combined_summary_option.as_mut() {
-                    None => {
-                        combined_summary_option = Some(summary.as_ref().clone());
-                    }
-                    Some(combined_summary) => {
-                        combined_summary.update_from(&summary);
-                    }
-                }
 
                 (chunk, batches)
             })
             .collect();
 
-        let statistics = combined_summary_option
-            .map(|combined_summary| crate::statistics::df_from_iox(&schema, &combined_summary))
-            .unwrap_or_default();
+        let statistics = chunks
+            .iter()
+            .fold(
+                DFStatsAggregator::new(&schema),
+                |mut agg, (chunk, _batches)| {
+                    agg.update(&chunk.stats(), chunk.schema().as_arrow().as_ref());
+
+                    if let Some(schema) = chunk_order_only_schema.as_ref() {
+                        let order = chunk.order().get();
+                        let order = ScalarValue::from(order);
+                        agg.update(
+                            &Statistics {
+                                num_rows: Some(0),
+                                total_byte_size: Some(0),
+                                column_statistics: Some(vec![ColumnStatistics {
+                                    null_count: Some(0),
+                                    max_value: Some(order.clone()),
+                                    min_value: Some(order),
+                                    distinct_count: Some(1),
+                                }]),
+                                is_exact: true,
+                            },
+                            schema,
+                        );
+                    }
+
+                    agg
+                },
+            )
+            .build();
+
+        let output_ordering = if chunk_order_field.is_some() {
+            Some(vec![
+                // every chunk gets its own partition, so we can claim that the output is ordered
+                PhysicalSortExpr {
+                    expr: Arc::new(
+                        Column::new_with_schema(CHUNK_ORDER_COLUMN_NAME, &schema)
+                            .expect("just checked presence of chunk order col"),
+                    ),
+                    options: Default::default(),
+                },
+            ])
+        } else {
+            None
+        };
 
         Self {
             chunks,
             schema,
             statistics,
+            output_sort_key_memo,
+            output_ordering,
             metrics: ExecutionPlanMetricsSet::new(),
         }
     }
@@ -74,6 +135,16 @@ impl RecordBatchesExec {
     /// Chunks that make up this node.
     pub fn chunks(&self) -> impl Iterator<Item = &Arc<dyn QueryChunk>> {
         self.chunks.iter().map(|(chunk, _batches)| chunk)
+    }
+
+    /// Sort key that was passed to [`chunks_to_physical_nodes`].
+    ///
+    /// This is NOT used to set the output ordering. It is only here to recover this information later.
+    ///
+    ///
+    /// [`chunks_to_physical_nodes`]: super::physical::chunks_to_physical_nodes
+    pub fn output_sort_key_memo(&self) -> Option<&SortKey> {
+        self.output_sort_key_memo.as_ref()
     }
 }
 
@@ -91,8 +162,7 @@ impl ExecutionPlan for RecordBatchesExec {
     }
 
     fn output_ordering(&self) -> Option<&[PhysicalSortExpr]> {
-        // TODO ??
-        None
+        self.output_ordering.as_deref()
     }
 
     fn children(&self) -> Vec<Arc<dyn ExecutionPlan>> {
@@ -151,8 +221,12 @@ impl ExecutionPlan for RecordBatchesExec {
             incomplete_output_schema,
             projection,
         )?);
+        let virtual_columns = HashMap::from([(
+            CHUNK_ORDER_COLUMN_NAME,
+            ScalarValue::from(chunk.order().get()),
+        )]);
         let adapter = Box::pin(
-            SchemaAdapterStream::try_new(stream, schema, baseline_metrics)
+            SchemaAdapterStream::try_new(stream, schema, &virtual_columns, baseline_metrics)
                 .map_err(|e| DataFusionError::Internal(e.to_string()))?,
         );
 
@@ -160,6 +234,16 @@ impl ExecutionPlan for RecordBatchesExec {
         Ok(adapter)
     }
 
+    fn metrics(&self) -> Option<MetricsSet> {
+        Some(self.metrics.clone_inner())
+    }
+
+    fn statistics(&self) -> Statistics {
+        self.statistics.clone()
+    }
+}
+
+impl DisplayAs for RecordBatchesExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let total_groups = self.chunks.len();
 
@@ -176,20 +260,12 @@ impl ExecutionPlan for RecordBatchesExec {
             .sum::<usize>();
 
         match t {
-            DisplayFormatType::Default => {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
                 write!(
                     f,
                     "RecordBatchesExec: batches_groups={total_groups} batches={total_batches} total_rows={total_rows}",
                 )
             }
         }
-    }
-
-    fn metrics(&self) -> Option<MetricsSet> {
-        Some(self.metrics.clone_inner())
-    }
-
-    fn statistics(&self) -> Statistics {
-        self.statistics.clone()
     }
 }
