@@ -82,7 +82,6 @@ impl ReorgPlanner {
     {
         let scan_plan = ScanPlanBuilder::new(table_name, schema)
             .with_chunks(chunks)
-            .with_output_sort_key(output_sort_key)
             .enable_deduplication(false)
             .build()
             .context(BuildingScanSnafu)?;
@@ -193,7 +192,6 @@ impl ReorgPlanner {
 
         let scan_plan = ScanPlanBuilder::new(table_name, schema)
             .with_chunks(chunks)
-            .with_output_sort_key(output_sort_key)
             .enable_deduplication(false)
             .build()
             .context(BuildingScanSnafu)?;
