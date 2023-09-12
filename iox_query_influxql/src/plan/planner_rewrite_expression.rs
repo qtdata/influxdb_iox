@@ -669,7 +669,7 @@ mod test {
             .unwrap()
             .and_hms_opt(0, 0, 0)
             .unwrap();
-        let start_time = DateTime::<Utc>::from_utc(start_time, Utc);
+        let start_time = DateTime::<Utc>::from_naive_utc_and_offset(start_time, Utc);
         let mut props = ExecutionProps::new();
         props.query_execution_start_time = start_time;
         props
@@ -736,7 +736,7 @@ mod test {
         let expr = binary_expr("boolean_field".as_expr(), Operator::BitwiseXor, lit(true));
         assert_eq!(
             rewrite(expr),
-            "CAST(CAST(boolean_field AS Int8) # CAST(Boolean(true) AS Int8) AS Boolean)"
+            "CAST(CAST(boolean_field AS Int8) BIT_XOR CAST(Boolean(true) AS Int8) AS Boolean)"
         );
 
         // Unsupported operations

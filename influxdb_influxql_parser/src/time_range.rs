@@ -242,7 +242,7 @@ pub fn split_cond(
                     };
 
                     let Some(expr) = expr.expr() else {
-                        return ControlFlow::Break(error::map::internal("expected Expr"))
+                        return ControlFlow::Break(error::map::internal("expected Expr"));
                     };
 
                     // simplify binary expressions to a constant, including resolve `now()`
@@ -296,13 +296,11 @@ pub fn split_cond(
                     op: op @ (And | Or),
                     ..
                 }) => {
-                    let Some(right) = stack
-                        .pop() else {
-                        return ControlFlow::Break(error::map::internal("invalid expr stack"))
+                    let Some(right) = stack.pop() else {
+                        return ControlFlow::Break(error::map::internal("invalid expr stack"));
                     };
-                    let Some(left) = stack
-                        .pop() else {
-                        return ControlFlow::Break(error::map::internal("invalid expr stack"))
+                    let Some(left) = stack.pop() else {
+                        return ControlFlow::Break(error::map::internal("invalid expr stack"));
                     };
                     stack.push(match (left, right) {
                         (Some(left), Some(right)) => Some(CE::Binary(ConditionalBinary {
@@ -734,7 +732,7 @@ mod test {
     /// and not timezone.
     fn reduce_context() -> ReduceContext {
         ReduceContext {
-            now: Some(Timestamp::from_utc(
+            now: Some(Timestamp::from_naive_utc_and_offset(
                 NaiveDateTime::new(
                     NaiveDate::from_ymd_opt(2023, 1, 1).unwrap(),
                     NaiveTime::from_hms_opt(0, 0, 0).unwrap(),
@@ -894,7 +892,7 @@ mod test {
             let cond: ConditionalExpression =
                 s.parse().expect("unexpected error parsing expression");
             let ctx = ReduceContext {
-                now: Some(Timestamp::from_utc(
+                now: Some(Timestamp::from_naive_utc_and_offset(
                     NaiveDateTime::new(
                         NaiveDate::from_ymd_opt(2004, 4, 9).unwrap(),
                         NaiveTime::from_hms_opt(12, 13, 14).unwrap(),

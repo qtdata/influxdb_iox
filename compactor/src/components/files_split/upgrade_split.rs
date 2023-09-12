@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use data_types::{CompactionLevel, ParquetFile};
+use data_types::{CompactionLevel, ParquetFile, TransitionPartitionId};
 
 use super::FilesSplit;
 use crate::file_group::{overlaps_in_time, split_by_level, FilesTimeRange};
@@ -34,13 +34,13 @@ impl Display for UpgradeSplit {
 
 impl FilesSplit for UpgradeSplit {
     /// Return (`[files_to_compact]`, `[files_to_upgrade]`) of the given files
-    /// so that `files_to_upgrade` does not overlap with any files in previous level
+    /// so that `files_to_upgrade` does not overlap with any files in next level
     ///
     /// The files_to_upgrade must in the (target_level - 1)
     ///
-    /// Eligible upgradable files are large-enough-file (>= max_desired_file_size) files of the previous level of
+    /// Eligible upgradable files are large-enough-file (>= max_desired_file_size/2) files of the previous level of
     /// the target level that do not overlap on time range with any files in its level and higher-level files.
-    /// Note: we always have to stick the the invariance that the outout files must not overlap
+    /// Note: we always have to stick to the invariance that the outout files must not overlap
     ///
     /// Example:
     ///             |--L0.1--| |--L0.2--| |--L0.3--|
@@ -54,7 +54,7 @@ impl FilesSplit for UpgradeSplit {
     ///
     /// Algorithm:
     ///    The non-overlappings files are files of the (target_level -1) files that:
-    ///      1. Size >= max_desire_file_size
+    ///      1. Size >= max_desire_file_size/2
     ///      2. Completely outside the time range of all higher level files
     ///      3. Not overlap with any files in the same level
     ///      4. Not overlap with the time range of the files not meet 3 conditions above
@@ -64,9 +64,14 @@ impl FilesSplit for UpgradeSplit {
         &self,
         files: Vec<ParquetFile>,
         target_level: CompactionLevel,
+        partition: TransitionPartitionId,
     ) -> (Vec<ParquetFile>, Vec<ParquetFile>) {
-        // Panic if given wrong target level, L0
-        assert_ne!(target_level, CompactionLevel::Initial);
+        assert_ne!(
+            target_level,
+            CompactionLevel::Initial,
+            "unexpected compaction target_level, should not be L0, partition_id={}",
+            partition
+        );
 
         let mut files_to_upgrade = Vec::with_capacity(files.len());
         let mut files_to_compact = Vec::with_capacity(files.len());
@@ -74,14 +79,14 @@ impl FilesSplit for UpgradeSplit {
         // Split files into levels
         let prev_level = target_level.prev();
         let (target_level_files, mut prev_level_files) =
-            split_by_level(files, target_level, prev_level);
+            split_by_level(files, target_level, prev_level, partition);
 
         // compute time range of target_level_files, if any
         let target_time_range = FilesTimeRange::try_new(&target_level_files);
 
         // Go go over all files of previous level and check if they are NOT eligible to upgrade
         // by hit one of this conditions
-        //  . Size < max_desire_file_size
+        //  . Size < max_desire_file_size/2
         //  . Overlap with time range of target_level_files
         //  . Overlap with any files in the same level
         // Otherwise, they are large and not overlap. Put them in the potential upgradable list
@@ -90,7 +95,7 @@ impl FilesSplit for UpgradeSplit {
         let mut potential_upgradable_files = Vec::with_capacity(prev_level_files.len());
         while let Some(file) = prev_level_files.pop() {
             // size is small
-            if file.file_size_bytes < self.max_desired_file_size_bytes as i64 {
+            if file.file_size_bytes < self.max_desired_file_size_bytes as i64 / 2 {
                 files_to_compact.push(file);
             } else if let Some(target_time_range) = target_time_range {
                 // overlap with target_level_files
@@ -141,11 +146,12 @@ impl FilesSplit for UpgradeSplit {
 mod tests {
 
     use compactor_test_utils::{
-        create_l0_files, create_l1_files, create_l1_files_mix_size, create_overlapped_files,
-        create_overlapped_files_2, create_overlapped_files_3, create_overlapped_files_3_mix_size,
-        create_overlapped_l0_l1_files, create_overlapped_l1_l2_files,
-        create_overlapped_l1_l2_files_mix_size, create_overlapped_l1_l2_files_mix_size_2,
-        create_overlapping_l0_files, format_files, format_files_split,
+        create_fake_partition_id, create_l0_files, create_l1_files, create_l1_files_mix_size,
+        create_overlapped_files, create_overlapped_files_2, create_overlapped_files_3,
+        create_overlapped_files_3_mix_size, create_overlapped_l0_l1_files,
+        create_overlapped_l1_l2_files, create_overlapped_l1_l2_files_mix_size,
+        create_overlapped_l1_l2_files_mix_size_2, create_overlapping_l0_files, format_files,
+        format_files_split,
     };
 
     use super::*;
@@ -165,51 +171,60 @@ mod tests {
     #[should_panic]
     fn test_wrong_target_level() {
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (_files_to_compact, _files_to_upgrade) = split.apply(vec![], CompactionLevel::Initial);
+        let (_files_to_compact, _files_to_upgrade) =
+            split.apply(vec![], CompactionLevel::Initial, create_fake_partition_id());
     }
 
     #[test]
     #[should_panic(
-        expected = "Unexpected compaction level. Expected CompactionLevel::L1 or CompactionLevel::L0 but got CompactionLevel::L2."
+        expected = "unexpected compaction level for partition 0, expected CompactionLevel::L1 or CompactionLevel::L0 but got CompactionLevel::L2"
     )]
     fn test_unexpected_compaction_level_2() {
         let files = create_overlapped_files();
         let split = UpgradeSplit::new(MAX_SIZE);
         // There are L2 files and will panic
-        split.apply(files, CompactionLevel::FileNonOverlapped);
+        split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
     }
 
     #[test]
     #[should_panic(
-        expected = "Unexpected compaction level. Expected CompactionLevel::L2 or CompactionLevel::L1 but got CompactionLevel::L0."
+        expected = "unexpected compaction level for partition 0, expected CompactionLevel::L2 or CompactionLevel::L1 but got CompactionLevel::L0"
     )]
     fn test_unexpected_compaction_level_0() {
         let files = create_overlapped_files();
         let split = UpgradeSplit::new(MAX_SIZE);
         // There are L0 files and will panic
-        split.apply(files, CompactionLevel::Final);
+        split.apply(files, CompactionLevel::Final, create_fake_partition_id());
     }
 
     #[test]
     fn test_apply_empty_files() {
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(vec![], CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            vec![],
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
         assert_eq!((files_to_compact, files_to_upgrade), (vec![], vec![]));
 
-        let (files_to_compact, files_to_upgrade) = split.apply(vec![], CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(vec![], CompactionLevel::Final, create_fake_partition_id());
         assert_eq!((files_to_compact, files_to_upgrade), (vec![], vec![]));
     }
 
     #[test]
     fn test_apply_one_level_overlap_small_l0() {
-        let files = create_overlapping_l0_files((MAX_SIZE - 1) as i64);
+        let files = create_overlapping_l0_files((MAX_SIZE / 2 - 1) as i64);
         insta::assert_yaml_snapshot!(
             format_files("initial", &files),
             @r###"
         ---
         - initial
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.2[150,180] 0ns             |L0.2|                                                                               "
         - "L0.1[100,200] 0ns        |--L0.1---|                                                                               "
         - "L0.3[800,900] 0ns                                                                                      |--L0.3---| "
@@ -217,8 +232,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are small --> nothing to upgrade
         insta::assert_yaml_snapshot!(
@@ -226,7 +244,7 @@ mod tests {
             @r###"
         ---
         - files_to_compact
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.3[800,900] 0ns                                                                                      |--L0.3---| "
         - "L0.1[100,200] 0ns        |--L0.1---|                                                                               "
         - "L0.2[150,180] 0ns             |L0.2|                                                                               "
@@ -251,8 +269,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are large but only one eligible for upgrade
         // files_to_compact = [L0.1, L0.2]
@@ -274,21 +295,24 @@ mod tests {
 
     #[test]
     fn test_apply_one_level_small_l0() {
-        let files = create_l0_files((MAX_SIZE - 1) as i64);
+        let files = create_l0_files((MAX_SIZE / 2 - 1) as i64);
         insta::assert_yaml_snapshot!(
             format_files("initial", &files),
             @r###"
         ---
         - initial
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.2[650,750] 0ns                                                |-------L0.2-------|                              "
         - "L0.1[450,620] 0ns        |--------------L0.1--------------|                                                        "
         - "L0.3[800,900] 0ns                                                                              |-------L0.3-------|"
         "###
         );
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are small --> nothing to upgrade
         insta::assert_yaml_snapshot!(
@@ -296,7 +320,7 @@ mod tests {
             @r###"
         ---
         - files_to_compact
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.3[800,900] 0ns                                                                              |-------L0.3-------|"
         - "L0.1[450,620] 0ns        |--------------L0.1--------------|                                                        "
         - "L0.2[650,750] 0ns                                                |-------L0.2-------|                              "
@@ -320,8 +344,11 @@ mod tests {
         "###
         );
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are large and eligible for upgrade
         insta::assert_yaml_snapshot!(
@@ -353,8 +380,11 @@ mod tests {
         "###
         );
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are small --> nothing to upgrade
         insta::assert_yaml_snapshot!(
@@ -375,7 +405,8 @@ mod tests {
     fn test_apply_one_level_large_l1() {
         let files = create_l1_files((MAX_SIZE + 1) as i64);
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
 
         // All files are large and eligible for upgrade
         insta::assert_yaml_snapshot!(
@@ -394,7 +425,7 @@ mod tests {
 
     #[test]
     fn test_apply_one_level_l1_mix_size() {
-        let files = create_l1_files_mix_size(MAX_SIZE as i64);
+        let files = create_l1_files_mix_size((MAX_SIZE / 2) as i64);
 
         //  . small files (< size ): L1.1, L1.3
         //  . Large files (.= size): L1.2, L1.4, L1.5
@@ -407,16 +438,17 @@ mod tests {
         ---
         - initial
         - "L1                                                                                                                 "
-        - "L1.15[1000,1100] 0ns 200b                                                                               |-L1.15--| "
-        - "L1.13[600,700] 0ns 90b                                        |-L1.13--|                                           "
-        - "L1.12[400,500] 0ns 101b                 |-L1.12--|                                                                 "
-        - "L1.11[250,350] 0ns 99b   |-L1.11--|                                                                                "
-        - "L1.14[800,900] 0ns 100b                                                            |-L1.14--|                      "
+        - "L1.15[1000,1100] 0ns 150b                                                                               |-L1.15--| "
+        - "L1.13[600,700] 0ns 40b                                        |-L1.13--|                                           "
+        - "L1.12[400,500] 0ns 51b                  |-L1.12--|                                                                 "
+        - "L1.11[250,350] 0ns 49b   |-L1.11--|                                                                                "
+        - "L1.14[800,900] 0ns 50b                                                             |-L1.14--|                      "
         "###
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
 
         // Some files are large and eligible for upgrade
         insta::assert_yaml_snapshot!(
@@ -425,30 +457,30 @@ mod tests {
         ---
         - files_to_compact
         - "L1                                                                                                                 "
-        - "L1.11[250,350] 0ns 99b   |------L1.11-------|                                                                      "
-        - "L1.13[600,700] 0ns 90b                                                                         |------L1.13-------|"
-        - "L1.12[400,500] 0ns 101b                                |------L1.12-------|                                        "
+        - "L1.11[250,350] 0ns 49b   |------L1.11-------|                                                                      "
+        - "L1.13[600,700] 0ns 40b                                                                         |------L1.13-------|"
+        - "L1.12[400,500] 0ns 51b                                 |------L1.12-------|                                        "
         - files_to_upgrade
         - "L1                                                                                                                 "
-        - "L1.15[1000,1100] 0ns 200b                                                            |-----------L1.15------------|"
-        - "L1.14[800,900] 0ns 100b  |-----------L1.14------------|                                                            "
+        - "L1.15[1000,1100] 0ns 150b                                                            |-----------L1.15------------|"
+        - "L1.14[800,900] 0ns 50b   |-----------L1.14------------|                                                            "
         "###
         );
     }
 
     #[test]
     fn test_apply_all_small_target_l1() {
-        let files = create_overlapped_l0_l1_files((MAX_SIZE - 1) as i64);
+        let files = create_overlapped_l0_l1_files((MAX_SIZE / 2 - 1) as i64);
         insta::assert_yaml_snapshot!(
             format_files("initial", &files),
             @r###"
         ---
         - initial
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.2[650,750] 180s                                                              |---L0.2----|                      "
         - "L0.1[450,620] 120s                                  |--------L0.1---------|                                        "
         - "L0.3[800,900] 300s                                                                                   |---L0.3----| "
-        - "L1, all files 99b                                                                                                  "
+        - "L1, all files 49b                                                                                                  "
         - "L1.13[600,700] 60s                                                       |---L1.13---|                             "
         - "L1.12[400,500] 60s                           |---L1.12---|                                                         "
         - "L1.11[250,350] 60s       |---L1.11---|                                                                             "
@@ -456,8 +488,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are small --> nothing to upgrade
         insta::assert_yaml_snapshot!(
@@ -465,11 +500,11 @@ mod tests {
             @r###"
         ---
         - files_to_compact
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.3[800,900] 300s                                                                                   |---L0.3----| "
         - "L0.1[450,620] 120s                                  |--------L0.1---------|                                        "
         - "L0.2[650,750] 180s                                                              |---L0.2----|                      "
-        - "L1, all files 99b                                                                                                  "
+        - "L1, all files 49b                                                                                                  "
         - "L1.13[600,700] 60s                                                       |---L1.13---|                             "
         - "L1.12[400,500] 60s                           |---L1.12---|                                                         "
         - "L1.11[250,350] 60s       |---L1.11---|                                                                             "
@@ -498,8 +533,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         // All files are large --> L0.3 is eligible for upgrade
         insta::assert_yaml_snapshot!(
@@ -523,9 +561,10 @@ mod tests {
 
     #[test]
     fn test_apply_all_small_target_l2() {
-        let files = create_overlapped_l1_l2_files((MAX_SIZE - 1) as i64);
+        let files = create_overlapped_l1_l2_files((MAX_SIZE / 2 - 1) as i64);
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
 
         // All files are small --> nothing to upgrade
         insta::assert_yaml_snapshot!(
@@ -533,11 +572,11 @@ mod tests {
             @r###"
         ---
         - files_to_compact
-        - "L1, all files 99b                                                                                                  "
+        - "L1, all files 49b                                                                                                  "
         - "L1.11[250,350] 0ns                                       |--L1.11---|                                              "
         - "L1.12[400,500] 0ns                                                          |--L1.12---|                           "
         - "L1.13[600,700] 0ns                                                                                    |--L1.13---| "
-        - "L2, all files 99b                                                                                                  "
+        - "L2, all files 49b                                                                                                  "
         - "L2.21[0,100] 0ns         |--L2.21---|                                                                              "
         - "L2.22[200,300] 0ns                                |--L2.22---|                                                     "
         - files_to_upgrade
@@ -564,7 +603,8 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
 
         // All files are large --> L1.2 and L1.3 are eligible for upgrade
         insta::assert_yaml_snapshot!(
@@ -587,7 +627,7 @@ mod tests {
 
     #[test]
     fn test_apply_all_small_target_l2_mix_size() {
-        let files = create_overlapped_l1_l2_files_mix_size(MAX_SIZE as i64);
+        let files = create_overlapped_l1_l2_files_mix_size((MAX_SIZE / 2) as i64);
         //  Small files (< size): [L1.3]
         //  Large files: [L2.1, L2.2, L1.1, L1.2]
         // ==> nothing to upgrade
@@ -597,17 +637,18 @@ mod tests {
         ---
         - initial
         - "L1                                                                                                                 "
-        - "L1.13[600,700] 0ns 99b                                                                                |--L1.13---| "
-        - "L1.12[400,500] 0ns 100b                                                     |--L1.12---|                           "
-        - "L1.11[250,350] 0ns 100b                                  |--L1.11---|                                              "
+        - "L1.13[600,700] 0ns 49b                                                                                |--L1.13---| "
+        - "L1.12[400,500] 0ns 50b                                                      |--L1.12---|                           "
+        - "L1.11[250,350] 0ns 50b                                   |--L1.11---|                                              "
         - "L2                                                                                                                 "
-        - "L2.21[0,100] 0ns 100b    |--L2.21---|                                                                              "
-        - "L2.22[200,300] 0ns 100b                           |--L2.22---|                                                     "
+        - "L2.21[0,100] 0ns 50b     |--L2.21---|                                                                              "
+        - "L2.22[200,300] 0ns 50b                            |--L2.22---|                                                     "
         "###
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
 
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
@@ -615,12 +656,12 @@ mod tests {
         ---
         - files_to_compact
         - "L1                                                                                                                 "
-        - "L1.11[250,350] 0ns 100b                                  |--L1.11---|                                              "
-        - "L1.13[600,700] 0ns 99b                                                                                |--L1.13---| "
-        - "L1.12[400,500] 0ns 100b                                                     |--L1.12---|                           "
+        - "L1.11[250,350] 0ns 50b                                   |--L1.11---|                                              "
+        - "L1.13[600,700] 0ns 49b                                                                                |--L1.13---| "
+        - "L1.12[400,500] 0ns 50b                                                      |--L1.12---|                           "
         - "L2                                                                                                                 "
-        - "L2.21[0,100] 0ns 100b    |--L2.21---|                                                                              "
-        - "L2.22[200,300] 0ns 100b                           |--L2.22---|                                                     "
+        - "L2.21[0,100] 0ns 50b     |--L2.21---|                                                                              "
+        - "L2.22[200,300] 0ns 50b                            |--L2.22---|                                                     "
         - files_to_upgrade
         "###
         );
@@ -628,7 +669,7 @@ mod tests {
 
     #[test]
     fn test_apply_all_small_target_l2_mix_size_2() {
-        let files = create_overlapped_l1_l2_files_mix_size_2(MAX_SIZE as i64);
+        let files = create_overlapped_l1_l2_files_mix_size_2((MAX_SIZE / 2) as i64);
         //  Small files (< size): [L1.2]
         //  Large files: [L2.1, L2.2, L1.1, L1.3]
         //  ==> L1.3 is eligible for upgrade
@@ -638,30 +679,31 @@ mod tests {
         ---
         - initial
         - "L1                                                                                                                 "
-        - "L1.13[600,700] 0ns 100b                                                                               |--L1.13---| "
-        - "L1.12[400,500] 0ns 99b                                                      |--L1.12---|                           "
-        - "L1.11[250,350] 0ns 100b                                  |--L1.11---|                                              "
+        - "L1.13[600,700] 0ns 50b                                                                                |--L1.13---| "
+        - "L1.12[400,500] 0ns 49b                                                      |--L1.12---|                           "
+        - "L1.11[250,350] 0ns 50b                                   |--L1.11---|                                              "
         - "L2                                                                                                                 "
-        - "L2.21[0,100] 0ns 100b    |--L2.21---|                                                                              "
-        - "L2.22[200,300] 0ns 100b                           |--L2.22---|                                                     "
+        - "L2.21[0,100] 0ns 50b     |--L2.21---|                                                                              "
+        - "L2.22[200,300] 0ns 50b                            |--L2.22---|                                                     "
         "###
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) = split.apply(files, CompactionLevel::Final);
+        let (files_to_compact, files_to_upgrade) =
+            split.apply(files, CompactionLevel::Final, create_fake_partition_id());
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
             @r###"
         ---
         - files_to_compact
         - "L1                                                                                                                 "
-        - "L1.11[250,350] 0ns 100b                                               |-----L1.11------|                           "
-        - "L1.12[400,500] 0ns 99b                                                                           |-----L1.12------|"
+        - "L1.11[250,350] 0ns 50b                                                |-----L1.11------|                           "
+        - "L1.12[400,500] 0ns 49b                                                                           |-----L1.12------|"
         - "L2                                                                                                                 "
-        - "L2.21[0,100] 0ns 100b    |-----L2.21------|                                                                        "
-        - "L2.22[200,300] 0ns 100b                                      |-----L2.22------|                                    "
+        - "L2.21[0,100] 0ns 50b     |-----L2.21------|                                                                        "
+        - "L2.22[200,300] 0ns 50b                                       |-----L2.22------|                                    "
         - files_to_upgrade
-        - "L1, all files 100b                                                                                                 "
+        - "L1, all files 50b                                                                                                  "
         - "L1.13[600,700] 0ns       |-----------------------------------------L1.13------------------------------------------|"
         "###
         );
@@ -688,8 +730,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
@@ -711,43 +756,46 @@ mod tests {
 
     #[test]
     fn test_apply_all_small_target_l1_2() {
-        let files = create_overlapped_files_3((MAX_SIZE - 1) as i64);
+        let files = create_overlapped_files_3((MAX_SIZE / 2 - 1) as i64);
         // All small ==> nothing to upgrade
         insta::assert_yaml_snapshot!(
             format_files("initial", &files),
             @r###"
         ---
         - initial
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.3[400,500] 0ns                                        |-L0.3-|                                                  "
         - "L0.2[200,300] 0ns                        |-L0.2-|                                                                  "
         - "L0.1[0,100] 0ns          |-L0.1-|                                                                                  "
         - "L0.4[600,700] 0ns                                                         |-L0.4-|                                 "
         - "L0.5[800,900] 0ns                                                                         |-L0.5-|                 "
         - "L0.6[1000,1100] 0ns                                                                                       |-L0.6-| "
-        - "L1, all files 99b                                                                                                  "
+        - "L1, all files 49b                                                                                                  "
         - "L1.11[250,350] 0ns                           |L1.11-|                                                              "
         - "L1.12[650,750] 0ns                                                            |L1.12-|                             "
         "###
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
             @r###"
         ---
         - files_to_compact
-        - "L0, all files 99b                                                                                                  "
+        - "L0, all files 49b                                                                                                  "
         - "L0.6[1000,1100] 0ns                                                                                       |-L0.6-| "
         - "L0.5[800,900] 0ns                                                                         |-L0.5-|                 "
         - "L0.4[600,700] 0ns                                                         |-L0.4-|                                 "
         - "L0.1[0,100] 0ns          |-L0.1-|                                                                                  "
         - "L0.2[200,300] 0ns                        |-L0.2-|                                                                  "
         - "L0.3[400,500] 0ns                                        |-L0.3-|                                                  "
-        - "L1, all files 99b                                                                                                  "
+        - "L1, all files 49b                                                                                                  "
         - "L1.11[250,350] 0ns                           |L1.11-|                                                              "
         - "L1.12[650,750] 0ns                                                            |L1.12-|                             "
         - files_to_upgrade
@@ -780,8 +828,11 @@ mod tests {
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
@@ -806,7 +857,7 @@ mod tests {
 
     #[test]
     fn test_apply_mix_size_target_l1_2() {
-        let files = create_overlapped_files_3_mix_size(MAX_SIZE as i64);
+        let files = create_overlapped_files_3_mix_size((MAX_SIZE / 2) as i64);
         // Small files (< size): L0.6
         // Large files: the rest
         // ==> only L0.1 is eligible for upgrade
@@ -816,21 +867,24 @@ mod tests {
         ---
         - initial
         - "L0                                                                                                                 "
-        - "L0.3[400,500] 0ns 100b                                   |-L0.3-|                                                  "
-        - "L0.2[200,300] 0ns 100b                   |-L0.2-|                                                                  "
-        - "L0.1[0,100] 0ns 100b     |-L0.1-|                                                                                  "
-        - "L0.4[600,700] 0ns 100b                                                    |-L0.4-|                                 "
-        - "L0.5[800,900] 0ns 100b                                                                    |-L0.5-|                 "
-        - "L0.6[1000,1100] 0ns 99b                                                                                   |-L0.6-| "
+        - "L0.3[400,500] 0ns 50b                                    |-L0.3-|                                                  "
+        - "L0.2[200,300] 0ns 50b                    |-L0.2-|                                                                  "
+        - "L0.1[0,100] 0ns 50b      |-L0.1-|                                                                                  "
+        - "L0.4[600,700] 0ns 50b                                                     |-L0.4-|                                 "
+        - "L0.5[800,900] 0ns 50b                                                                     |-L0.5-|                 "
+        - "L0.6[1000,1100] 0ns 49b                                                                                   |-L0.6-| "
         - "L1                                                                                                                 "
-        - "L1.11[250,350] 0ns 100b                      |L1.11-|                                                              "
-        - "L1.12[650,750] 0ns 100b                                                       |L1.12-|                             "
+        - "L1.11[250,350] 0ns 50b                       |L1.11-|                                                              "
+        - "L1.12[650,750] 0ns 50b                                                        |L1.12-|                             "
         "###
         );
 
         let split = UpgradeSplit::new(MAX_SIZE);
-        let (files_to_compact, files_to_upgrade) =
-            split.apply(files, CompactionLevel::FileNonOverlapped);
+        let (files_to_compact, files_to_upgrade) = split.apply(
+            files,
+            CompactionLevel::FileNonOverlapped,
+            create_fake_partition_id(),
+        );
 
         insta::assert_yaml_snapshot!(
             format_files_split("files_to_compact", &files_to_compact, "files_to_upgrade", &files_to_upgrade),
@@ -838,16 +892,16 @@ mod tests {
         ---
         - files_to_compact
         - "L0                                                                                                                 "
-        - "L0.6[1000,1100] 0ns 99b                                                                                  |--L0.6--|"
-        - "L0.4[600,700] 0ns 100b                                           |--L0.4--|                                        "
-        - "L0.2[200,300] 0ns 100b   |--L0.2--|                                                                                "
-        - "L0.3[400,500] 0ns 100b                       |--L0.3--|                                                            "
-        - "L0.5[800,900] 0ns 100b                                                               |--L0.5--|                    "
+        - "L0.6[1000,1100] 0ns 49b                                                                                  |--L0.6--|"
+        - "L0.4[600,700] 0ns 50b                                            |--L0.4--|                                        "
+        - "L0.2[200,300] 0ns 50b    |--L0.2--|                                                                                "
+        - "L0.3[400,500] 0ns 50b                        |--L0.3--|                                                            "
+        - "L0.5[800,900] 0ns 50b                                                                |--L0.5--|                    "
         - "L1                                                                                                                 "
-        - "L1.11[250,350] 0ns 100b       |-L1.11--|                                                                           "
-        - "L1.12[650,750] 0ns 100b                                               |-L1.12--|                                   "
+        - "L1.11[250,350] 0ns 50b        |-L1.11--|                                                                           "
+        - "L1.12[650,750] 0ns 50b                                                |-L1.12--|                                   "
         - files_to_upgrade
-        - "L0, all files 100b                                                                                                 "
+        - "L0, all files 50b                                                                                                  "
         - "L0.1[0,100] 0ns          |------------------------------------------L0.1------------------------------------------|"
         "###
         );

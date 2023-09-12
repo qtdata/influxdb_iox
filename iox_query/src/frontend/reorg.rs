@@ -4,16 +4,16 @@ use std::sync::Arc;
 
 use arrow::datatypes::Field;
 use datafusion::{
-    logical_expr::{LogicalPlan, LogicalPlanBuilder},
+    logical_expr::LogicalPlan,
     prelude::{col, lit_timestamp_nano},
 };
 use observability_deps::tracing::debug;
 use schema::{sort::SortKey, Schema, TIME_COLUMN_NAME};
 
-use crate::{exec::make_stream_split, util::logical_sort_key_exprs, QueryChunk};
+use crate::{
+    exec::make_stream_split, provider::ProviderBuilder, util::logical_sort_key_exprs, QueryChunk,
+};
 use snafu::{ResultExt, Snafu};
-
-use super::common::ScanPlanBuilder;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -25,11 +25,6 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
-    #[snafu(display("Reorg planner got error building scan: {}", source))]
-    BuildingScan {
-        source: crate::frontend::common::Error,
-    },
-
     #[snafu(display(
         "Reorg planner got error adding creating scan for {}: {}",
         table_name,
@@ -37,7 +32,7 @@ pub enum Error {
     ))]
     CreatingScan {
         table_name: String,
-        source: super::common::Error,
+        source: crate::provider::Error,
     },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -80,21 +75,27 @@ impl ReorgPlanner {
     where
         I: IntoIterator<Item = Arc<dyn QueryChunk>>,
     {
-        let scan_plan = ScanPlanBuilder::new(table_name, schema)
-            .with_chunks(chunks)
-            .enable_deduplication(false)
-            .build()
-            .context(BuildingScanSnafu)?;
+        let mut builder = ProviderBuilder::new(Arc::clone(&table_name), schema.clone())
+            .with_enable_deduplication(false);
 
-        let plan = scan_plan.plan_builder.build()?;
+        for chunk in chunks {
+            builder = builder.add_chunk(chunk);
+        }
+
+        let provider = builder.build().context(CreatingScanSnafu {
+            table_name: table_name.as_ref(),
+        })?;
+        let plan_builder = Arc::new(provider)
+            .into_logical_plan_builder()
+            .context(BuildingPlanSnafu)?;
         let sort_expr = logical_sort_key_exprs(&output_sort_key);
-        let plan = LogicalPlanBuilder::from(plan)
+        let plan = plan_builder
             .sort(sort_expr)
             .context(BuildingPlanSnafu)?
             .build()
             .context(BuildingPlanSnafu)?;
 
-        debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
+        debug!(table_name=table_name.as_ref(), plan=%plan.display_indent_schema(),
                "created compact plan for table");
 
         Ok(plan)
@@ -190,14 +191,21 @@ impl ReorgPlanner {
             .find(|c| time_columns.contains(c))
             .expect("a time column is needed")[..];
 
-        let scan_plan = ScanPlanBuilder::new(table_name, schema)
-            .with_chunks(chunks)
-            .enable_deduplication(false)
-            .build()
-            .context(BuildingScanSnafu)?;
-        let plan = scan_plan.plan_builder.build().context(BuildingPlanSnafu)?;
+        let mut builder = ProviderBuilder::new(Arc::clone(&table_name), schema.clone())
+            .with_enable_deduplication(false);
+
+        for chunk in chunks {
+            builder = builder.add_chunk(chunk);
+        }
+
+        let provider = builder.build().context(CreatingScanSnafu {
+            table_name: table_name.as_ref(),
+        })?;
+        let plan_builder = Arc::new(provider)
+            .into_logical_plan_builder()
+            .context(BuildingPlanSnafu)?;
         let sort_expr = logical_sort_key_exprs(&output_sort_key);
-        let plan = LogicalPlanBuilder::from(plan)
+        let plan = plan_builder
             .sort(sort_expr)
             .context(BuildingPlanSnafu)?
             .build()
@@ -225,7 +233,7 @@ impl ReorgPlanner {
         }
         let plan = make_stream_split(plan, split_exprs);
 
-        debug!(table_name=scan_plan.provider.table_name(), plan=%plan.display_indent_schema(),
+        debug!(table_name=table_name.as_ref(), plan=%plan.display_indent_schema(),
                "created split plan for table");
 
         Ok(plan)

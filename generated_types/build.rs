@@ -57,7 +57,10 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         catalog_path.join("service.proto"),
         compactor_path.join("service.proto"),
         delete_path.join("service.proto"),
-        gossip_path.join("message.proto"),
+        gossip_path.join("compaction.proto"),
+        gossip_path.join("parquet_file.proto"),
+        gossip_path.join("schema.proto"),
+        gossip_path.join("schema_sync.proto"),
         ingester_path.join("parquet_metadata.proto"),
         ingester_path.join("persist.proto"),
         ingester_path.join("write.proto"),
@@ -95,7 +98,8 @@ fn generate_grpc_types(root: &Path) -> Result<()> {
         .extern_path(".google.protobuf", "::pbjson_types")
         .btree_map([
             ".influxdata.iox.ingester.v1.IngesterQueryResponseMetadata.unpersisted_partitions",
-        ]);
+        ])
+        .type_attribute(".influxdata.iox.partition_template", "#[derive(Hash)]");
 
     let descriptor_path = PathBuf::from(env::var("OUT_DIR").unwrap()).join("proto_descriptor.bin");
     tonic_build::configure()

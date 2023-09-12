@@ -1,5 +1,7 @@
-use gossip::{GossipHandle, NopDispatcher};
+use data_types::ParquetFile;
+use gossip::{NopDispatcher, TopicInterests};
 
+use gossip_parquet_file::tx::ParquetFileTx;
 /// This needs to be pub for the benchmarks but should not be used outside the crate.
 #[cfg(feature = "benches")]
 pub use wal_replay::*;
@@ -14,6 +16,7 @@ use backoff::BackoffConfig;
 use futures::{future::Shared, Future, FutureExt};
 use generated_types::influxdata::iox::{
     catalog::v1::catalog_service_server::CatalogService,
+    gossip::Topic,
     ingester::v1::{persist_service_server::PersistService, write_service_server::WriteService},
 };
 use iox_catalog::interface::Catalog;
@@ -30,17 +33,19 @@ use crate::{
     buffer_tree::{
         namespace::name_resolver::{NamespaceNameProvider, NamespaceNameResolver},
         partition::resolver::{
-            CatalogPartitionResolver, CoalescePartitionResolver, PartitionCache, PartitionProvider,
+            CatalogPartitionResolver, CoalescePartitionResolver, OldPartitionBloomFilter,
+            PartitionCache, PartitionProvider,
         },
         table::metadata_resolver::{TableProvider, TableResolver},
         BufferTree,
     },
     dml_sink::{instrumentation::DmlSinkInstrumentation, tracing::DmlSinkTracing},
+    gossip::persist_parquet::ParquetFileNotification,
     ingest_state::IngestState,
     ingester_id::IngesterId,
     persist::{
-        file_metrics::ParquetFileInstrumentation, handle::PersistHandle,
-        hot_partitions::HotPartitionPersister,
+        completion_observer::MaybeLayer, file_metrics::ParquetFileInstrumentation,
+        handle::PersistHandle, hot_partitions::HotPartitionPersister,
     },
     query::{
         exec_instrumentation::QueryExecInstrumentation,
@@ -49,7 +54,10 @@ use crate::{
     server::grpc::GrpcDelegate,
     timestamp_oracle::TimestampOracle,
     wal::{
-        reference_tracker::WalReferenceHandle, rotate_task::periodic_rotation, wal_sink::WalSink,
+        disk_full_protection::{self, guard_disk_capacity},
+        reference_tracker::WalReferenceHandle,
+        rotate_task::periodic_rotation,
+        wal_sink::WalSink,
     },
 };
 
@@ -111,9 +119,6 @@ pub struct IngesterGuard<T> {
     /// The task handle executing the graceful shutdown once triggered.
     graceful_shutdown_handler: tokio::task::JoinHandle<()>,
     shutdown_complete: Shared<oneshot::Receiver<()>>,
-
-    /// An optional handle to the gossip sub-system, if running.
-    gossip_handle: Option<GossipHandle>,
 }
 
 impl<T> IngesterGuard<T>
@@ -170,6 +175,10 @@ pub enum InitError {
     /// the internal cache.
     #[error("failed to pre-warm partition cache: {0}")]
     PreWarmPartitions(iox_catalog::interface::Error),
+
+    /// A catalog error occurred while fetching the old-style partitions for the bloom filter.
+    #[error("failed to fetch old-style partitions: {0}")]
+    FetchOldStylePartitions(iox_catalog::interface::Error),
 
     /// An error initialising the WAL.
     #[error("failed to initialise write-ahead log: {0}")]
@@ -307,10 +316,28 @@ where
         .await
         .map_err(InitError::PreWarmPartitions)?;
 
-    // Build the partition provider, wrapped in the partition cache and request
-    // coalescer.
+    // Fetch all the currently-existing old-style partitions to be put into a bloom filter that
+    // determines if we need to resolve a partition (potentially making a catalog query) or not.
+    let old_style = catalog
+        .repositories()
+        .await
+        .partitions()
+        .list_old_style()
+        .await
+        .map_err(InitError::FetchOldStylePartitions)?;
+
+    // Build the partition provider, wrapped in the old partition bloom filter, partition cache,
+    // and request coalescer.
     let partition_provider = CatalogPartitionResolver::new(Arc::clone(&catalog));
     let partition_provider = CoalescePartitionResolver::new(Arc::new(partition_provider));
+    let partition_provider = OldPartitionBloomFilter::new(
+        partition_provider,
+        Arc::clone(&catalog),
+        BackoffConfig::default(),
+        persist_background_fetch_time,
+        Arc::clone(&metrics),
+        old_style,
+    );
     let partition_provider = PartitionCache::new(
         partition_provider,
         recent_partitions,
@@ -331,9 +358,44 @@ where
         .await
         .map_err(InitError::WalInit)?;
 
+    // Start defining the chain of persist completion observers so it can be
+    // layered in gossip handlers if needed.
+    //
     // Prepare the WAL segment reference tracker
     let (wal_reference_handle, wal_reference_actor) =
         WalReferenceHandle::new(Arc::clone(&wal), &metrics);
+    // Add file metric instrumentation.
+    let persist_observer = ParquetFileInstrumentation::new(wal_reference_handle.clone(), &metrics);
+
+    // Optionally start the gossip subsystem and layer on the parquet file
+    // gossip handler.
+    let persist_observer = match gossip {
+        GossipConfig::Disabled => {
+            info!("gossip disabled");
+            MaybeLayer::Without(persist_observer)
+        }
+        GossipConfig::Enabled { bind_addr, peers } => {
+            // Start the gossip sub-system, which logs during init.
+            let handle = gossip::Builder::<_, Topic>::new(
+                peers,
+                NopDispatcher::default(),
+                Arc::clone(&metrics),
+            )
+            // Configure the ingester to ignore all user payloads, only acting
+            // as a gossip peer exchange seed and sender of messages.
+            .with_topic_filter(TopicInterests::default())
+            .bind(bind_addr)
+            .await
+            .map_err(InitError::GossipBind)?;
+
+            let persist_observer = ParquetFileNotification::new(
+                persist_observer,
+                ParquetFileTx::<ParquetFile>::new(handle),
+            );
+
+            MaybeLayer::With(persist_observer)
+        }
+    };
 
     // Spawn the persist workers to compact partition data, convert it into
     // Parquet files, and upload them to object storage.
@@ -344,10 +406,7 @@ where
         persist_executor,
         object_store,
         Arc::clone(&catalog),
-        // Register a post-persistence observer that emits Parquet file
-        // attributes as metrics, and notifies the WAL segment reference tracker of
-        // completed persist actions.
-        ParquetFileInstrumentation::new(wal_reference_handle.clone(), &metrics),
+        persist_observer,
         &metrics,
     );
     let persist_handle = Arc::new(persist_handle);
@@ -382,9 +441,23 @@ where
 
     // Initialize disk metrics to emit disk capacity / free statistics for the
     // WAL directory.
-    let (disk_metric_task, _snapshot_rx) = DiskSpaceMetrics::new(wal_directory, &metrics)
+    let (disk_metric_task, snapshot_rx) = DiskSpaceMetrics::new(wal_directory, &metrics)
         .expect("failed to resolve WAL directory to disk");
     let disk_metric_task = tokio::task::spawn(disk_metric_task.run());
+    // Spawn the disk full protection task, with values fed from the disk space
+    // metric collection task. This importantly doesn't leak the task, as it will
+    // shut itself down when the disk metric task's snapshot sender is dropped and
+    // the receiver is disconnected.
+    tokio::spawn(guard_disk_capacity(
+        snapshot_rx,
+        Arc::clone(&ingest_state),
+        disk_full_protection::WalPersister::new(
+            Arc::clone(&wal),
+            wal_reference_handle.clone(),
+            Arc::clone(&buffer),
+            Arc::clone(&persist_handle),
+        ),
+    ));
 
     // Replay the WAL log files, if any.
     let max_sequence_number =
@@ -451,23 +524,6 @@ where
         wal_reference_handle,
     ));
 
-    // Optionally start the gossip subsystem
-    let gossip_handle = match gossip {
-        GossipConfig::Disabled => {
-            info!("gossip disabled");
-            None
-        }
-        GossipConfig::Enabled { bind_addr, peers } => {
-            // Start the gossip sub-system, which logs during init.
-            let handle =
-                gossip::Builder::new(peers, NopDispatcher::default(), Arc::clone(&metrics))
-                    .bind(bind_addr)
-                    .await
-                    .map_err(InitError::GossipBind)?;
-            Some(handle)
-        }
-    };
-
     Ok(IngesterGuard {
         rpc: GrpcDelegate::new(
             Arc::new(write_path),
@@ -484,6 +540,5 @@ where
         disk_metric_task,
         graceful_shutdown_handler: shutdown_task,
         shutdown_complete: shutdown_rx.shared(),
-        gossip_handle,
     })
 }

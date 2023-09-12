@@ -1,5 +1,7 @@
 //! Types having to do with partitions.
 
+use crate::SortedColumnSet;
+
 use super::{TableId, Timestamp};
 
 use schema::sort::SortKey;
@@ -93,6 +95,61 @@ impl TransitionPartitionId {
     /// value doesn't matter. Public and not test-only so that other crates' tests can use this.
     pub fn arbitrary_for_testing() -> Self {
         Self::new(TableId::new(0), &PartitionKey::from("arbitrary"))
+    }
+}
+
+/// Errors deserialising protobuf representations of [`TransitionPartitionId`].
+#[derive(Debug, Error)]
+pub enum PartitionIdProtoError {
+    /// The proto type does not contain an ID.
+    #[error("no id specified for partition id")]
+    NoId,
+
+    /// The specified hash ID is invalid.
+    #[error(transparent)]
+    InvalidHashId(#[from] PartitionHashIdError),
+}
+
+/// Serialise a [`TransitionPartitionId`] to a protobuf representation.
+impl From<TransitionPartitionId>
+    for generated_types::influxdata::iox::catalog::v1::PartitionIdentifier
+{
+    fn from(value: TransitionPartitionId) -> Self {
+        use generated_types::influxdata::iox::catalog::v1 as proto;
+        match value {
+            TransitionPartitionId::Deprecated(id) => proto::PartitionIdentifier {
+                id: Some(proto::partition_identifier::Id::CatalogId(id.get())),
+            },
+            TransitionPartitionId::Deterministic(hash) => proto::PartitionIdentifier {
+                id: Some(proto::partition_identifier::Id::HashId(
+                    hash.as_bytes().to_owned(),
+                )),
+            },
+        }
+    }
+}
+
+/// Deserialise a [`TransitionPartitionId`] from a protobuf representation.
+impl TryFrom<generated_types::influxdata::iox::catalog::v1::PartitionIdentifier>
+    for TransitionPartitionId
+{
+    type Error = PartitionIdProtoError;
+
+    fn try_from(
+        value: generated_types::influxdata::iox::catalog::v1::PartitionIdentifier,
+    ) -> Result<Self, Self::Error> {
+        use generated_types::influxdata::iox::catalog::v1 as proto;
+
+        let id = value.id.ok_or(PartitionIdProtoError::NoId)?;
+
+        Ok(match id {
+            proto::partition_identifier::Id::CatalogId(v) => {
+                TransitionPartitionId::Deprecated(PartitionId::new(v))
+            }
+            proto::partition_identifier::Id::HashId(hash) => {
+                TransitionPartitionId::Deterministic(PartitionHashId::try_from(hash.as_slice())?)
+            }
+        })
     }
 }
 
@@ -223,7 +280,7 @@ pub struct PartitionHashId(Arc<[u8; PARTITION_HASH_ID_SIZE_BYTES]>);
 
 impl std::fmt::Display for PartitionHashId {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        for byte in self.0.iter() {
+        for byte in &*self.0 {
             write!(f, "{:02x}", byte)?;
         }
         Ok(())
@@ -358,7 +415,13 @@ pub struct Partition {
     pub table_id: TableId,
     /// the string key of the partition
     pub partition_key: PartitionKey,
+
+    // TODO: remove this field once the sort_key_ids is fully imlemented
     /// vector of column names that describes how *every* parquet file
+    /// in this [`Partition`] is sorted.
+    pub sort_key: Vec<String>,
+
+    /// vector of column ids that describes how *every* parquet file
     /// in this [`Partition`] is sorted. The sort_key contains all the
     /// primary key (PK) columns that have been persisted, and nothing
     /// else. The PK columns are all `tag` columns and the `time`
@@ -383,7 +446,7 @@ pub struct Partition {
     /// For example, updating `A,B,C` to either `A,D,B,C` or `A,B,C,D`
     /// is legal. However, updating to `A,C,D,B` is not because the
     /// relative order of B and C have been reversed.
-    pub sort_key: Vec<String>,
+    pub sort_key_ids: Option<SortedColumnSet>,
 
     /// The time at which the newest file of the partition is created
     pub new_file_at: Option<Timestamp>,
@@ -399,6 +462,7 @@ impl Partition {
         table_id: TableId,
         partition_key: PartitionKey,
         sort_key: Vec<String>,
+        sort_key_ids: Option<SortedColumnSet>,
         new_file_at: Option<Timestamp>,
     ) -> Self {
         let hash_id = PartitionHashId::new(table_id, &partition_key);
@@ -408,6 +472,7 @@ impl Partition {
             table_id,
             partition_key,
             sort_key,
+            sort_key_ids,
             new_file_at,
         }
     }
@@ -424,6 +489,7 @@ impl Partition {
         table_id: TableId,
         partition_key: PartitionKey,
         sort_key: Vec<String>,
+        sort_key_ids: Option<SortedColumnSet>,
         new_file_at: Option<Timestamp>,
     ) -> Self {
         Self {
@@ -432,6 +498,7 @@ impl Partition {
             table_id,
             partition_key,
             sort_key,
+            sort_key_ids,
             new_file_at,
         }
     }
@@ -447,6 +514,8 @@ impl Partition {
         self.hash_id.as_ref()
     }
 
+    // TODO: remove this function after all PRs that teach compactor, ingester,
+    // and querier to use sort_key_ids are merged.
     /// The sort key for the partition, if present, structured as a `SortKey`
     pub fn sort_key(&self) -> Option<SortKey> {
         if self.sort_key.is_empty() {
@@ -455,11 +524,32 @@ impl Partition {
 
         Some(SortKey::from_columns(self.sort_key.iter().map(|s| &**s)))
     }
+
+    /// The sort_key_ids if present
+    pub fn sort_key_ids(&self) -> Option<&SortedColumnSet> {
+        self.sort_key_ids.as_ref()
+    }
+
+    /// The sort_key_ids if present and not empty
+    pub fn sort_key_ids_none_if_empty(&self) -> Option<SortedColumnSet> {
+        match self.sort_key_ids.as_ref() {
+            None => None,
+            Some(sort_key_ids) => {
+                if sort_key_ids.is_empty() {
+                    None
+                } else {
+                    Some(sort_key_ids.clone())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    use assert_matches::assert_matches;
     use proptest::{prelude::*, proptest};
 
     /// A fixture test asserting the deterministic partition ID generation
@@ -479,14 +569,27 @@ mod tests {
         );
     }
 
+    prop_compose! {
+        /// Return an arbitrary [`TransitionPartitionId`] with a randomised ID
+        /// value.
+        pub fn arbitrary_partition_id()(
+            use_hash in any::<bool>(),
+            row_id in any::<i64>(),
+            hash_id in any::<[u8; PARTITION_HASH_ID_SIZE_BYTES]>()
+        ) -> TransitionPartitionId {
+            match use_hash {
+                true => TransitionPartitionId::Deterministic(PartitionHashId(hash_id.into())),
+                false => TransitionPartitionId::Deprecated(PartitionId::new(row_id)),
+            }
+        }
+    }
+
     proptest! {
         #[test]
         fn partition_hash_id_representations(
             table_id in 0..i64::MAX,
-            partition_key in any::<String>(),
+            partition_key in ".+",
         ) {
-            prop_assume!(!partition_key.is_empty());
-
             let table_id = TableId::new(table_id);
             let partition_key = PartitionKey::from(partition_key);
 
@@ -519,5 +622,47 @@ mod tests {
             let from_string = PartitionHashId::try_from(&bytes_from_string[..]).unwrap();
             assert_eq!(from_string, partition_hash_id);
         }
+
+        /// Assert a [`TransitionPartitionId`] is round-trippable through proto
+        /// serialisation.
+        #[test]
+        fn prop_partition_id_proto_round_trip(id in arbitrary_partition_id()) {
+            use generated_types::influxdata::iox::catalog::v1 as proto;
+
+            // Encoding is infallible
+            let encoded = proto::PartitionIdentifier::from(id.clone());
+
+            // Decoding a valid ID is infallible.
+            let decoded = TransitionPartitionId::try_from(encoded).unwrap();
+
+            // The deserialised value must match the input (round trippable)
+            assert_eq!(decoded, id);
+        }
+    }
+
+    #[test]
+    fn test_proto_no_id() {
+        use generated_types::influxdata::iox::catalog::v1 as proto;
+
+        let msg = proto::PartitionIdentifier { id: None };
+
+        assert_matches!(
+            TransitionPartitionId::try_from(msg),
+            Err(PartitionIdProtoError::NoId)
+        );
+    }
+
+    #[test]
+    fn test_proto_bad_hash() {
+        use generated_types::influxdata::iox::catalog::v1 as proto;
+
+        let msg = proto::PartitionIdentifier {
+            id: Some(proto::partition_identifier::Id::HashId(vec![42])),
+        };
+
+        assert_matches!(
+            TransitionPartitionId::try_from(msg),
+            Err(PartitionIdProtoError::InvalidHashId(_))
+        );
     }
 }

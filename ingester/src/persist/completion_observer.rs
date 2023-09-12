@@ -2,11 +2,9 @@ use std::{fmt::Debug, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use data_types::{
-    sequence_number_set::SequenceNumberSet, NamespaceId, ParquetFileParams, TableId,
+    sequence_number_set::SequenceNumberSet, NamespaceId, ParquetFile, TableId,
     TransitionPartitionId,
 };
-
-use crate::wal::reference_tracker::WalReferenceHandle;
 
 /// An abstract observer of persistence completion events.
 ///
@@ -27,10 +25,10 @@ pub trait PersistCompletionObserver: Send + Sync + Debug {
 }
 
 /// A set of details describing the persisted data.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct CompletedPersist {
     /// The catalog metadata for the persist operation.
-    meta: ParquetFileParams,
+    meta: ParquetFile,
 
     /// The [`SequenceNumberSet`] of the persisted data.
     sequence_numbers: SequenceNumberSet,
@@ -38,7 +36,7 @@ pub struct CompletedPersist {
 
 impl CompletedPersist {
     /// Construct a new completion notification.
-    pub(crate) fn new(meta: ParquetFileParams, sequence_numbers: SequenceNumberSet) -> Self {
+    pub(crate) fn new(meta: ParquetFile, sequence_numbers: SequenceNumberSet) -> Self {
         Self {
             meta,
             sequence_numbers,
@@ -106,6 +104,11 @@ impl CompletedPersist {
         max.checked_duration_since(min)
             .expect("parquet min/max file timestamp difference is negative")
     }
+
+    /// Return the [`ParquetFile`] record inserted into the catalog.
+    pub fn file_record(&self) -> &ParquetFile {
+        &self.meta
+    }
 }
 
 /// A no-op implementation of the [`PersistCompletionObserver`] trait.
@@ -129,10 +132,26 @@ where
     }
 }
 
+/// An optional [`PersistCompletionObserver`] decorator layer.
+#[derive(Debug)]
+pub enum MaybeLayer<T, U> {
+    /// With the optional layer.
+    With(T),
+    /// Without the operational layer.
+    Without(U),
+}
+
 #[async_trait]
-impl PersistCompletionObserver for WalReferenceHandle {
+impl<T, U> PersistCompletionObserver for MaybeLayer<T, U>
+where
+    T: PersistCompletionObserver,
+    U: PersistCompletionObserver,
+{
     async fn persist_complete(&self, note: Arc<CompletedPersist>) {
-        self.enqueue_persist_notification(note).await
+        match self {
+            Self::With(v) => T::persist_complete(v, note).await,
+            Self::Without(v) => U::persist_complete(v, note).await,
+        }
     }
 }
 
@@ -170,10 +189,12 @@ mod tests {
     use crate::test_util::{
         ARBITRARY_NAMESPACE_ID, ARBITRARY_TABLE_ID, ARBITRARY_TRANSITION_PARTITION_ID,
     };
-    use data_types::{ColumnId, ColumnSet, SequenceNumber, Timestamp};
+    use data_types::{ColumnId, ColumnSet, ParquetFileId, SequenceNumber, Timestamp};
 
-    fn arbitrary_file_meta() -> ParquetFileParams {
-        ParquetFileParams {
+    fn arbitrary_file_meta() -> ParquetFile {
+        ParquetFile {
+            id: ParquetFileId::new(42),
+            to_delete: None,
             namespace_id: ARBITRARY_NAMESPACE_ID,
             table_id: ARBITRARY_TABLE_ID,
             partition_id: ARBITRARY_TRANSITION_PARTITION_ID.clone(),

@@ -18,7 +18,7 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 
 # crates.io dependencies in alphabetical order.
 async-trait = "0.1"
-base64 = "0.21.2"
+base64 = "0.21.3"
 snafu = "0.7"
 tonic = { workspace = true }
 
@@ -27,7 +27,7 @@ assert_matches = "1.5.0"
 parking_lot = "0.12.1"
 paste = "1.0.14"
 test_helpers_end_to_end = { path = "../test_helpers_end_to_end" }
-tokio = "1.31.0"
+tokio = "1.32.0"
 
 [features]
 http = ["dep:http"]

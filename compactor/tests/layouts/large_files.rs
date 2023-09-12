@@ -628,81 +628,77 @@ async fn two_large_files_total_over_max_compact_size_start_l0() {
     - "L1.2[1,1000] 9ns         |-----------------------------------------L1.2------------------------------------------| "
     - "WARNING: file L0.1[0,1000] 10ns 150mb exceeds soft limit 100mb by more than 50%"
     - "WARNING: file L1.2[1,1000] 9ns 150mb exceeds soft limit 100mb by more than 50%"
-    - "**** Simulation run 0, type=split(HighL0OverlapSingleFile)(split_times=[333, 666]). 1 Input Files, 150mb total:"
-    - "L1, all files 150mb                                                                                                "
-    - "L1.2[1,1000] 9ns         |------------------------------------------L1.2------------------------------------------|"
-    - "**** 3 Output Files (parquet_file_id not yet assigned), 150mb total:"
-    - "L1                                                                                                                 "
-    - "L1.?[1,333] 9ns 50mb     |-----------L1.?------------|                                                             "
-    - "L1.?[334,666] 9ns 50mb                                 |-----------L1.?------------|                               "
-    - "L1.?[667,1000] 9ns 50mb                                                              |------------L1.?------------|"
-    - "**** Simulation run 1, type=split(HighL0OverlapSingleFile)(split_times=[333, 666]). 1 Input Files, 150mb total:"
+    - "**** Simulation run 0, type=split(ReduceLargeFileSize)(split_times=[667]). 1 Input Files, 150mb total:"
     - "L0, all files 150mb                                                                                                "
     - "L0.1[0,1000] 10ns        |------------------------------------------L0.1------------------------------------------|"
-    - "**** 3 Output Files (parquet_file_id not yet assigned), 150mb total:"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 150mb total:"
     - "L0                                                                                                                 "
-    - "L0.?[0,333] 10ns 50mb    |-----------L0.?------------|                                                             "
-    - "L0.?[334,666] 10ns 50mb                                |-----------L0.?------------|                               "
-    - "L0.?[667,1000] 10ns 50mb                                                             |-----------L0.?------------| "
+    - "L0.?[0,667] 10ns 100mb   |---------------------------L0.?---------------------------|                              "
+    - "L0.?[668,1000] 10ns 50mb                                                             |-----------L0.?------------| "
+    - "**** Simulation run 1, type=split(ReduceLargeFileSize)(split_times=[667]). 1 Input Files, 150mb total:"
+    - "L1, all files 150mb                                                                                                "
+    - "L1.2[1,1000] 9ns         |------------------------------------------L1.2------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 150mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[1,667] 9ns 100mb    |---------------------------L1.?---------------------------|                              "
+    - "L1.?[668,1000] 9ns 50mb                                                              |-----------L1.?------------| "
     - "Committing partition 1:"
     - "  Soft Deleting 2 files: L0.1, L1.2"
-    - "  Creating 6 files"
-    - "**** Simulation run 2, type=split(CompactAndSplitOutput(FoundSubsetLessThanMaxCompactSize))(split_times=[334]). 4 Input Files, 200mb total:"
+    - "  Creating 4 files"
+    - "**** Simulation run 2, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[334]). 2 Input Files, 200mb total:"
     - "L0                                                                                                                 "
-    - "L0.6[0,333] 10ns 50mb    |-------------------L0.6--------------------|                                             "
-    - "L0.7[334,666] 10ns 50mb                                               |-------------------L0.7-------------------| "
+    - "L0.3[0,667] 10ns 100mb   |------------------------------------------L0.3------------------------------------------|"
     - "L1                                                                                                                 "
-    - "L1.3[1,333] 9ns 50mb     |-------------------L1.3-------------------|                                              "
-    - "L1.4[334,666] 9ns 50mb                                                |-------------------L1.4-------------------| "
+    - "L1.5[1,667] 9ns 100mb    |-----------------------------------------L1.5------------------------------------------| "
     - "**** 2 Output Files (parquet_file_id not yet assigned), 200mb total:"
     - "L1                                                                                                                 "
     - "L1.?[0,334] 10ns 100mb   |-------------------L1.?--------------------|                                             "
-    - "L1.?[335,666] 10ns 99mb                                               |-------------------L1.?-------------------| "
+    - "L1.?[335,667] 10ns 100mb                                              |-------------------L1.?-------------------| "
     - "Committing partition 1:"
-    - "  Soft Deleting 4 files: L1.3, L1.4, L0.6, L0.7"
+    - "  Soft Deleting 2 files: L0.3, L1.5"
     - "  Creating 2 files"
     - "**** Simulation run 3, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[933]). 2 Input Files, 100mb total:"
     - "L0                                                                                                                 "
-    - "L0.8[667,1000] 10ns 50mb |------------------------------------------L0.8------------------------------------------|"
+    - "L0.4[668,1000] 10ns 50mb |------------------------------------------L0.4------------------------------------------|"
     - "L1                                                                                                                 "
-    - "L1.5[667,1000] 9ns 50mb  |------------------------------------------L1.5------------------------------------------|"
+    - "L1.6[668,1000] 9ns 50mb  |------------------------------------------L1.6------------------------------------------|"
     - "**** 2 Output Files (parquet_file_id not yet assigned), 100mb total:"
     - "L1                                                                                                                 "
-    - "L1.?[667,933] 10ns 80mb  |--------------------------------L1.?---------------------------------|                   "
+    - "L1.?[668,933] 10ns 80mb  |--------------------------------L1.?---------------------------------|                   "
     - "L1.?[934,1000] 10ns 20mb                                                                         |-----L1.?------| "
     - "Committing partition 1:"
-    - "  Soft Deleting 2 files: L1.5, L0.8"
+    - "  Soft Deleting 2 files: L0.4, L1.6"
     - "  Creating 2 files"
-    - "**** Simulation run 4, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[669]). 3 Input Files, 200mb total:"
-    - "L1                                                                                                                 "
-    - "L1.10[335,666] 10ns 99mb |------------------L1.10-------------------|                                              "
-    - "L1.12[934,1000] 10ns 20mb                                                                                 |L1.12-| "
-    - "L1.11[667,933] 10ns 80mb                                             |--------------L1.11---------------|          "
-    - "**** 2 Output Files (parquet_file_id not yet assigned), 200mb total:"
+    - "**** Simulation run 4, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[986]). 1 Input Files, 20mb total:"
+    - "L1, all files 20mb                                                                                                 "
+    - "L1.10[934,1000] 10ns     |-----------------------------------------L1.10------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 20mb total:"
     - "L2                                                                                                                 "
-    - "L2.?[335,669] 10ns 100mb |-------------------L2.?--------------------|                                             "
-    - "L2.?[670,1000] 10ns 99mb                                              |-------------------L2.?-------------------| "
+    - "L2.?[934,986] 10ns 16mb  |--------------------------------L2.?--------------------------------|                    "
+    - "L2.?[987,1000] 10ns 4mb                                                                          |-----L2.?------| "
     - "Committing partition 1:"
-    - "  Soft Deleting 3 files: L1.10, L1.11, L1.12"
-    - "  Upgrading 1 files level to CompactionLevel::L2: L1.9"
+    - "  Soft Deleting 1 files: L1.10"
+    - "  Upgrading 3 files level to CompactionLevel::L2: L1.7, L1.8, L1.9"
     - "  Creating 2 files"
-    - "**** Final Output Files (800mb written)"
+    - "**** Final Output Files (620mb written)"
     - "L2                                                                                                                 "
-    - "L2.9[0,334] 10ns 100mb   |------------L2.9------------|                                                            "
-    - "L2.13[335,669] 10ns 100mb                              |-----------L2.13------------|                              "
-    - "L2.14[670,1000] 10ns 99mb                                                            |-----------L2.14-----------| "
+    - "L2.7[0,334] 10ns 100mb   |------------L2.7------------|                                                            "
+    - "L2.8[335,667] 10ns 100mb                               |-----------L2.8------------|                               "
+    - "L2.9[668,933] 10ns 80mb                                                              |--------L2.9---------|       "
+    - "L2.11[934,986] 10ns 16mb                                                                                     |L2.11|"
+    - "L2.12[987,1000] 10ns 4mb                                                                                         |L2.12|"
     "###
     );
 
     // Read all files including the soft deleted ones
     let output_files = setup.list_by_table().await;
-    assert_eq!(output_files.len(), 14);
+    assert_eq!(output_files.len(), 12);
 
     // Sort the files by id
     let mut output_files = output_files;
     output_files.sort_by(|a, b| a.id.cmp(&b.id));
 
-    // Verify all L0 files created by splitting must have  value of max_l0_created_at 10 which is the value of the riginal L0
+    // Verify all L0 files created by splitting must have  value of max_l0_created_at 10 which is the value of the original L0
     // Note: this test make created_test deterministic and 1 which we do not care much about
     for file in &output_files {
         if file.compaction_level == CompactionLevel::Initial {
@@ -727,7 +723,7 @@ async fn target_too_large_1() {
     //   . one very large overlapped L2
 
     // size of l1s & l2
-    let l1_sizes = vec![53 * ONE_MB, 45 * ONE_MB, 5 * ONE_MB];
+    let l1_sizes = [53 * ONE_MB, 45 * ONE_MB, 5 * ONE_MB];
     let l2_size = 253 * ONE_MB;
 
     // L2 overlapped with the first L1
@@ -840,7 +836,7 @@ async fn target_too_large_2() {
     //   . one very large overlapped L2
 
     // size of l1s & l2
-    let l1_sizes = vec![69 * ONE_MB, 50 * ONE_MB];
+    let l1_sizes = [69 * ONE_MB, 50 * ONE_MB];
     let l2_size = 232 * ONE_MB;
 
     // L2 overlapped with both L1s
@@ -947,7 +943,7 @@ async fn start_too_large_similar_time_range() {
     //   . total size = L1 & L2 > max_compact_size
 
     // size of l1 & l2 respectively
-    let sizes = vec![250 * ONE_MB, 52 * ONE_MB];
+    let sizes = [250 * ONE_MB, 52 * ONE_MB];
 
     for i in 1..=2 {
         setup
@@ -1061,7 +1057,7 @@ async fn start_too_large_small_time_range() {
     //   . total size = L1 & L2 > max_compact_size
 
     // size of l1 & l2 respectively
-    let sizes = vec![250 * ONE_MB, 52 * ONE_MB];
+    let sizes = [250 * ONE_MB, 52 * ONE_MB];
 
     for i in 1..=2 {
         setup
@@ -1143,7 +1139,7 @@ async fn start_too_large_small_time_range_2() {
     //   . total size = L1 & L2 > max_compact_size
 
     // size of l1 & l2 respectively
-    let sizes = vec![250 * ONE_MB, 52 * ONE_MB];
+    let sizes = [250 * ONE_MB, 52 * ONE_MB];
 
     for i in 1..=2 {
         setup
@@ -1224,7 +1220,7 @@ async fn start_too_large_small_time_range_3() {
     //   . total size = L1 & L2 > max_compact_size
 
     // size of l1 & l2 respectively
-    let sizes = vec![250 * ONE_MB, 52 * ONE_MB];
+    let sizes = [250 * ONE_MB, 52 * ONE_MB];
 
     for i in 1..=2 {
         setup
@@ -1347,13 +1343,440 @@ async fn tiny_time_range() {
     - "L2                                                                                                                 "
     - "L2.2[1,1000] 5ns 52mb    |------------------------------------------L2.2------------------------------------------|"
     - "WARNING: file L1.1[1,2] 10ns 250mb exceeds soft limit 100mb by more than 50%"
-    - "SKIPPED COMPACTION for PartitionId(1): partition 1 has overlapped files that exceed max compact size limit 314572800. This may happen if a large amount of data has the same timestamp"
-    - "**** Final Output Files (0b written)"
-    - "L1                                                                                                                 "
-    - "L1.1[1,2] 10ns 250mb     |L1.1|                                                                                    "
+    - "**** Simulation run 0, type=split(ReduceLargeFileSize)(split_times=[1]). 1 Input Files, 250mb total:"
+    - "L1, all files 250mb                                                                                                "
+    - "L1.1[1,2] 10ns           |------------------------------------------L1.1------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 250mb total:"
+    - "L1, all files 125mb                                                                                                "
+    - "L1.?[1,1] 10ns           |L1.?|                                                                                    "
+    - "L1.?[2,2] 10ns                                                                                                     |L1.?|"
+    - "Committing partition 1:"
+    - "  Soft Deleting 1 files: L1.1"
+    - "  Creating 2 files"
+    - "**** Simulation run 1, type=split(StartLevelOverlapsTooBig)(split_times=[2]). 1 Input Files, 52mb total:"
+    - "L2, all files 52mb                                                                                                 "
+    - "L2.2[1,1000] 5ns         |------------------------------------------L2.2------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 52mb total:"
     - "L2                                                                                                                 "
-    - "L2.2[1,1000] 5ns 52mb    |------------------------------------------L2.2------------------------------------------|"
-    - "WARNING: file L1.1[1,2] 10ns 250mb exceeds soft limit 100mb by more than 50%"
+    - "L2.?[1,2] 5ns 106kb      |L2.?|                                                                                    "
+    - "L2.?[3,1000] 5ns 52mb    |-----------------------------------------L2.?------------------------------------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 1 files: L2.2"
+    - "  Creating 2 files"
+    - "**** Simulation run 2, type=compact(TotalSizeLessThanMaxCompactSize). 3 Input Files, 250mb total:"
+    - "L1                                                                                                                 "
+    - "L1.4[2,2] 10ns 125mb                                                                                               |L1.4|"
+    - "L1.3[1,1] 10ns 125mb     |L1.3|                                                                                    "
+    - "L2                                                                                                                 "
+    - "L2.5[1,2] 5ns 106kb      |------------------------------------------L2.5------------------------------------------|"
+    - "**** 1 Output Files (parquet_file_id not yet assigned), 250mb total:"
+    - "L2, all files 250mb                                                                                                "
+    - "L2.?[1,2] 10ns           |------------------------------------------L2.?------------------------------------------|"
+    - "Committing partition 1:"
+    - "  Soft Deleting 3 files: L1.3, L1.4, L2.5"
+    - "  Creating 1 files"
+    - "**** Final Output Files (552mb written)"
+    - "L2                                                                                                                 "
+    - "L2.6[3,1000] 5ns 52mb    |-----------------------------------------L2.6------------------------------------------| "
+    - "L2.7[1,2] 10ns 250mb     |L2.7|                                                                                    "
+    - "WARNING: file L2.7[1,2] 10ns 250mb exceeds soft limit 100mb by more than 50%"
+    "###
+    );
+}
+
+// This test simulates a situation where we vertically split 11 large L0s, into 7 files each, then another L0 file is written
+// which shifts the default split points.  The purpose of this test is to see if the compactor will adjust its split points
+// to the previusly used times.  Otherwise, write amplification will be significantly impacted.
+#[tokio::test]
+async fn pre_split_large_l0() {
+    test_helpers::maybe_start_logging();
+
+    let setup = layout_setup_builder()
+        .await
+        .with_max_desired_file_size_bytes(MAX_DESIRED_FILE_SIZE)
+        .with_required_split_times(vec![3568, 4852, 6136, 7420, 8704])
+        .build()
+        .await;
+
+    // L0s - assume they started as timestamp 1000 - 10000, with MAX_DESIRED_FILE_SIZE bytes and were split
+    for i in 0..=10 {
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(1000)
+                    .with_max_time(2284)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(2285)
+                    .with_max_time(3568)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(3569)
+                    .with_max_time(4852)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(4853)
+                    .with_max_time(6136)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(6137)
+                    .with_max_time(7420)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(7421)
+                    .with_max_time(8704)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+        setup
+            .partition
+            .create_parquet_file(
+                parquet_builder()
+                    .with_min_time(8705)
+                    .with_max_time(10000)
+                    .with_compaction_level(CompactionLevel::Initial)
+                    .with_max_l0_created_at(Time::from_timestamp_nanos(10000 + i))
+                    .with_file_size_bytes(MAX_DESIRED_FILE_SIZE / 7),
+            )
+            .await;
+    }
+
+    // after we split those, another L0 arrived with different time range, and shifted the default split points when resuming compaction
+    setup
+        .partition
+        .create_parquet_file(
+            parquet_builder()
+                .with_min_time(3000)
+                .with_max_time(13000)
+                .with_compaction_level(CompactionLevel::Initial)
+                .with_max_l0_created_at(Time::from_timestamp_nanos(11000))
+                .with_file_size_bytes(MAX_DESIRED_FILE_SIZE),
+        )
+        .await;
+
+    insta::assert_yaml_snapshot!(
+        run_layout_scenario(&setup).await,
+        @r###"
+    ---
+    - "**** Input Files "
+    - "L0                                                                                                                 "
+    - "L0.1[1000,2284] 10us 14mb|-L0.1--|                                                                                 "
+    - "L0.2[2285,3568] 10us 14mb         |-L0.2--|                                                                        "
+    - "L0.3[3569,4852] 10us 14mb                   |-L0.3--|                                                              "
+    - "L0.4[4853,6136] 10us 14mb                            |-L0.4--|                                                     "
+    - "L0.5[6137,7420] 10us 14mb                                      |-L0.5--|                                           "
+    - "L0.6[7421,8704] 10us 14mb                                                |-L0.6--|                                 "
+    - "L0.7[8705,10000] 10us 14mb                                                         |-L0.7--|                        "
+    - "L0.8[1000,2284] 10us 14mb|-L0.8--|                                                                                 "
+    - "L0.9[2285,3568] 10us 14mb         |-L0.9--|                                                                        "
+    - "L0.10[3569,4852] 10us 14mb                   |-L0.10-|                                                              "
+    - "L0.11[4853,6136] 10us 14mb                            |-L0.11-|                                                     "
+    - "L0.12[6137,7420] 10us 14mb                                      |-L0.12-|                                           "
+    - "L0.13[7421,8704] 10us 14mb                                                |-L0.13-|                                 "
+    - "L0.14[8705,10000] 10us 14mb                                                         |-L0.14-|                        "
+    - "L0.15[1000,2284] 10us 14mb|-L0.15-|                                                                                 "
+    - "L0.16[2285,3568] 10us 14mb         |-L0.16-|                                                                        "
+    - "L0.17[3569,4852] 10us 14mb                   |-L0.17-|                                                              "
+    - "L0.18[4853,6136] 10us 14mb                            |-L0.18-|                                                     "
+    - "L0.19[6137,7420] 10us 14mb                                      |-L0.19-|                                           "
+    - "L0.20[7421,8704] 10us 14mb                                                |-L0.20-|                                 "
+    - "L0.21[8705,10000] 10us 14mb                                                         |-L0.21-|                        "
+    - "L0.22[1000,2284] 10us 14mb|-L0.22-|                                                                                 "
+    - "L0.23[2285,3568] 10us 14mb         |-L0.23-|                                                                        "
+    - "L0.24[3569,4852] 10us 14mb                   |-L0.24-|                                                              "
+    - "L0.25[4853,6136] 10us 14mb                            |-L0.25-|                                                     "
+    - "L0.26[6137,7420] 10us 14mb                                      |-L0.26-|                                           "
+    - "L0.27[7421,8704] 10us 14mb                                                |-L0.27-|                                 "
+    - "L0.28[8705,10000] 10us 14mb                                                         |-L0.28-|                        "
+    - "L0.29[1000,2284] 10us 14mb|-L0.29-|                                                                                 "
+    - "L0.30[2285,3568] 10us 14mb         |-L0.30-|                                                                        "
+    - "L0.31[3569,4852] 10us 14mb                   |-L0.31-|                                                              "
+    - "L0.32[4853,6136] 10us 14mb                            |-L0.32-|                                                     "
+    - "L0.33[6137,7420] 10us 14mb                                      |-L0.33-|                                           "
+    - "L0.34[7421,8704] 10us 14mb                                                |-L0.34-|                                 "
+    - "L0.35[8705,10000] 10us 14mb                                                         |-L0.35-|                        "
+    - "L0.36[1000,2284] 10.01us 14mb|-L0.36-|                                                                                 "
+    - "L0.37[2285,3568] 10.01us 14mb         |-L0.37-|                                                                        "
+    - "L0.38[3569,4852] 10.01us 14mb                   |-L0.38-|                                                              "
+    - "L0.39[4853,6136] 10.01us 14mb                            |-L0.39-|                                                     "
+    - "L0.40[6137,7420] 10.01us 14mb                                      |-L0.40-|                                           "
+    - "L0.41[7421,8704] 10.01us 14mb                                                |-L0.41-|                                 "
+    - "L0.42[8705,10000] 10.01us 14mb                                                         |-L0.42-|                        "
+    - "L0.43[1000,2284] 10.01us 14mb|-L0.43-|                                                                                 "
+    - "L0.44[2285,3568] 10.01us 14mb         |-L0.44-|                                                                        "
+    - "L0.45[3569,4852] 10.01us 14mb                   |-L0.45-|                                                              "
+    - "L0.46[4853,6136] 10.01us 14mb                            |-L0.46-|                                                     "
+    - "L0.47[6137,7420] 10.01us 14mb                                      |-L0.47-|                                           "
+    - "L0.48[7421,8704] 10.01us 14mb                                                |-L0.48-|                                 "
+    - "L0.49[8705,10000] 10.01us 14mb                                                         |-L0.49-|                        "
+    - "L0.50[1000,2284] 10.01us 14mb|-L0.50-|                                                                                 "
+    - "L0.51[2285,3568] 10.01us 14mb         |-L0.51-|                                                                        "
+    - "L0.52[3569,4852] 10.01us 14mb                   |-L0.52-|                                                              "
+    - "L0.53[4853,6136] 10.01us 14mb                            |-L0.53-|                                                     "
+    - "L0.54[6137,7420] 10.01us 14mb                                      |-L0.54-|                                           "
+    - "L0.55[7421,8704] 10.01us 14mb                                                |-L0.55-|                                 "
+    - "L0.56[8705,10000] 10.01us 14mb                                                         |-L0.56-|                        "
+    - "L0.57[1000,2284] 10.01us 14mb|-L0.57-|                                                                                 "
+    - "L0.58[2285,3568] 10.01us 14mb         |-L0.58-|                                                                        "
+    - "L0.59[3569,4852] 10.01us 14mb                   |-L0.59-|                                                              "
+    - "L0.60[4853,6136] 10.01us 14mb                            |-L0.60-|                                                     "
+    - "L0.61[6137,7420] 10.01us 14mb                                      |-L0.61-|                                           "
+    - "L0.62[7421,8704] 10.01us 14mb                                                |-L0.62-|                                 "
+    - "L0.63[8705,10000] 10.01us 14mb                                                         |-L0.63-|                        "
+    - "L0.64[1000,2284] 10.01us 14mb|-L0.64-|                                                                                 "
+    - "L0.65[2285,3568] 10.01us 14mb         |-L0.65-|                                                                        "
+    - "L0.66[3569,4852] 10.01us 14mb                   |-L0.66-|                                                              "
+    - "L0.67[4853,6136] 10.01us 14mb                            |-L0.67-|                                                     "
+    - "L0.68[6137,7420] 10.01us 14mb                                      |-L0.68-|                                           "
+    - "L0.69[7421,8704] 10.01us 14mb                                                |-L0.69-|                                 "
+    - "L0.70[8705,10000] 10.01us 14mb                                                         |-L0.70-|                        "
+    - "L0.71[1000,2284] 10.01us 14mb|-L0.71-|                                                                                 "
+    - "L0.72[2285,3568] 10.01us 14mb         |-L0.72-|                                                                        "
+    - "L0.73[3569,4852] 10.01us 14mb                   |-L0.73-|                                                              "
+    - "L0.74[4853,6136] 10.01us 14mb                            |-L0.74-|                                                     "
+    - "L0.75[6137,7420] 10.01us 14mb                                      |-L0.75-|                                           "
+    - "L0.76[7421,8704] 10.01us 14mb                                                |-L0.76-|                                 "
+    - "L0.77[8705,10000] 10.01us 14mb                                                         |-L0.77-|                        "
+    - "L0.78[3000,13000] 11us 100mb              |----------------------------------L0.78----------------------------------| "
+    - "**** Simulation run 0, type=split(VerticalSplit)(split_times=[3568, 4852, 6136, 7420, 8704, 10312]). 1 Input Files, 100mb total:"
+    - "L0, all files 100mb                                                                                                "
+    - "L0.78[3000,13000] 11us   |-----------------------------------------L0.78------------------------------------------|"
+    - "**** 7 Output Files (parquet_file_id not yet assigned), 100mb total:"
+    - "L0                                                                                                                 "
+    - "L0.?[3000,3568] 11us 6mb |L0.?|                                                                                    "
+    - "L0.?[3569,4852] 11us 13mb     |--L0.?---|                                                                          "
+    - "L0.?[4853,6136] 11us 13mb                |--L0.?---|                                                               "
+    - "L0.?[6137,7420] 11us 13mb                            |--L0.?---|                                                   "
+    - "L0.?[7421,8704] 11us 13mb                                       |--L0.?---|                                        "
+    - "L0.?[8705,10312] 11us 16mb                                                   |----L0.?----|                         "
+    - "L0.?[10313,13000] 11us 27mb                                                                 |---------L0.?---------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 1 files: L0.78"
+    - "  Creating 7 files"
+    - "**** Simulation run 1, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[1818]). 11 Input Files, 157mb total:"
+    - "L0, all files 14mb                                                                                                 "
+    - "L0.71[1000,2284] 10.01us |-----------------------------------------L0.71------------------------------------------|"
+    - "L0.64[1000,2284] 10.01us |-----------------------------------------L0.64------------------------------------------|"
+    - "L0.57[1000,2284] 10.01us |-----------------------------------------L0.57------------------------------------------|"
+    - "L0.50[1000,2284] 10.01us |-----------------------------------------L0.50------------------------------------------|"
+    - "L0.43[1000,2284] 10.01us |-----------------------------------------L0.43------------------------------------------|"
+    - "L0.36[1000,2284] 10.01us |-----------------------------------------L0.36------------------------------------------|"
+    - "L0.29[1000,2284] 10us    |-----------------------------------------L0.29------------------------------------------|"
+    - "L0.22[1000,2284] 10us    |-----------------------------------------L0.22------------------------------------------|"
+    - "L0.15[1000,2284] 10us    |-----------------------------------------L0.15------------------------------------------|"
+    - "L0.8[1000,2284] 10us     |------------------------------------------L0.8------------------------------------------|"
+    - "L0.1[1000,2284] 10us     |------------------------------------------L0.1------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 157mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[1000,1818] 10.01us 100mb|-------------------------L1.?--------------------------|                                 "
+    - "L1.?[1819,2284] 10.01us 57mb                                                         |-------------L1.?-------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 11 files: L0.1, L0.8, L0.15, L0.22, L0.29, L0.36, L0.43, L0.50, L0.57, L0.64, L0.71"
+    - "  Creating 2 files"
+    - "**** Simulation run 2, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[3073]). 12 Input Files, 163mb total:"
+    - "L0                                                                                                                 "
+    - "L0.79[3000,3568] 11us 6mb                                                  |----------------L0.79----------------| "
+    - "L0.72[2285,3568] 10.01us 14mb|-----------------------------------------L0.72------------------------------------------|"
+    - "L0.65[2285,3568] 10.01us 14mb|-----------------------------------------L0.65------------------------------------------|"
+    - "L0.58[2285,3568] 10.01us 14mb|-----------------------------------------L0.58------------------------------------------|"
+    - "L0.51[2285,3568] 10.01us 14mb|-----------------------------------------L0.51------------------------------------------|"
+    - "L0.44[2285,3568] 10.01us 14mb|-----------------------------------------L0.44------------------------------------------|"
+    - "L0.37[2285,3568] 10.01us 14mb|-----------------------------------------L0.37------------------------------------------|"
+    - "L0.30[2285,3568] 10us 14mb|-----------------------------------------L0.30------------------------------------------|"
+    - "L0.23[2285,3568] 10us 14mb|-----------------------------------------L0.23------------------------------------------|"
+    - "L0.16[2285,3568] 10us 14mb|-----------------------------------------L0.16------------------------------------------|"
+    - "L0.9[2285,3568] 10us 14mb|------------------------------------------L0.9------------------------------------------|"
+    - "L0.2[2285,3568] 10us 14mb|------------------------------------------L0.2------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 163mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[2285,3073] 11us 100mb|------------------------L1.?-------------------------|                                   "
+    - "L1.?[3074,3568] 11us 63mb                                                       |--------------L1.?--------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.2, L0.9, L0.16, L0.23, L0.30, L0.37, L0.44, L0.51, L0.58, L0.65, L0.72, L0.79"
+    - "  Creating 2 files"
+    - "**** Simulation run 3, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[4324]). 12 Input Files, 170mb total:"
+    - "L0                                                                                                                 "
+    - "L0.80[3569,4852] 11us 13mb|-----------------------------------------L0.80------------------------------------------|"
+    - "L0.73[3569,4852] 10.01us 14mb|-----------------------------------------L0.73------------------------------------------|"
+    - "L0.66[3569,4852] 10.01us 14mb|-----------------------------------------L0.66------------------------------------------|"
+    - "L0.59[3569,4852] 10.01us 14mb|-----------------------------------------L0.59------------------------------------------|"
+    - "L0.52[3569,4852] 10.01us 14mb|-----------------------------------------L0.52------------------------------------------|"
+    - "L0.45[3569,4852] 10.01us 14mb|-----------------------------------------L0.45------------------------------------------|"
+    - "L0.38[3569,4852] 10.01us 14mb|-----------------------------------------L0.38------------------------------------------|"
+    - "L0.31[3569,4852] 10us 14mb|-----------------------------------------L0.31------------------------------------------|"
+    - "L0.24[3569,4852] 10us 14mb|-----------------------------------------L0.24------------------------------------------|"
+    - "L0.17[3569,4852] 10us 14mb|-----------------------------------------L0.17------------------------------------------|"
+    - "L0.10[3569,4852] 10us 14mb|-----------------------------------------L0.10------------------------------------------|"
+    - "L0.3[3569,4852] 10us 14mb|------------------------------------------L0.3------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 170mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[3569,4324] 11us 100mb|-----------------------L1.?-----------------------|                                      "
+    - "L1.?[4325,4852] 11us 70mb                                                     |---------------L1.?---------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.3, L0.10, L0.17, L0.24, L0.31, L0.38, L0.45, L0.52, L0.59, L0.66, L0.73, L0.80"
+    - "  Creating 2 files"
+    - "**** Simulation run 4, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[5608]). 12 Input Files, 170mb total:"
+    - "L0                                                                                                                 "
+    - "L0.81[4853,6136] 11us 13mb|-----------------------------------------L0.81------------------------------------------|"
+    - "L0.74[4853,6136] 10.01us 14mb|-----------------------------------------L0.74------------------------------------------|"
+    - "L0.67[4853,6136] 10.01us 14mb|-----------------------------------------L0.67------------------------------------------|"
+    - "L0.60[4853,6136] 10.01us 14mb|-----------------------------------------L0.60------------------------------------------|"
+    - "L0.53[4853,6136] 10.01us 14mb|-----------------------------------------L0.53------------------------------------------|"
+    - "L0.46[4853,6136] 10.01us 14mb|-----------------------------------------L0.46------------------------------------------|"
+    - "L0.39[4853,6136] 10.01us 14mb|-----------------------------------------L0.39------------------------------------------|"
+    - "L0.32[4853,6136] 10us 14mb|-----------------------------------------L0.32------------------------------------------|"
+    - "L0.25[4853,6136] 10us 14mb|-----------------------------------------L0.25------------------------------------------|"
+    - "L0.18[4853,6136] 10us 14mb|-----------------------------------------L0.18------------------------------------------|"
+    - "L0.11[4853,6136] 10us 14mb|-----------------------------------------L0.11------------------------------------------|"
+    - "L0.4[4853,6136] 10us 14mb|------------------------------------------L0.4------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 170mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[4853,5608] 11us 100mb|-----------------------L1.?-----------------------|                                      "
+    - "L1.?[5609,6136] 11us 70mb                                                     |---------------L1.?---------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.4, L0.11, L0.18, L0.25, L0.32, L0.39, L0.46, L0.53, L0.60, L0.67, L0.74, L0.81"
+    - "  Creating 2 files"
+    - "**** Simulation run 5, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[6892]). 12 Input Files, 170mb total:"
+    - "L0                                                                                                                 "
+    - "L0.82[6137,7420] 11us 13mb|-----------------------------------------L0.82------------------------------------------|"
+    - "L0.75[6137,7420] 10.01us 14mb|-----------------------------------------L0.75------------------------------------------|"
+    - "L0.68[6137,7420] 10.01us 14mb|-----------------------------------------L0.68------------------------------------------|"
+    - "L0.61[6137,7420] 10.01us 14mb|-----------------------------------------L0.61------------------------------------------|"
+    - "L0.54[6137,7420] 10.01us 14mb|-----------------------------------------L0.54------------------------------------------|"
+    - "L0.47[6137,7420] 10.01us 14mb|-----------------------------------------L0.47------------------------------------------|"
+    - "L0.40[6137,7420] 10.01us 14mb|-----------------------------------------L0.40------------------------------------------|"
+    - "L0.33[6137,7420] 10us 14mb|-----------------------------------------L0.33------------------------------------------|"
+    - "L0.26[6137,7420] 10us 14mb|-----------------------------------------L0.26------------------------------------------|"
+    - "L0.19[6137,7420] 10us 14mb|-----------------------------------------L0.19------------------------------------------|"
+    - "L0.12[6137,7420] 10us 14mb|-----------------------------------------L0.12------------------------------------------|"
+    - "L0.5[6137,7420] 10us 14mb|------------------------------------------L0.5------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 170mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[6137,6892] 11us 100mb|-----------------------L1.?-----------------------|                                      "
+    - "L1.?[6893,7420] 11us 70mb                                                     |---------------L1.?---------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.5, L0.12, L0.19, L0.26, L0.33, L0.40, L0.47, L0.54, L0.61, L0.68, L0.75, L0.82"
+    - "  Creating 2 files"
+    - "**** Simulation run 6, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[8176]). 12 Input Files, 170mb total:"
+    - "L0                                                                                                                 "
+    - "L0.83[7421,8704] 11us 13mb|-----------------------------------------L0.83------------------------------------------|"
+    - "L0.76[7421,8704] 10.01us 14mb|-----------------------------------------L0.76------------------------------------------|"
+    - "L0.69[7421,8704] 10.01us 14mb|-----------------------------------------L0.69------------------------------------------|"
+    - "L0.62[7421,8704] 10.01us 14mb|-----------------------------------------L0.62------------------------------------------|"
+    - "L0.55[7421,8704] 10.01us 14mb|-----------------------------------------L0.55------------------------------------------|"
+    - "L0.48[7421,8704] 10.01us 14mb|-----------------------------------------L0.48------------------------------------------|"
+    - "L0.41[7421,8704] 10.01us 14mb|-----------------------------------------L0.41------------------------------------------|"
+    - "L0.34[7421,8704] 10us 14mb|-----------------------------------------L0.34------------------------------------------|"
+    - "L0.27[7421,8704] 10us 14mb|-----------------------------------------L0.27------------------------------------------|"
+    - "L0.20[7421,8704] 10us 14mb|-----------------------------------------L0.20------------------------------------------|"
+    - "L0.13[7421,8704] 10us 14mb|-----------------------------------------L0.13------------------------------------------|"
+    - "L0.6[7421,8704] 10us 14mb|------------------------------------------L0.6------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 170mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[7421,8176] 11us 100mb|-----------------------L1.?-----------------------|                                      "
+    - "L1.?[8177,8704] 11us 70mb                                                     |---------------L1.?---------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.6, L0.13, L0.20, L0.27, L0.34, L0.41, L0.48, L0.55, L0.62, L0.69, L0.76, L0.83"
+    - "  Creating 2 files"
+    - "**** Simulation run 7, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[9633]). 12 Input Files, 173mb total:"
+    - "L0                                                                                                                 "
+    - "L0.84[8705,10312] 11us 16mb|-----------------------------------------L0.84------------------------------------------|"
+    - "L0.77[8705,10000] 10.01us 14mb|--------------------------------L0.77---------------------------------|                  "
+    - "L0.70[8705,10000] 10.01us 14mb|--------------------------------L0.70---------------------------------|                  "
+    - "L0.63[8705,10000] 10.01us 14mb|--------------------------------L0.63---------------------------------|                  "
+    - "L0.56[8705,10000] 10.01us 14mb|--------------------------------L0.56---------------------------------|                  "
+    - "L0.49[8705,10000] 10.01us 14mb|--------------------------------L0.49---------------------------------|                  "
+    - "L0.42[8705,10000] 10.01us 14mb|--------------------------------L0.42---------------------------------|                  "
+    - "L0.35[8705,10000] 10us 14mb|--------------------------------L0.35---------------------------------|                  "
+    - "L0.28[8705,10000] 10us 14mb|--------------------------------L0.28---------------------------------|                  "
+    - "L0.21[8705,10000] 10us 14mb|--------------------------------L0.21---------------------------------|                  "
+    - "L0.14[8705,10000] 10us 14mb|--------------------------------L0.14---------------------------------|                  "
+    - "L0.7[8705,10000] 10us 14mb|---------------------------------L0.7---------------------------------|                  "
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 173mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[8705,9633] 11us 100mb|----------------------L1.?-----------------------|                                       "
+    - "L1.?[9634,10312] 11us 73mb                                                    |---------------L1.?----------------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 12 files: L0.7, L0.14, L0.21, L0.28, L0.35, L0.42, L0.49, L0.56, L0.63, L0.70, L0.77, L0.84"
+    - "  Creating 2 files"
+    - "**** Simulation run 8, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[12462]). 1 Input Files, 27mb total:"
+    - "L0, all files 27mb                                                                                                 "
+    - "L0.85[10313,13000] 11us  |-----------------------------------------L0.85------------------------------------------|"
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 27mb total:"
+    - "L1                                                                                                                 "
+    - "L1.?[10313,12462] 11us 21mb|--------------------------------L1.?---------------------------------|                   "
+    - "L1.?[12463,13000] 11us 5mb                                                                        |-----L1.?------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 1 files: L0.85"
+    - "  Creating 2 files"
+    - "**** Simulation run 9, type=split(CompactAndSplitOutput(TotalSizeLessThanMaxCompactSize))(split_times=[12462]). 2 Input Files, 27mb total:"
+    - "L1                                                                                                                 "
+    - "L1.101[12463,13000] 11us 5mb                                                                        |----L1.101-----| "
+    - "L1.100[10313,12462] 11us 21mb|-------------------------------L1.100--------------------------------|                   "
+    - "**** 2 Output Files (parquet_file_id not yet assigned), 27mb total:"
+    - "L2                                                                                                                 "
+    - "L2.?[10313,12462] 11us 21mb|--------------------------------L2.?---------------------------------|                   "
+    - "L2.?[12463,13000] 11us 5mb                                                                        |-----L2.?------| "
+    - "Committing partition 1:"
+    - "  Soft Deleting 2 files: L1.100, L1.101"
+    - "  Upgrading 14 files level to CompactionLevel::L2: L1.86, L1.87, L1.88, L1.89, L1.90, L1.91, L1.92, L1.93, L1.94, L1.95, L1.96, L1.97, L1.98, L1.99"
+    - "  Creating 2 files"
+    - "**** Final Output Files (1.3gb written)"
+    - "L2                                                                                                                 "
+    - "L2.86[1000,1818] 10.01us 100mb|L2.86|                                                                                   "
+    - "L2.87[1819,2284] 10.01us 57mb      |L2.87|                                                                             "
+    - "L2.88[2285,3073] 11us 100mb         |L2.88|                                                                          "
+    - "L2.89[3074,3568] 11us 63mb               |L2.89|                                                                    "
+    - "L2.90[3569,4324] 11us 100mb                   |L2.90|                                                                "
+    - "L2.91[4325,4852] 11us 70mb                        |L2.91|                                                           "
+    - "L2.92[4853,5608] 11us 100mb                            |L2.92|                                                       "
+    - "L2.93[5609,6136] 11us 70mb                                  |L2.93|                                                 "
+    - "L2.94[6137,6892] 11us 100mb                                      |L2.94|                                             "
+    - "L2.95[6893,7420] 11us 70mb                                            |L2.95|                                       "
+    - "L2.96[7421,8176] 11us 100mb                                                |L2.96|                                   "
+    - "L2.97[8177,8704] 11us 70mb                                                     |L2.97|                              "
+    - "L2.98[8705,9633] 11us 100mb                                                         |L2.98|                          "
+    - "L2.99[9634,10312] 11us 73mb                                                                |L2.99|                   "
+    - "L2.102[10313,12462] 11us 21mb                                                                     |----L2.102----|     "
+    - "L2.103[12463,13000] 11us 5mb                                                                                     |L2.103|"
     "###
     );
 }

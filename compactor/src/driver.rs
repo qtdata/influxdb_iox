@@ -73,6 +73,8 @@ async fn compact_partition(
     span.set_metadata("partition_id", partition_id.get().to_string());
     let scratchpad = components.scratchpad_gen.pad();
 
+    info!(partition_id = partition_id.get(), "compaction job starting");
+
     let res = timeout_with_progress_checking(partition_timeout, |transmit_progress_signal| {
         let components = Arc::clone(&components);
         let scratchpad = Arc::clone(&scratchpad);
@@ -213,6 +215,7 @@ async fn try_compact_partition(
     let mut files = components.partition_files_source.fetch(partition_id).await;
     let partition_info = components.partition_info_source.fetch(partition_id).await?;
     let transmit_progress_signal = Arc::new(transmit_progress_signal);
+    let mut last_round_info: Option<RoundInfo> = None;
 
     // loop for each "Round", consider each file in the partition
     // for partitions with a lot of compaction work to do, keeping the work divided into multiple rounds,
@@ -244,6 +247,7 @@ async fn try_compact_partition(
             .round_info_source
             .calculate(
                 Arc::<Components>::clone(&components),
+                last_round_info,
                 &partition_info,
                 files,
             )
@@ -268,6 +272,7 @@ async fn try_compact_partition(
                 let scratchpad = Arc::clone(&scratchpad_ctx);
                 let job = job.clone();
                 let branch_span = round_span.child("branch");
+                let round_info = round_info.clone();
 
                 async move {
                     execute_branch(
@@ -289,6 +294,7 @@ async fn try_compact_partition(
             .await?;
 
         files.extend(branches_output.into_iter().flatten());
+        last_round_info = Some(round_info);
     }
 }
 
@@ -503,9 +509,6 @@ async fn execute_plan(
     span.set_metadata("reason", plan_ir.reason());
 
     let create = {
-        // Adjust concurrency based on the column count in the partition.
-        let permits = compute_permits(df_semaphore.total_permits(), partition_info.column_count());
-
         // use the address of the plan as a uniq identifier so logs can be matched despite the concurrency.
         let plan_id = format!("{:p}", &plan_ir);
 
@@ -513,7 +516,6 @@ async fn execute_plan(
             partition_id = partition_info.partition_id.get(),
             jobs_running = df_semaphore.holders_acquired(),
             jobs_pending = df_semaphore.holders_pending(),
-            permits_needed = permits,
             permits_acquired = df_semaphore.permits_acquired(),
             permits_pending = df_semaphore.permits_pending(),
             plan_id,
@@ -525,10 +527,10 @@ async fn execute_plan(
         //
         // We guard the DataFusion planning (that doesn't perform any IO) via the semaphore as well in case
         // DataFusion ever starts to pre-allocate buffers during the physical planning. To the best of our
-        // knowledge, this is currently (2023-01-25) not the case but if this ever changes, then we are prepared.
+        // knowledge, this is currently (2023-08-29) not the case but if this ever changes, then we are prepared.
         let permit_span = span.child("acquire_permit");
         let permit = df_semaphore
-            .acquire_many(permits, None)
+            .acquire(None)
             .await
             .expect("semaphore not closed");
         drop(permit_span);
@@ -537,7 +539,6 @@ async fn execute_plan(
             partition_id = partition_info.partition_id.get(),
             column_count = partition_info.column_count(),
             input_files = plan_ir.n_input_files(),
-            permits,
             plan_id,
             "job semaphore acquired",
         );
@@ -669,78 +670,4 @@ async fn update_catalog(
         .collect::<Vec<_>>();
 
     Ok((created_file_params, upgraded_files))
-}
-
-// SINGLE_THREADED_COLUMN_COUNT is the number of columns requiring a partition be compacted single threaded.
-const SINGLE_THREADED_COLUMN_COUNT: usize = 100;
-
-// Determine how many permits must be acquired from the concurrency limiter semaphore
-// based on the column count of this job and the total permits (concurrency).
-fn compute_permits(
-    total_permits: usize, // total number of permits (max concurrency)
-    columns: usize,       // column count for this job
-) -> u32 {
-    if columns >= SINGLE_THREADED_COLUMN_COUNT {
-        // this job requires all permits, forcing it to run by itself.
-        return total_permits as u32;
-    }
-
-    // compute the share (linearly scaled) of total permits this job requires
-    let share = columns as f64 / SINGLE_THREADED_COLUMN_COUNT as f64;
-
-    // Square the share so the required permits is non-linearly scaled.
-    // See test cases below for detail, but this makes it extra permissive of low column counts,
-    // but still gets to single threaded by SINGLE_THREADED_COLUMN_COUNT.
-    let permits = total_permits as f64 * share * share;
-
-    if permits < 1.0 {
-        return 1;
-    }
-
-    permits as u32
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn concurrency_limits() {
-        assert_eq!(compute_permits(100, 1), 1); // 1 column still takes 1 permit
-        assert_eq!(compute_permits(100, SINGLE_THREADED_COLUMN_COUNT / 10), 1); // 10% of the max column count takes 1% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 2 / 10),
-            4
-        ); // 20% of the max column count takes 4% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 3 / 10),
-            9
-        ); // 30% of the max column count takes 9% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 4 / 10),
-            16
-        ); // 40% of the max column count takes 16% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 5 / 10),
-            25
-        ); // 50% of the max column count takes 25% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 6 / 10),
-            36
-        ); // 60% of the max column count takes 36% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 7 / 10),
-            49
-        ); // 70% of the max column count takes 49% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 8 / 10),
-            64
-        ); // 80% of the max column count takes 64% of total permits
-        assert_eq!(
-            compute_permits(100, SINGLE_THREADED_COLUMN_COUNT * 9 / 10),
-            81
-        ); // 90% of the max column count takes 81% of total permits
-        assert_eq!(compute_permits(100, SINGLE_THREADED_COLUMN_COUNT), 100); // 100% of the max column count takes 100% of total permits
-        assert_eq!(compute_permits(100, 10000), 100); // huge column count takes exactly all permits (not more than the total)
-    }
 }

@@ -44,7 +44,6 @@ pub mod pruning;
 pub mod statistics;
 pub mod util;
 
-pub use frontend::common::ScanPlanBuilder;
 pub use query_functions::group_by::{Aggregate, WindowDuration};
 
 /// The name of the virtual column that represents the chunk order.
@@ -325,9 +324,9 @@ pub fn chunks_have_distinct_counts<'a>(
     // do not need to compute potential duplicates. We will treat
     // as all of them have duplicates
     chunks.into_iter().all(|chunk| {
-        let Some(col_stats) = &chunk
-            .stats()
-            .column_statistics else {return false};
+        let Some(col_stats) = &chunk.stats().column_statistics else {
+            return false;
+        };
         col_stats.iter().all(|col| col.distinct_count.is_some())
     })
 }

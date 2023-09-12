@@ -18,6 +18,9 @@ members = [
     "garbage_collector",
     "generated_types",
     "gossip",
+    "gossip_compaction",
+    "gossip_parquet_file",
+    "gossip_schema",
     "grpc-binary-logger-proto",
     "grpc-binary-logger-test-proto",
     "grpc-binary-logger",
@@ -31,6 +34,7 @@ members = [
     "influxdb2_client",
     "influxrpc_parser",
     "ingester_query_grpc",
+    "ingester_query_client",
     "ingester_test_ctx",
     "ingester",
     "iox_catalog",
@@ -121,8 +125,8 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 arrow = { version = "45.0.0" }
 arrow-flight = { version = "45.0.0" }
-datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "161c6d32824fc87307341f942ffad7b4d452c82f", default-features = false }
-datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "161c6d32824fc87307341f942ffad7b4d452c82f" }
+datafusion = { git = "https://github.com/apache/arrow-datafusion.git", rev = "f3722c0af8418bcb19cf9dc5f7e458a3aa5f0f32", default-features = false }
+datafusion-proto = { git = "https://github.com/apache/arrow-datafusion.git", rev = "f3722c0af8418bcb19cf9dc5f7e458a3aa5f0f32" }
 
 hashbrown = { version = "0.14.0" }
 object_store = { version = "0.6.0" }

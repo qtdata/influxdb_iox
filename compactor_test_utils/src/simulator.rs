@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Mutex,
@@ -51,6 +51,11 @@ pub struct ParquetFileSimulator {
     run_id_generator: AtomicUsize,
     /// Used to track total bytes written (to help judge efficiency changes)
     bytes_written: Arc<AtomicUsize>,
+    /// map of bytes written per plan type
+    bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
+    /// split times required to occur during the simulation.
+    /// This starts as the full list of what we need to see, and they're removed as they occur.
+    required_split_times: Arc<Mutex<Vec<i64>>>,
 }
 
 impl std::fmt::Display for ParquetFileSimulator {
@@ -62,11 +67,18 @@ impl std::fmt::Display for ParquetFileSimulator {
 impl ParquetFileSimulator {
     /// Create a new simulator for creating parquet files, which
     /// appends its output to `run_log`
-    pub fn new(run_log: Arc<Mutex<Vec<String>>>, bytes_written: Arc<AtomicUsize>) -> Self {
+    pub fn new(
+        run_log: Arc<Mutex<Vec<String>>>,
+        bytes_written: Arc<AtomicUsize>,
+        bytes_written_per_plan: Arc<Mutex<HashMap<String, usize>>>,
+        required_split_times: Arc<Mutex<Vec<i64>>>,
+    ) -> Self {
         Self {
             run_log,
             run_id_generator: AtomicUsize::new(0),
             bytes_written,
+            bytes_written_per_plan,
+            required_split_times,
         }
     }
 
@@ -108,6 +120,16 @@ impl ParquetFilesSink for ParquetFileSimulator {
             }
         };
 
+        // If specific split itmes are required by this test, remove any we're seeing now.
+        if !split_times.is_empty() {
+            let mut required_split_times = self.required_split_times.lock().unwrap();
+            if !required_split_times.is_empty() {
+                for split_time in split_times {
+                    required_split_times.retain(|t| t != split_time);
+                }
+            }
+        }
+
         let input_files: Vec<_> = plan_ir
             .input_files()
             .iter()
@@ -142,6 +164,13 @@ impl ParquetFilesSink for ParquetFileSimulator {
         self.run_log.lock().unwrap().extend(run.into_strings());
         self.bytes_written
             .fetch_add(bytes_written as usize, Ordering::Relaxed);
+
+        self.bytes_written_per_plan
+            .lock()
+            .unwrap()
+            .entry(plan_ir.to_string())
+            .and_modify(|e| *e += bytes_written as usize)
+            .or_insert(bytes_written as usize);
 
         Ok(output_params)
     }
@@ -254,7 +283,7 @@ impl SimulatedRun {
         // hook up inputs and outputs
         format_files(input_title, &input_parquet_files)
             .into_iter()
-            .chain(format_files(output_title, &output_params).into_iter())
+            .chain(format_files(output_title, &output_params))
     }
 }
 
